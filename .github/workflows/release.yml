@@ -1,0 +1,59 @@
+name: Release
+
+# 触发方式：
+#   1) 推送符合 v* 的 tag（例如 v1.0.0）时自动发版
+#   2) 在 Actions 页面手动运行（workflow_dispatch），需填入版本号
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号 tag，例如 v1.0.0'
+        required: true
+
+# 创建 Release / 上传产物所需的最小权限
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 拉取完整历史与 tag，供 build.sh 的 git describe 使用
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # 直接读取 go.mod 中的 Go 版本（当前为 1.26）
+          go-version-file: go.mod
+
+      - name: Resolve version
+        id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build & package
+        env:
+          # 复用现有 build.sh：跑测试 -> 跨平台编译 -> 打包 -> 生成 checksums
+          VERSION: ${{ steps.v.outputs.version }}
+        run: ./build.sh
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          gh release create "$VERSION" dist/* \
+            --target "${{ github.sha }}" \
+            --title "$VERSION" \
+            --generate-notes

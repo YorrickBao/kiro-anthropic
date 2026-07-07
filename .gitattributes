@@ -1,0 +1,36 @@
+# Normalize line endings: stored as LF in the repo, checked out per rules below.
+* text=auto
+
+# --- Source & config: always LF ---
+*.go   text eol=lf
+*.mod  text eol=lf
+*.sum  text eol=lf
+*.sh   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+
+# --- Windows scripts: CRLF ---
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# --- Binary assets: never normalize or diff as text ---
+*.exe   binary
+*.dll   binary
+*.so    binary
+*.dylib binary
+*.gz    binary
+*.tgz   binary
+*.zip   binary
+*.tar   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.icns  binary
+
+# --- Linguist: keep vendored/generated out of language stats if added later ---
+# /vendor/** linguist-vendored

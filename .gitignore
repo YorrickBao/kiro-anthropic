@@ -1,0 +1,44 @@
+# ---- Binaries ----
+# Local dev binary from `go build -o kiro-anthropic .`
+/kiro-anthropic
+# Compiled objects / plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# ---- Go test & coverage ----
+# Test binary built with `go test -c`
+*.test
+# Coverage / profiling output
+*.out
+coverage.*
+*.prof
+
+# ---- Go workspace (keep local) ----
+go.work
+go.work.sum
+
+# ---- Dependencies ----
+# This module vendors nothing; uncomment if you switch to `go mod vendor`.
+# /vendor/
+
+# ---- Build artifacts (produced by build.sh) ----
+/dist/
+/artifacts/
+
+# ---- Environment / secrets ----
+.env
+.env.*
+!.env.example
+
+# ---- Editor / IDE ----
+.idea/
+*.swp
+*~
+
+# ---- OS cruft ----
+.DS_Store
+**/.DS_Store
+Thumbs.db

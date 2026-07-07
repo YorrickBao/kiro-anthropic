@@ -1,0 +1,485 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+)
+
+// ---------------------------------------------------------------------------
+// Kiro / CodeWhisperer streaming wire types (GenerateAssistantResponse).
+// Field names and nesting come from Kiro's bundled client.
+// ---------------------------------------------------------------------------
+
+type kiroRequest struct {
+	ConversationState            kiroConversationState `json:"conversationState"`
+	ProfileArn                   string                `json:"profileArn,omitempty"`
+	AgentMode                    string                `json:"agentMode,omitempty"`
+	SystemPrompt                 string                `json:"systemPrompt,omitempty"`
+	AdditionalModelRequestFields map[string]any        `json:"additionalModelRequestFields,omitempty"`
+}
+
+type kiroConversationState struct {
+	ChatTriggerType string        `json:"chatTriggerType"`
+	ConversationID  string        `json:"conversationId"`
+	CurrentMessage  kiroMessage   `json:"currentMessage"`
+	History         []kiroMessage `json:"history,omitempty"`
+}
+
+// kiroMessage is a union: exactly one of the two pointers is set.
+type kiroMessage struct {
+	UserInputMessage         *kiroUserInputMessage `json:"userInputMessage,omitempty"`
+	AssistantResponseMessage *kiroAssistantMessage `json:"assistantResponseMessage,omitempty"`
+}
+
+type kiroUserInputMessage struct {
+	Content                 string                       `json:"content"`
+	ModelID                 string                       `json:"modelId,omitempty"`
+	Origin                  string                       `json:"origin,omitempty"`
+	UserInputMessageContext *kiroUserInputMessageContext `json:"userInputMessageContext,omitempty"`
+	Images                  []kiroImage                  `json:"images,omitempty"`
+}
+
+// kiroImage is a CodeWhisperer ImageBlock. Over AWS JSON 1.0 the source bytes
+// blob is a base64 string, which matches Anthropic's source.data directly.
+type kiroImage struct {
+	Format string          `json:"format"` // png | jpeg | gif | webp
+	Source kiroImageSource `json:"source"`
+}
+
+type kiroImageSource struct {
+	Bytes string `json:"bytes"` // base64-encoded image bytes
+}
+
+type kiroUserInputMessageContext struct {
+	Tools       []kiroTool       `json:"tools,omitempty"`
+	ToolResults []kiroToolResult `json:"toolResults,omitempty"`
+}
+
+type kiroTool struct {
+	ToolSpecification kiroToolSpecification `json:"toolSpecification"`
+}
+
+type kiroToolSpecification struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	InputSchema kiroInputSchema `json:"inputSchema"`
+}
+
+type kiroInputSchema struct {
+	JSON json.RawMessage `json:"json"`
+}
+
+type kiroToolResult struct {
+	ToolUseID string                  `json:"toolUseId"`
+	Content   []kiroToolResultContent `json:"content"`
+	Status    string                  `json:"status,omitempty"` // "success" | "error"
+}
+
+type kiroToolResultContent struct {
+	Text string          `json:"text,omitempty"`
+	JSON json.RawMessage `json:"json,omitempty"`
+}
+
+type kiroAssistantMessage struct {
+	Content  string        `json:"content"`
+	ToolUses []kiroToolUse `json:"toolUses,omitempty"`
+}
+
+type kiroToolUse struct {
+	ToolUseID string          `json:"toolUseId"`
+	Name      string          `json:"name"`
+	Input     json.RawMessage `json:"input,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// Parsed streaming events (protocol-agnostic view for the translation layer).
+// ---------------------------------------------------------------------------
+
+type kiroEventKind int
+
+const (
+	evText kiroEventKind = iota
+	evToolUse
+	evMetadata
+	evError
+	evOther
+)
+
+type kiroEvent struct {
+	Kind kiroEventKind
+
+	Text string // evText
+
+	ToolUseID string // evToolUse
+	ToolName  string // evToolUse (present on first chunk)
+	ToolInput string // evToolUse (partial JSON chunk)
+	ToolStop  bool   // evToolUse (final chunk for this tool use)
+
+	ConversationID string // evMetadata
+
+	ErrKind string // evError
+	ErrMsg  string // evError
+}
+
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
+
+// KiroClient sends GenerateAssistantResponse calls to the Kiro runtime and
+// exposes the response as a stream of parsed events.
+type KiroClient struct {
+	cfg    *Config
+	store  *TokenStore
+	client *http.Client
+}
+
+func NewKiroClient(cfg *Config, store *TokenStore, client *http.Client) *KiroClient {
+	return &KiroClient{cfg: cfg, store: store, client: client}
+}
+
+func (c *KiroClient) runtimeEndpoint() string {
+	return fmt.Sprintf("https://runtime.%s.kiro.dev/", c.store.region())
+}
+
+// kiroStream is an open streaming response.
+type kiroStream struct {
+	resp *http.Response
+	dec  *eventStreamDecoder
+}
+
+// Send issues the request and returns a stream of events. On a 401/403 the
+// token is force-refreshed and the request retried once.
+func (c *KiroClient) Send(ctx context.Context, req *kiroRequest) (*kiroStream, error) {
+	stream, status, body, err := c.sendOnce(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if stream != nil {
+		return stream, nil
+	}
+	// Non-2xx on first try.
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		if rerr := c.store.ForceRefresh(ctx); rerr == nil {
+			stream, status, body, err = c.sendOnce(ctx, req)
+			if err != nil {
+				return nil, err
+			}
+			if stream != nil {
+				return stream, nil
+			}
+		}
+	}
+	return nil, &kiroHTTPError{Status: status, Body: body}
+}
+
+// sendOnce performs a single attempt. On success it returns a stream; on a
+// non-2xx response it returns (nil, status, body, nil).
+func (c *KiroClient) sendOnce(ctx context.Context, req *kiroRequest) (*kiroStream, int, string, error) {
+	token, err := c.store.AccessToken(ctx)
+	if err != nil {
+		return nil, 0, "", err
+	}
+
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return nil, 0, "", err
+	}
+
+	if os.Getenv("KIRO_DEBUG") != "" {
+		fmt.Fprintf(os.Stderr, "[kiro-debug] POST %s\n[kiro-debug] body: %s\n", c.runtimeEndpoint(), payload)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.runtimeEndpoint(), bytes.NewReader(payload))
+	if err != nil {
+		return nil, 0, "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	httpReq.Header.Set("X-Amz-Target", "AmazonCodeWhispererStreamingService.GenerateAssistantResponse")
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	httpReq.Header.Set("User-Agent", "kiro-anthropic/"+version)
+
+	resp, err := c.client.Do(httpReq)
+	if err != nil {
+		return nil, 0, "", err
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body := readSnippet(resp.Body)
+		resp.Body.Close()
+		return nil, resp.StatusCode, body, nil
+	}
+
+	return &kiroStream{resp: resp, dec: newEventStreamDecoder(resp.Body)}, resp.StatusCode, "", nil
+}
+
+// Recv returns the next parsed event, or io.EOF when the stream ends.
+func (s *kiroStream) Recv() (*kiroEvent, error) {
+	msg, err := s.dec.Next()
+	if err != nil {
+		return nil, err
+	}
+	return parseKiroMessage(msg), nil
+}
+
+func (s *kiroStream) Close() error {
+	if s.resp != nil && s.resp.Body != nil {
+		_, _ = io.Copy(io.Discard, io.LimitReader(s.resp.Body, 4096))
+		return s.resp.Body.Close()
+	}
+	return nil
+}
+
+// parseKiroMessage converts a raw framed message into a kiroEvent.
+func parseKiroMessage(msg *eventMessage) *kiroEvent {
+	// Service-level exceptions are flagged in the message headers.
+	if msg.messageType() == "exception" {
+		return &kiroEvent{Kind: evError, ErrKind: msg.exceptionType(), ErrMsg: extractMessage(msg.payload)}
+	}
+
+	switch msg.eventType() {
+	case "assistantResponseEvent":
+		var p struct {
+			Content string `json:"content"`
+		}
+		_ = json.Unmarshal(msg.payload, &p)
+		return &kiroEvent{Kind: evText, Text: p.Content}
+
+	case "toolUseEvent":
+		var p struct {
+			ToolUseID string          `json:"toolUseId"`
+			Name      string          `json:"name"`
+			Input     json.RawMessage `json:"input"`
+			Stop      bool            `json:"stop"`
+		}
+		_ = json.Unmarshal(msg.payload, &p)
+		return &kiroEvent{
+			Kind:      evToolUse,
+			ToolUseID: p.ToolUseID,
+			ToolName:  p.Name,
+			ToolInput: rawToInputString(p.Input),
+			ToolStop:  p.Stop,
+		}
+
+	case "messageMetadataEvent":
+		var p struct {
+			ConversationID string `json:"conversationId"`
+		}
+		_ = json.Unmarshal(msg.payload, &p)
+		return &kiroEvent{Kind: evMetadata, ConversationID: p.ConversationID}
+
+	case "invalidStateEvent", "internalServerException", "throttlingError",
+		"serviceQuotaExceededError", "conversationExpiredError", "dryRunSucceedEvent":
+		// Error-ish union members surfaced as normal events.
+		return &kiroEvent{Kind: evError, ErrKind: msg.eventType(), ErrMsg: extractMessage(msg.payload)}
+
+	default:
+		// codeReferenceEvent, followupPromptEvent, supplementaryWebLinksEvent,
+		// contextUsageEvent, etc. are not needed for the Anthropic mapping.
+		return &kiroEvent{Kind: evOther}
+	}
+}
+
+// rawToInputString turns a toolUse "input" chunk into a string. The field may
+// arrive as a JSON string chunk ("...") or a raw JSON fragment; both are
+// concatenated as text on the Anthropic side.
+func rawToInputString(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	return string(raw)
+}
+
+func extractMessage(payload []byte) string {
+	var p struct {
+		Message string `json:"message"`
+		Msg     string `json:"Message"`
+	}
+	if err := json.Unmarshal(payload, &p); err == nil {
+		if p.Message != "" {
+			return p.Message
+		}
+		if p.Msg != "" {
+			return p.Msg
+		}
+	}
+	return string(payload)
+}
+
+// kiroHTTPError carries a non-2xx runtime response.
+type kiroHTTPError struct {
+	Status int
+	Body   string
+}
+
+func (e *kiroHTTPError) Error() string {
+	return fmt.Sprintf("kiro runtime returned %d: %s", e.Status, e.Body)
+}
+
+// kiroModelInfo describes one model returned by ListAvailableModels.
+type kiroModelInfo struct {
+	ModelID   string `json:"modelId"`
+	ModelName string `json:"modelName"`
+	// Some responses flag the account default; we surface it best-effort.
+	Default   bool `json:"default"`
+	IsDefault bool `json:"isDefault"`
+	// Per-model schema describing where reasoning-effort / max_tokens go.
+	AdditionalModelRequestFieldsSchema json.RawMessage `json:"additionalModelRequestFieldsSchema"`
+	// Context window limits.
+	TokenLimits struct {
+		MaxInputTokens  int `json:"maxInputTokens"`
+		MaxOutputTokens int `json:"maxOutputTokens"`
+	} `json:"tokenLimits"`
+}
+
+// maxTokensRange reports the [min, max] the model accepts for the additional
+// "max_tokens" field, and whether the model accepts it at all (its schema must
+// declare max_tokens). Returns ok=false for models with no schema (e.g. "auto",
+// claude-sonnet-4.5).
+func (m kiroModelInfo) maxTokensRange() (min, max int, ok bool) {
+	if len(m.AdditionalModelRequestFieldsSchema) == 0 {
+		return 0, 0, false
+	}
+	var schema struct {
+		Properties map[string]struct {
+			Maximum int `json:"maximum"`
+			Minimum int `json:"minimum"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(m.AdditionalModelRequestFieldsSchema, &schema); err != nil {
+		return 0, 0, false
+	}
+	node, present := schema.Properties["max_tokens"]
+	if !present {
+		return 0, 0, false
+	}
+	max = node.Maximum
+	if max <= 0 {
+		max = m.TokenLimits.MaxOutputTokens
+	}
+	if max <= 0 {
+		return 0, 0, false
+	}
+	min = node.Minimum
+	if min < 1 {
+		min = 1
+	}
+	return min, max, true
+}
+
+// allEffortLevels is the full set of reasoning-effort levels, ordered low..high.
+// Used when reporting per-model capabilities.
+var allEffortLevels = []string{"low", "medium", "high", "xhigh", "max"}
+
+// effortConfig describes a model's reasoning-effort capability, mirroring
+// Kiro's own extraction (schemaPath is "output_config" or "reasoning").
+type effortConfig struct {
+	SchemaPath string   // where the effort value is placed in additionalModelRequestFields
+	Levels     []string // advertised levels, ordered low..high
+}
+
+// has reports whether the model advertises the given effort level.
+func (e effortConfig) has(level string) bool {
+	for _, l := range e.Levels {
+		if l == level {
+			return true
+		}
+	}
+	return false
+}
+
+// max returns the highest advertised effort level.
+func (e effortConfig) max() string {
+	if len(e.Levels) == 0 {
+		return ""
+	}
+	return e.Levels[len(e.Levels)-1]
+}
+
+// clamp returns desired if the model advertises it, else the highest level.
+func (e effortConfig) clamp(desired string) string {
+	for _, l := range e.Levels {
+		if l == desired {
+			return desired
+		}
+	}
+	return e.max()
+}
+
+// effort extracts the reasoning-effort schema from a model's
+// additionalModelRequestFieldsSchema. Returns ok=false when the model does not
+// support effort (e.g. "auto", claude-sonnet-4.5).
+func (m kiroModelInfo) effort() (effortConfig, bool) {
+	if len(m.AdditionalModelRequestFieldsSchema) == 0 {
+		return effortConfig{}, false
+	}
+	var schema struct {
+		Properties map[string]struct {
+			Properties map[string]struct {
+				Enum []string `json:"enum"`
+			} `json:"properties"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(m.AdditionalModelRequestFieldsSchema, &schema); err != nil {
+		return effortConfig{}, false
+	}
+	// Kiro looks for effort under either "output_config" or "reasoning".
+	for _, path := range []string{"output_config", "reasoning"} {
+		if node, ok := schema.Properties[path]; ok {
+			if eff, ok := node.Properties["effort"]; ok && len(eff.Enum) > 0 {
+				return effortConfig{SchemaPath: path, Levels: eff.Enum}, true
+			}
+		}
+	}
+	return effortConfig{}, false
+}
+
+// ListModels queries the Kiro control plane for the model IDs available to this
+// account (KiroControlPlaneBearerService.ListAvailableModels).
+func (c *KiroClient) ListModels(ctx context.Context) ([]kiroModelInfo, error) {
+	token, err := c.store.AccessToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	arn, _ := c.store.ProfileArn(ctx) // best effort; some tiers don't need it
+
+	reqBody := map[string]any{"origin": "AI_EDITOR"}
+	if arn != "" {
+		reqBody["profileArn"] = arn
+	}
+	payload, _ := json.Marshal(reqBody)
+
+	endpoint := fmt.Sprintf("https://management.%s.kiro.dev/", c.store.region())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
+	req.Header.Set("X-Amz-Target", "KiroControlPlaneBearerService.ListAvailableModels")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, &kiroHTTPError{Status: resp.StatusCode, Body: readSnippet(resp.Body)}
+	}
+
+	var out struct {
+		Models []kiroModelInfo `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode models: %w", err)
+	}
+	return out.Models, nil
+}

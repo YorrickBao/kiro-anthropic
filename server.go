@@ -449,7 +449,7 @@ func (s *Server) aggregateMessages(w http.ResponseWriter, r *http.Request, areq 
 		ID:         "msg_" + strings.ReplaceAll(newUUID(), "-", ""),
 		Type:       "message",
 		Role:       "assistant",
-		Model:      areq.Model,
+		Model:      mapModel(areq.Model),
 		Content:    blocks,
 		StopReason: asm.stopReason(),
 		Usage: anthropicUsage{
@@ -496,7 +496,7 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, areq *an
 			"id":            msgID,
 			"type":          "message",
 			"role":          "assistant",
-			"model":         areq.Model,
+			"model":         mapModel(areq.Model),
 			"content":       []any{},
 			"stop_reason":   nil,
 			"stop_sequence": nil,

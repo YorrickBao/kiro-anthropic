@@ -5,6 +5,7 @@
 [![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go)](https://go.dev)
 [![License: MIT](https://img.shields.io/github/license/YorrickBao/kiro-anthropic)](LICENSE)
 [![Conventional Commits](https://img.shields.io/badge/Conventional%20Commits-1.0.0-yellow)](https://www.conventionalcommits.org/en/v1.0.0/)
+[![Sponsor](https://img.shields.io/badge/sponsor-%E7%88%B1%E5%8F%91%E7%94%B5-ff69b4)](https://www.ifdian.net/item/db69bdce79e911f19e2f52540025c377)
 
 把 **Kiro**（Amazon Q Developer / CodeWhisperer）账号代理成 **Anthropic Messages API** 的本地服务。任何兼容 Anthropic 协议的客户端（Claude Code、各类 SDK 等）都能直接指向本服务，用上 Kiro 里的 Claude（以及 DeepSeek / GLM / MiniMax / Qwen 等）模型。
 

@@ -163,6 +163,88 @@ func TestApplyModelRequestFieldsMinimize(t *testing.T) {
 	}
 }
 
+func TestWithReasoningRetry(t *testing.T) {
+	sigErr := &kiroHTTPError{Status: 400, Body: `{"reason":"THINKING_SIGNATURE_INVALID"}`}
+
+	// history carrying reasoning on an assistant turn.
+	withReasoning := func() *kiroRequest {
+		return &kiroRequest{ConversationState: kiroConversationState{History: []kiroMessage{
+			{UserInputMessage: &kiroUserInputMessage{Content: "hi"}},
+			{AssistantResponseMessage: &kiroAssistantMessage{Content: "a",
+				ReasoningContent: &kiroReasoningContent{ReasoningText: &kiroReasoningText{Text: "t", Signature: "s"}}}},
+		}}}
+	}
+	hasReasoning := func(k *kiroRequest) bool {
+		for _, m := range k.ConversationState.History {
+			if m.AssistantResponseMessage != nil && m.AssistantResponseMessage.ReasoningContent != nil {
+				return true
+			}
+		}
+		return false
+	}
+
+	// 1. first send succeeds -> no retry, stream returned as-is.
+	{
+		want := &kiroStream{}
+		calls := 0
+		got, err := withReasoningRetry(withReasoning(), func(*kiroRequest) (*kiroStream, error) {
+			calls++
+			return want, nil
+		})
+		if err != nil || got != want || calls != 1 {
+			t.Errorf("success path: got=%p err=%v calls=%d", got, err, calls)
+		}
+	}
+
+	// 2. signature error + reasoning present -> retry once, history stripped, retry result returned.
+	{
+		want := &kiroStream{}
+		calls := 0
+		var strippedOnRetry bool
+		k := withReasoning()
+		got, err := withReasoningRetry(k, func(kk *kiroRequest) (*kiroStream, error) {
+			calls++
+			if calls == 1 {
+				return nil, sigErr
+			}
+			strippedOnRetry = !hasReasoning(kk) // history must be stripped before the retry send
+			return want, nil
+		})
+		if err != nil || got != want || calls != 2 {
+			t.Errorf("retry path: got=%p err=%v calls=%d", got, err, calls)
+		}
+		if !strippedOnRetry {
+			t.Errorf("history should be stripped before retry")
+		}
+	}
+
+	// 3. signature error but nothing to strip -> no retry, original error surfaces.
+	{
+		calls := 0
+		bare := &kiroRequest{}
+		_, err := withReasoningRetry(bare, func(*kiroRequest) (*kiroStream, error) {
+			calls++
+			return nil, sigErr
+		})
+		if err != sigErr || calls != 1 {
+			t.Errorf("no-reasoning path: err=%v calls=%d", err, calls)
+		}
+	}
+
+	// 4. unrelated error -> no retry, original error surfaces.
+	{
+		calls := 0
+		other := &kiroHTTPError{Status: 400, Body: `{"reason":"PROMPT_TOO_LONG"}`}
+		_, err := withReasoningRetry(withReasoning(), func(*kiroRequest) (*kiroStream, error) {
+			calls++
+			return nil, other
+		})
+		if err != other || calls != 1 {
+			t.Errorf("unrelated-error path: err=%v calls=%d", err, calls)
+		}
+	}
+}
+
 func TestIsThinkingSignatureError(t *testing.T) {
 	if !isThinkingSignatureError(&kiroHTTPError{Status: 400, Body: `{"message":"bad","reason":"THINKING_SIGNATURE_INVALID"}`}) {
 		t.Errorf("reason code should match")

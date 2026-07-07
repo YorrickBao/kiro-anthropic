@@ -46,6 +46,13 @@ type anthropicThinking struct {
 // which Kiro cannot fully turn off for reasoning models).
 const effortMinimize = "\x00min"
 
+// thinkingDisabled reports whether the client explicitly turned extended
+// thinking off (thinking.type == "disabled"). It is the single condition behind
+// both effort minimization and response-side suppression.
+func thinkingDisabled(areq *anthropicRequest) bool {
+	return areq.Thinking != nil && strings.EqualFold(areq.Thinking.Type, "disabled")
+}
+
 // requestedEffort returns the effort level the client asked for, if any.
 // Precedence: output_config.effort (native) > reasoning_effort (alias) >
 // thinking toggle. An explicit thinking.type=="disabled" minimizes effort;
@@ -57,17 +64,17 @@ func requestedEffort(areq *anthropicRequest) string {
 	if areq.ReasoningEffort != "" {
 		return areq.ReasoningEffort
 	}
-	if areq.Thinking != nil && strings.EqualFold(areq.Thinking.Type, "disabled") {
+	if thinkingDisabled(areq) {
 		return effortMinimize
 	}
 	return ""
 }
 
-// thinkingSuppressed reports whether the client explicitly disabled extended
-// thinking, in which case reasoning content is dropped from the response
-// (matching Anthropic's contract that no thinking blocks appear when disabled).
+// thinkingSuppressed reports whether reasoning content should be dropped from
+// the response (matching Anthropic's contract that no thinking blocks appear
+// when thinking is disabled).
 func thinkingSuppressed(areq *anthropicRequest) bool {
-	return areq.Thinking != nil && strings.EqualFold(areq.Thinking.Type, "disabled")
+	return thinkingDisabled(areq)
 }
 
 type anthropicMessage struct {

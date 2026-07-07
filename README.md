@@ -167,7 +167,8 @@ Anthropic Messages API。支持 `stream: true`（SSE：`message_start` / `conten
   - 非流式：`content` 数组里包含 `{"type":"thinking","thinking":"...","signature":"..."}`。
   - 被后端加密的推理映射为 `redacted_thinking` 块（`data` 字段）。
 - **默认开启**：只要模型产出思考内容就透传（思考块始终排在正文之前）。请求带 `thinking: {"type":"disabled"}` 时不下发思考块，并把 effort 降到该模型最低档；`thinking: {"type":"enabled", "budget_tokens": N}` 按开启处理（`budget_tokens` 会被接收但不映射为 effort 档位，Kiro 用的是 effort 而非 token 预算）。
-- **多轮回传**：客户端把上一轮的 `thinking` / `redacted_thinking` 块（含 `signature`）放进 `messages` 历史时，会原样回传给后端（`assistantResponseMessage.reasoningContent`），以保持思考链连续。若后端返回 `THINKING_SIGNATURE_INVALID`（签名失效，常见于上下文压缩后），会自动剥离历史里的推理内容并重试一次。
+- **多轮回传**：客户端把上一轮的 `thinking` / `redacted_thinking` 块（含 `signature`）放进 `messages` 历史时，会原样回传给后端（`assistantResponseMessage.reasoningContent`），以保持思考链连续。若后端返回 `THINKING_SIGNATURE_INVALID`（签名失效，常见于上下文压缩后），会自动剥离历史里的推理内容并重试一次（仅对流开始前的 400 校验错误生效）。
+  - **每个 assistant 轮次仅回传首个思考块**：Kiro 的 `reasoningContent` 是单成员 union，一轮只能携带一个 `reasoningText` 或 `redactedContent`。若某个 assistant 消息里有多个思考块（如交错思考 + 多次工具调用），只回传第一个，其余思考块会被丢弃（其正文 `text` 仍保留）。
 
 ### 图片
 - 支持 user 消息中的 base64 图片：`png` / `jpeg` / `gif` / `webp`。

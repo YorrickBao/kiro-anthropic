@@ -366,14 +366,30 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 // or invalid extended-thinking signature, retries once with reasoningContent
 // stripped from history. This mirrors Kiro's own recovery and matters most
 // during multi-turn / context compaction, where a signature may no longer
-// validate. The retry only fires when there was reasoning in history to strip.
+// validate.
 func (s *Server) sendWithReasoningRetry(ctx context.Context, kreq *kiroRequest) (*kiroStream, error) {
-	stream, err := s.kiro.Send(ctx, kreq)
+	return withReasoningRetry(kreq, func(k *kiroRequest) (*kiroStream, error) {
+		return s.kiro.Send(ctx, k)
+	})
+}
+
+// withReasoningRetry runs send(kreq) and, on an invalid/stale thinking-signature
+// rejection, retries once with reasoningContent stripped from history. The retry
+// only fires when there was reasoning in history to strip, so an unrelated 400
+// (or a signature error with nothing to strip) surfaces unchanged.
+//
+// This recovers only from a pre-stream validation failure (a non-2xx
+// THINKING_SIGNATURE_INVALID, which is how the backend rejects a bad signature
+// before streaming begins). Were the same condition ever surfaced as an
+// in-stream exception after a 200, it would reach the caller mid-stream, where
+// a transparent retry is no longer possible.
+func withReasoningRetry(kreq *kiroRequest, send func(*kiroRequest) (*kiroStream, error)) (*kiroStream, error) {
+	stream, err := send(kreq)
 	if err == nil {
 		return stream, nil
 	}
 	if isThinkingSignatureError(err) && stripReasoningFromHistory(kreq) {
-		return s.kiro.Send(ctx, kreq)
+		return send(kreq)
 	}
 	return nil, err
 }

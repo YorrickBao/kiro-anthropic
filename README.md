@@ -229,3 +229,22 @@ anthropic.go     Anthropic 类型、模型映射、请求翻译、SSE 组装
 server.go        HTTP 服务与各端点
 build.sh         跨平台构建脚本
 ```
+
+---
+
+## 赞助 Support
+
+如果这个项目对你有帮助，欢迎请我喝杯咖啡 ☕
+
+<table>
+  <tr>
+    <td align="center">
+      <img src=".github/sponsor-qr.png" width="200" alt="爱发电打赏二维码" /><br/>
+      <sub>微信 / 支付宝 扫码打赏</sub>
+    </td>
+    <td align="center" valign="middle">
+      <a href="https://www.ifdian.net/item/db69bdce79e911f19e2f52540025c377"><strong>爱发电 打赏页 →</strong></a><br/>
+      <sub>或点顶部 <code>Sponsor</code> 徽章</sub>
+    </td>
+  </tr>
+</table>

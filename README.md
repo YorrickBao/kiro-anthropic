@@ -232,9 +232,11 @@ build.sh         跨平台构建脚本
 
 ---
 
-## 赞助 Support
+## 😸 觉得好用？
 
-如果这个项目对你有帮助，欢迎请我喝杯咖啡 ☕
+那就赏我一杯咖啡吧 ☕
+
+你的支持 = 我的多巴胺 = 更多奇怪的想法变成代码。
 
 <table>
   <tr>
@@ -243,8 +245,7 @@ build.sh         跨平台构建脚本
       <sub>微信 / 支付宝 扫码打赏</sub>
     </td>
     <td align="center" valign="middle">
-      <a href="https://www.ifdian.net/item/db69bdce79e911f19e2f52540025c377"><strong>爱发电 打赏页 →</strong></a><br/>
-      <sub>或点顶部 <code>Sponsor</code> 徽章</sub>
+      <a href="https://www.ifdian.net/item/db69bdce79e911f19e2f52540025c377"><strong>爱发电 打赏页 →</strong></a>
     </td>
   </tr>
 </table>

@@ -11,6 +11,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -42,6 +43,8 @@ type Config struct {
 	APIKey     string // optional key clients must send (x-api-key / Authorization)
 	AgentMode  string // Kiro agent mode, e.g. "vibe"
 	Region     string // optional region override (defaults to the token's region)
+	Log        bool   // enable request logging (off by default); logs to stdout unless LogFile is set
+	LogFile    string // if set, write the request log here instead of stdout ("none"/"off" disables)
 }
 
 func defaultTokenFile() string {
@@ -114,6 +117,8 @@ func newServeFlags() (*flag.FlagSet, *Config) {
 	fs.StringVar(&cfg.APIKey, "api-key", "", "if set, clients must present this key via x-api-key or Authorization: Bearer")
 	fs.StringVar(&cfg.AgentMode, "agent-mode", "vibe", "Kiro agent mode")
 	fs.StringVar(&cfg.Region, "region", "", "region override (defaults to the token's region)")
+	fs.BoolVar(&cfg.Log, "log", false, "enable request logging to stdout (the window); off by default")
+	fs.StringVar(&cfg.LogFile, "log-file", "", "write the request log to this file instead of stdout (implies --log); 'none' disables")
 	return fs, cfg
 }
 
@@ -140,6 +145,40 @@ func configureProxy(cfg *Config) {
 	}
 }
 
+// setupRequestLog resolves the --log / --log-file flags into a request logger.
+// Logging is OFF unless --log is set or --log-file names a destination:
+//
+//	--log=false, --log-file=""  -> disabled (nil logger, no access log)
+//	--log,       --log-file=""  -> stdout (the window)
+//	--log-file="stdout"/"-"     -> stdout
+//	--log-file="stderr"         -> stderr
+//	--log-file="none"/"off"     -> disabled
+//	--log-file=<path>           -> append to the file at <path>
+//
+// It returns the logger (nil when disabled), an optional closer for an opened
+// file, a short note for the startup banner, and any file-open error.
+func setupRequestLog(enable bool, file string) (*log.Logger, func(), string, error) {
+	switch strings.ToLower(strings.TrimSpace(file)) {
+	case "none", "off", "false", "no", "disabled":
+		return nil, nil, "disabled", nil
+	case "":
+		if !enable {
+			return nil, nil, "disabled", nil
+		}
+		return log.New(os.Stdout, "", log.LstdFlags), nil, "stdout (window)", nil
+	case "stdout", "-":
+		return log.New(os.Stdout, "", log.LstdFlags), nil, "stdout (window)", nil
+	case "stderr":
+		return log.New(os.Stderr, "", log.LstdFlags), nil, "stderr", nil
+	default:
+		f, err := os.OpenFile(file, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		return log.New(f, "", log.LstdFlags), func() { _ = f.Close() }, file, nil
+	}
+}
+
 func runServe(args []string) {
 	fs, cfg := newServeFlags()
 	_ = fs.Parse(args)
@@ -154,6 +193,15 @@ func runServe(args []string) {
 	}
 
 	srv := NewServer(cfg, store, client)
+
+	logger, closeLog, logNote, err := setupRequestLog(cfg.Log, cfg.LogFile)
+	if err != nil {
+		fatalf("could not open --log-file %q: %v", cfg.LogFile, err)
+	}
+	if closeLog != nil {
+		defer closeLog()
+	}
+	srv.logger = logger
 
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	httpServer := &http.Server{
@@ -183,6 +231,7 @@ func runServe(args []string) {
 		}
 		fmt.Printf("  effort    : per request, default max (output_config.effort / reasoning_effort)\n")
 		fmt.Printf("  max-tokens: per request, default max (caller max_tokens honored, clamped)\n")
+		fmt.Printf("  log       : %s\n", logNote)
 		fmt.Println("  ready. press Ctrl+C to stop.")
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			fatalf("server error: %v", err)

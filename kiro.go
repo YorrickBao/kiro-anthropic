@@ -223,6 +223,10 @@ func (s *kiroStream) Recv() (*kiroEvent, error) {
 	if err != nil {
 		return nil, err
 	}
+	if os.Getenv("KIRO_DEBUG_STREAM") != "" {
+		fmt.Fprintf(os.Stderr, "[kiro-stream] :message-type=%s :event-type=%s :exception-type=%s payload=%s\n",
+			msg.messageType(), msg.eventType(), msg.exceptionType(), msg.payload)
+	}
 	return parseKiroMessage(msg), nil
 }
 

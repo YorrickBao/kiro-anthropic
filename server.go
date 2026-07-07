@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -13,9 +14,10 @@ import (
 
 // Server wires the Anthropic-facing HTTP API to the Kiro backend.
 type Server struct {
-	cfg   *Config
-	store *TokenStore
-	kiro  *KiroClient
+	cfg    *Config
+	store  *TokenStore
+	kiro   *KiroClient
+	logger *log.Logger // per-request access log; nil disables it
 
 	modelsMu    sync.Mutex
 	modelsCache []kiroModelInfo
@@ -40,7 +42,84 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/v1/models", s.handleModels)
 	mux.HandleFunc("/v1/messages", s.handleMessages)
-	return mux
+	return s.logRequests(mux)
+}
+
+// ---- request logging ----
+
+// ctxKeyAccess is the context key under which per-request log details live.
+type ctxKeyAccess struct{}
+
+// accessInfo carries request details that handlers attach for the access log.
+type accessInfo struct {
+	model  string
+	stream bool
+}
+
+func accessFrom(ctx context.Context) *accessInfo {
+	a, _ := ctx.Value(ctxKeyAccess{}).(*accessInfo)
+	return a
+}
+
+// statusWriter records the response status and byte count while preserving the
+// http.Flusher behaviour that streaming (SSE) responses depend on.
+type statusWriter struct {
+	http.ResponseWriter
+	status  int
+	bytes   int
+	written bool
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	if !w.written {
+		w.status = code
+		w.written = true
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(b []byte) (int, error) {
+	if !w.written {
+		w.status = http.StatusOK
+		w.written = true
+	}
+	n, err := w.ResponseWriter.Write(b)
+	w.bytes += n
+	return n, err
+}
+
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// logRequests wraps h with a one-line-per-request access log. When request
+// logging is disabled (s.logger == nil) it returns h unchanged.
+func (s *Server) logRequests(h http.Handler) http.Handler {
+	if s.logger == nil {
+		return h
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		info := &accessInfo{}
+		r = r.WithContext(context.WithValue(r.Context(), ctxKeyAccess{}, info))
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+
+		h.ServeHTTP(sw, r)
+
+		detail := ""
+		if info.model != "" {
+			mode := "sync"
+			if info.stream {
+				mode = "stream"
+			}
+			detail = fmt.Sprintf(" model=%s %s", info.model, mode)
+		}
+		s.logger.Printf("%s %s %d %s %dB%s",
+			r.Method, r.URL.Path, sw.status,
+			time.Since(start).Round(time.Millisecond), sw.bytes, detail)
+	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -233,6 +312,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if err := json.Unmarshal(body, &areq); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON: "+err.Error())
 		return
+	}
+
+	if info := accessFrom(r.Context()); info != nil {
+		info.model = areq.Model
+		info.stream = areq.Stream
 	}
 
 	kreq, err := buildKiroRequest(s.cfg, &areq)

@@ -1,5 +1,12 @@
 # kiro-anthropic
 
+[![CI](https://github.com/YorrickBao/kiro-anthropic/actions/workflows/ci.yml/badge.svg)](https://github.com/YorrickBao/kiro-anthropic/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/YorrickBao/kiro-anthropic?sort=semver)](https://github.com/YorrickBao/kiro-anthropic/releases)
+[![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go)](https://go.dev)
+[![Go Report Card](https://goreportcard.com/badge/github.com/YorrickBao/kiro-anthropic)](https://goreportcard.com/report/github.com/YorrickBao/kiro-anthropic)
+[![License: MIT](https://img.shields.io/github/license/YorrickBao/kiro-anthropic)](LICENSE)
+[![Conventional Commits](https://img.shields.io/badge/Conventional%20Commits-1.0.0-yellow)](https://www.conventionalcommits.org/en/v1.0.0/)
+
 把 **Kiro**（Amazon Q Developer / CodeWhisperer）账号代理成 **Anthropic Messages API** 的本地服务。任何兼容 Anthropic 协议的客户端（Claude Code、各类 SDK 等）都能直接指向本服务，用上 Kiro 里的 Claude（以及 DeepSeek / GLM / MiniMax / Qwen 等）模型。
 
 零第三方依赖，单个静态二进制。默认监听 `127.0.0.1:17890`。

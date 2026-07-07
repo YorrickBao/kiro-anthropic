@@ -230,7 +230,7 @@ func runServe(args []string) {
 			fmt.Printf("  auth      : x-api-key required\n")
 		}
 		fmt.Printf("  effort    : per request, default max (output_config.effort / reasoning_effort)\n")
-		fmt.Printf("  max-tokens: per request, default max (caller max_tokens honored, clamped)\n")
+		fmt.Printf("  max-tokens: passed through to Kiro (backend does not enforce it)\n")
 		fmt.Printf("  log       : %s\n", logNote)
 		fmt.Println("  ready. press Ctrl+C to stop.")
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {

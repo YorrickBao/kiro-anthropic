@@ -48,6 +48,18 @@ jobs:
           VERSION: ${{ steps.v.outputs.version }}
         run: ./build.sh
 
+      - name: Generate release notes (git-cliff)
+        uses: orhun/git-cliff-action@v4
+        id: git-cliff
+        with:
+          # 仓库根目录的 cliff.toml 定义分组规则
+          config: cliff.toml
+          # --latest 只取最新 tag 这一段；--strip header 去掉顶部 "# Changelog" 标题
+          args: --latest --strip header
+        env:
+          # 生成的说明写到该文件，供下一步发布使用
+          OUTPUT: RELEASE_NOTES.md
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -56,4 +68,4 @@ jobs:
           gh release create "$VERSION" dist/* \
             --target "${{ github.sha }}" \
             --title "$VERSION" \
-            --generate-notes
+            --notes-file RELEASE_NOTES.md

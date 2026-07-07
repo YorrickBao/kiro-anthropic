@@ -3,7 +3,6 @@
 [![CI](https://github.com/YorrickBao/kiro-anthropic/actions/workflows/ci.yml/badge.svg)](https://github.com/YorrickBao/kiro-anthropic/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/YorrickBao/kiro-anthropic?sort=semver)](https://github.com/YorrickBao/kiro-anthropic/releases)
 [![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go)](https://go.dev)
-[![Go Report Card](https://goreportcard.com/badge/github.com/YorrickBao/kiro-anthropic)](https://goreportcard.com/report/github.com/YorrickBao/kiro-anthropic)
 [![License: MIT](https://img.shields.io/github/license/YorrickBao/kiro-anthropic)](LICENSE)
 [![Conventional Commits](https://img.shields.io/badge/Conventional%20Commits-1.0.0-yellow)](https://www.conventionalcommits.org/en/v1.0.0/)
 
@@ -23,7 +22,7 @@
 - **系统提示词**：`system` 原生透传到 Kiro 的 `systemPrompt`。
 - **推理 effort**：读取请求里的 `output_config.effort` / `reasoning_effort`，**未指定时默认顶格**，并按每个模型的档位自动 clamp。
 - **扩展思考（extended thinking）**：模型的思考过程通过 Anthropic 原生的 `thinking` / `redacted_thinking` 内容块透传（流式下发 `thinking_delta` + `signature_delta`）。多轮对话时思考块连同 `signature` 原样回传给后端；若后端判定签名失效（`THINKING_SIGNATURE_INVALID`），自动剥离推理内容并重试一次。请求侧 `thinking: {type:"disabled"}` 会关闭思考块并把 effort 降到最低档。
-- **最大输出 tokens**：尊重调用方的 `max_tokens`，按模型的 `[min, max]` 范围 clamp，**未指定时默认顶格**。
+- **最大输出 tokens**：按模型 schema 把调用方的 `max_tokens` 下发给 Kiro。**注意：实测 Kiro 后端不强制执行该上限**，实际输出长度由模型/effort 决定，`stop_reason` 基本不会是 `max_tokens`。该字段仅为协议兼容而发送。
 - **模型能力发现** `GET /v1/models`：返回 `max_input_tokens`、`max_tokens`、`capabilities.effort`（上下文窗口、effort 档位）。
 - **令牌自动刷新**：读取 Kiro 的登录缓存，快过期时用 SSO-OIDC 自动续期并写回。
 - **profileArn 自动解析**：企业/IdC 账号走 `ListAvailableProfiles`，免费/社交登录用内置固定 ARN。
@@ -164,8 +163,8 @@ Anthropic Messages API。支持 `stream: true`（SSE：`message_start` / `conten
 - 不支持 effort 的模型（如 `claude-sonnet-4.5`、`auto`）不会下发该字段。
 
 ### 最大输出 tokens
-- 尊重调用方的 `max_tokens`，并 clamp 到模型的 `[min, max]`（例如 opus-4.8 为 `[1024, 128000]`）。
-- **默认**：请求未指定时按模型上限下发。
+- 调用方的 `max_tokens` 会按模型 schema（`[min, max]`，例如 opus-4.8 为 `[1024, 128000]`）clamp 后下发到 Kiro 的 `additionalModelRequestFields`。
+- **不强制执行**：实测 Kiro 后端忽略该上限——即便下发 `max_tokens=1024`，模型仍会按需输出到自然结束（`stop_reason=end_turn`）。因此不要依赖 `max_tokens` 截断输出，`stop_reason` 也基本不会是 `max_tokens`。
 - 不支持该字段的模型不下发。
 
 ### 扩展思考（extended thinking / reasoning）
@@ -212,7 +211,8 @@ export NO_PROXY=127.0.0.1,localhost
 - **网络搜索不支持**：Anthropic 的 `web_search` 是服务端工具，而 Kiro 的 web 搜索是客户端工具、runtime 无对应服务端接口，无法直接映射（客户端会报 “web search not supported”）。
 - **图片仅 base64**：`source.type: "url"` 的图片会被跳过（留 `[unsupported image omitted]` 提示）；`tool_result` 里的图片不转发。
 - **采样参数**：`temperature` / `top_p` / `top_k` 不透传（Opus 4.7+ 本身也不支持）。
-- **usage 为估算**：返回的 `input_tokens` / `output_tokens` 是基于字符数的粗略估算，非精确计费值。
+- **usage 为估算**：返回的 `input_tokens` / `output_tokens` 是基于字符数的粗略估算（非精确计费值）。Kiro 后端只提供上下文占用百分比与 credit 计费，不提供真实 token 计数，故无法返回精确值。
+- **stop_reason**：取自 Kiro 结束帧（`metadataEvent.stopReason`）的权威值（`END_TURN`/`TOOL_USE`/`MAX_TOKENS` 等），映射为 Anthropic 的 `end_turn`/`tool_use`/`max_tokens`。由于后端不强制 `max_tokens`，`max_tokens` 实际极少出现。
 
 ---
 

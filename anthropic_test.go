@@ -353,3 +353,183 @@ func TestEstimateTokens(t *testing.T) {
 		}
 	}
 }
+
+// --- extended thinking / reasoning ---
+
+func TestRequestedEffortThinking(t *testing.T) {
+	// thinking disabled -> minimize sentinel
+	if got := requestedEffort(&anthropicRequest{Thinking: &anthropicThinking{Type: "disabled"}}); got != effortMinimize {
+		t.Errorf("disabled thinking -> %q, want minimize sentinel", got)
+	}
+	// thinking enabled -> default (empty = top out)
+	if got := requestedEffort(&anthropicRequest{Thinking: &anthropicThinking{Type: "enabled", BudgetTokens: 5000}}); got != "" {
+		t.Errorf("enabled thinking -> %q, want empty", got)
+	}
+	// explicit effort still wins over the thinking toggle
+	if got := requestedEffort(&anthropicRequest{
+		OutputConfig: &anthropicOutputConfig{Effort: "high"},
+		Thinking:     &anthropicThinking{Type: "disabled"}}); got != "high" {
+		t.Errorf("explicit effort should win, got %q", got)
+	}
+	// suppression flag
+	if !thinkingSuppressed(&anthropicRequest{Thinking: &anthropicThinking{Type: "disabled"}}) {
+		t.Errorf("disabled thinking should be suppressed")
+	}
+	if thinkingSuppressed(&anthropicRequest{Thinking: &anthropicThinking{Type: "enabled"}}) {
+		t.Errorf("enabled thinking should not be suppressed")
+	}
+	if thinkingSuppressed(&anthropicRequest{}) {
+		t.Errorf("absent thinking should not be suppressed")
+	}
+}
+
+func TestBlockAssemblerReasoning(t *testing.T) {
+	a := newBlockAssembler(nil)
+	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningText: "let me "})
+	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningText: "think"})
+	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningSignature: "SIG=="})
+	_ = a.addText("answer")
+	_ = a.closeOpen()
+	if len(a.blocks) != 2 {
+		t.Fatalf("blocks = %+v", a.blocks)
+	}
+	if a.blocks[0].Type != "thinking" || a.blocks[0].Thinking != "let me think" || a.blocks[0].Signature != "SIG==" {
+		t.Errorf("thinking block = %+v", a.blocks[0])
+	}
+	if a.blocks[1].Type != "text" || a.blocks[1].Text != "answer" {
+		t.Errorf("text block = %+v", a.blocks[1])
+	}
+	// thinking precedes text and is not a tool turn
+	if a.stopReason() != "end_turn" {
+		t.Errorf("stopReason = %q", a.stopReason())
+	}
+}
+
+func TestBlockAssemblerReasoningSSE(t *testing.T) {
+	type rec struct {
+		name string
+		data map[string]any
+	}
+	var got []rec
+	emit := func(name string, data any) error {
+		got = append(got, rec{name, data.(map[string]any)})
+		return nil
+	}
+	a := newBlockAssembler(emit)
+	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningText: "hmm"})
+	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningSignature: "SIG=="})
+	_ = a.closeOpen()
+	// content_block_start(thinking) -> thinking_delta -> signature_delta -> stop
+	if len(got) != 4 {
+		t.Fatalf("events = %+v", got)
+	}
+	cb := got[0].data["content_block"].(map[string]any)
+	if got[0].name != "content_block_start" || cb["type"] != "thinking" {
+		t.Errorf("start = %+v", got[0])
+	}
+	d1 := got[1].data["delta"].(map[string]any)
+	if got[1].name != "content_block_delta" || d1["type"] != "thinking_delta" || d1["thinking"] != "hmm" {
+		t.Errorf("delta1 = %+v", got[1])
+	}
+	d2 := got[2].data["delta"].(map[string]any)
+	if got[2].name != "content_block_delta" || d2["type"] != "signature_delta" || d2["signature"] != "SIG==" {
+		t.Errorf("delta2 = %+v", got[2])
+	}
+	if got[3].name != "content_block_stop" {
+		t.Errorf("stop = %+v", got[3])
+	}
+}
+
+func TestBlockAssemblerReasoningSuppressed(t *testing.T) {
+	a := newBlockAssembler(nil)
+	a.emitThinking = false
+	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningText: "secret"})
+	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningSignature: "SIG=="})
+	_ = a.addText("answer")
+	_ = a.closeOpen()
+	if len(a.blocks) != 1 || a.blocks[0].Type != "text" {
+		t.Errorf("suppressed blocks = %+v", a.blocks)
+	}
+}
+
+func TestBlockAssemblerRedactedThinking(t *testing.T) {
+	var events []string
+	emit := func(name string, _ any) error { events = append(events, name); return nil }
+	a := newBlockAssembler(emit)
+	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningRedacted: "REDACTED=="})
+	_ = a.closeOpen()
+	if len(a.blocks) != 1 || a.blocks[0].Type != "redacted_thinking" || a.blocks[0].Data != "REDACTED==" {
+		t.Errorf("redacted block = %+v", a.blocks)
+	}
+	// redacted reasoning has no delta: start (carrying data) then stop.
+	if len(events) != 2 || events[0] != "content_block_start" || events[1] != "content_block_stop" {
+		t.Errorf("redacted events = %v", events)
+	}
+}
+
+func TestBuildKiroRequestThinkingHistory(t *testing.T) {
+	areq := &anthropicRequest{
+		Model: "claude-opus-4.8",
+		Messages: []anthropicMessage{
+			{Role: "user", Content: json.RawMessage(`"solve it"`)},
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"thinking","thinking":"reasoning...","signature":"SIG=="},{"type":"text","text":"the answer"}]`)},
+			{Role: "user", Content: json.RawMessage(`"thanks"`)},
+		},
+	}
+	k, err := buildKiroRequest(&Config{}, areq)
+	if err != nil {
+		t.Fatalf("buildKiroRequest: %v", err)
+	}
+	am := k.ConversationState.History[1].AssistantResponseMessage
+	if am == nil || am.ReasoningContent == nil || am.ReasoningContent.ReasoningText == nil {
+		t.Fatalf("reasoningContent missing: %+v", am)
+	}
+	if am.ReasoningContent.ReasoningText.Text != "reasoning..." || am.ReasoningContent.ReasoningText.Signature != "SIG==" {
+		t.Errorf("reasoningText = %+v", am.ReasoningContent.ReasoningText)
+	}
+	if am.Content != "the answer" {
+		t.Errorf("content = %q", am.Content)
+	}
+	// the round-tripped reasoningContent must serialize under the union shape.
+	raw, _ := json.Marshal(am)
+	if !strings.Contains(string(raw), `"reasoningContent":{"reasoningText":{"text":"reasoning...","signature":"SIG=="}}`) {
+		t.Errorf("reasoningContent wire shape = %s", raw)
+	}
+}
+
+func TestBuildKiroRequestRedactedThinkingHistory(t *testing.T) {
+	areq := &anthropicRequest{
+		Model: "claude-opus-4.8",
+		Messages: []anthropicMessage{
+			{Role: "user", Content: json.RawMessage(`"q"`)},
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"redacted_thinking","data":"ENC=="},{"type":"text","text":"a"}]`)},
+			{Role: "user", Content: json.RawMessage(`"more"`)},
+		},
+	}
+	k, err := buildKiroRequest(&Config{}, areq)
+	if err != nil {
+		t.Fatalf("buildKiroRequest: %v", err)
+	}
+	am := k.ConversationState.History[1].AssistantResponseMessage
+	if am == nil || am.ReasoningContent == nil || am.ReasoningContent.RedactedContent != "ENC==" {
+		t.Errorf("redactedContent = %+v", am.ReasoningContent)
+	}
+}
+
+func TestStripReasoningFromHistory(t *testing.T) {
+	kreq := &kiroRequest{ConversationState: kiroConversationState{History: []kiroMessage{
+		{UserInputMessage: &kiroUserInputMessage{Content: "hi"}},
+		{AssistantResponseMessage: &kiroAssistantMessage{Content: "a",
+			ReasoningContent: &kiroReasoningContent{ReasoningText: &kiroReasoningText{Text: "t", Signature: "s"}}}},
+	}}}
+	if !stripReasoningFromHistory(kreq) {
+		t.Errorf("should report stripped")
+	}
+	if kreq.ConversationState.History[1].AssistantResponseMessage.ReasoningContent != nil {
+		t.Errorf("reasoningContent not stripped")
+	}
+	// nothing left to strip -> false
+	if stripReasoningFromHistory(kreq) {
+		t.Errorf("second strip should be false")
+	}
+}

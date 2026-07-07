@@ -86,8 +86,23 @@ type kiroToolResultContent struct {
 }
 
 type kiroAssistantMessage struct {
-	Content  string        `json:"content"`
-	ToolUses []kiroToolUse `json:"toolUses,omitempty"`
+	Content          string                `json:"content"`
+	ToolUses         []kiroToolUse         `json:"toolUses,omitempty"`
+	ReasoningContent *kiroReasoningContent `json:"reasoningContent,omitempty"`
+}
+
+// kiroReasoningContent is the CodeWhisperer ReasoningContent union carried on an
+// assistant turn in history. Exactly one member is set: reasoningText for normal
+// extended thinking (text + signature), or redactedContent for encrypted
+// reasoning the backend chose to redact.
+type kiroReasoningContent struct {
+	ReasoningText   *kiroReasoningText `json:"reasoningText,omitempty"`
+	RedactedContent string             `json:"redactedContent,omitempty"` // base64 blob
+}
+
+type kiroReasoningText struct {
+	Text      string `json:"text"`
+	Signature string `json:"signature,omitempty"`
 }
 
 type kiroToolUse struct {
@@ -104,6 +119,7 @@ type kiroEventKind int
 
 const (
 	evText kiroEventKind = iota
+	evReasoning
 	evToolUse
 	evMetadata
 	evError
@@ -115,6 +131,10 @@ type kiroEvent struct {
 
 	Text string // evText
 
+	ReasoningText      string // evReasoning (partial thinking text chunk)
+	ReasoningSignature string // evReasoning (thinking signature; arrives once, after text)
+	ReasoningRedacted  string // evReasoning (base64 blob for redacted reasoning)
+
 	ToolUseID string // evToolUse
 	ToolName  string // evToolUse (present on first chunk)
 	ToolInput string // evToolUse (partial JSON chunk)
@@ -122,8 +142,9 @@ type kiroEvent struct {
 
 	ConversationID string // evMetadata
 
-	ErrKind string // evError
-	ErrMsg  string // evError
+	ErrKind   string // evError
+	ErrMsg    string // evError
+	ErrReason string // evError (CodeWhisperer ValidationException reason code, e.g. THINKING_SIGNATURE_INVALID)
 }
 
 // ---------------------------------------------------------------------------
@@ -242,7 +263,8 @@ func (s *kiroStream) Close() error {
 func parseKiroMessage(msg *eventMessage) *kiroEvent {
 	// Service-level exceptions are flagged in the message headers.
 	if msg.messageType() == "exception" {
-		return &kiroEvent{Kind: evError, ErrKind: msg.exceptionType(), ErrMsg: extractMessage(msg.payload)}
+		errMsg, reason := extractMessageAndReason(msg.payload)
+		return &kiroEvent{Kind: evError, ErrKind: msg.exceptionType(), ErrMsg: errMsg, ErrReason: reason}
 	}
 
 	switch msg.eventType() {
@@ -252,6 +274,24 @@ func parseKiroMessage(msg *eventMessage) *kiroEvent {
 		}
 		_ = json.Unmarshal(msg.payload, &p)
 		return &kiroEvent{Kind: evText, Text: p.Content}
+
+	case "reasoningContentEvent":
+		// Extended-thinking stream: text chunks arrive first, then a single
+		// frame carrying the signature; redactedContent appears when the
+		// backend encrypts the reasoning. See ReasoningContentEvent in Kiro's
+		// bundled CodeWhisperer client.
+		var p struct {
+			Text            string `json:"text"`
+			Signature       string `json:"signature"`
+			RedactedContent string `json:"redactedContent"`
+		}
+		_ = json.Unmarshal(msg.payload, &p)
+		return &kiroEvent{
+			Kind:               evReasoning,
+			ReasoningText:      p.Text,
+			ReasoningSignature: p.Signature,
+			ReasoningRedacted:  p.RedactedContent,
+		}
 
 	case "toolUseEvent":
 		var p struct {
@@ -279,7 +319,8 @@ func parseKiroMessage(msg *eventMessage) *kiroEvent {
 	case "invalidStateEvent", "internalServerException", "throttlingError",
 		"serviceQuotaExceededError", "conversationExpiredError", "dryRunSucceedEvent":
 		// Error-ish union members surfaced as normal events.
-		return &kiroEvent{Kind: evError, ErrKind: msg.eventType(), ErrMsg: extractMessage(msg.payload)}
+		errMsg, reason := extractMessageAndReason(msg.payload)
+		return &kiroEvent{Kind: evError, ErrKind: msg.eventType(), ErrMsg: errMsg, ErrReason: reason}
 
 	default:
 		// codeReferenceEvent, followupPromptEvent, supplementaryWebLinksEvent,
@@ -302,20 +343,38 @@ func rawToInputString(raw json.RawMessage) string {
 	return string(raw)
 }
 
-func extractMessage(payload []byte) string {
+// extractMessageAndReason pulls the human-readable message and the machine
+// reason code (CodeWhisperer ValidationException carries {message, reason})
+// out of an error payload. reason is "" when absent.
+func extractMessageAndReason(payload []byte) (message, reason string) {
 	var p struct {
 		Message string `json:"message"`
 		Msg     string `json:"Message"`
+		Reason  string `json:"reason"`
 	}
 	if err := json.Unmarshal(payload, &p); err == nil {
-		if p.Message != "" {
-			return p.Message
-		}
-		if p.Msg != "" {
-			return p.Msg
+		reason = p.Reason
+		switch {
+		case p.Message != "":
+			return p.Message, reason
+		case p.Msg != "":
+			return p.Msg, reason
 		}
 	}
-	return string(payload)
+	return string(payload), reason
+}
+
+// reason parses the CodeWhisperer reason code out of a non-2xx runtime response
+// body (a ValidationException is {"message":...,"reason":...}). Returns "" when
+// the body is not JSON or carries no reason.
+func (e *kiroHTTPError) reason() string {
+	var p struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(e.Body), &p); err == nil {
+		return p.Reason
+	}
+	return ""
 }
 
 // kiroHTTPError carries a non-2xx runtime response.
@@ -406,6 +465,14 @@ func (e effortConfig) max() string {
 		return ""
 	}
 	return e.Levels[len(e.Levels)-1]
+}
+
+// min returns the lowest advertised effort level.
+func (e effortConfig) min() string {
+	if len(e.Levels) == 0 {
+		return ""
+	}
+	return e.Levels[0]
 }
 
 // clamp returns desired if the model advertises it, else the highest level.

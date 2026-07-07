@@ -259,13 +259,19 @@ func (s *Server) applyModelRequestFields(ctx context.Context, kreq *kiroRequest,
 	fields := map[string]any{}
 
 	// Reasoning effort: client's requested level, defaulting to the model's
-	// maximum when unspecified. Always clamped to the advertised levels.
+	// maximum when unspecified. A disabled thinking toggle minimizes it.
+	// Always clamped to the advertised levels.
 	if ec, ok := model.effort(); ok {
-		desired := strings.ToLower(strings.TrimSpace(reqEffort))
-		if desired == "" {
-			desired = "max"
+		var level string
+		switch desired := strings.TrimSpace(reqEffort); desired {
+		case "":
+			level = ec.max() // default: top out
+		case effortMinimize:
+			level = ec.min() // thinking disabled: use the lowest level
+		default:
+			level = ec.clamp(strings.ToLower(desired))
 		}
-		if level := ec.clamp(desired); level != "" {
+		if level != "" {
 			fields[ec.SchemaPath] = map[string]any{"effort": level}
 		}
 	}
@@ -336,7 +342,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// Effort and max output tokens: request-driven, defaulting to the model max.
 	s.applyModelRequestFields(r.Context(), kreq, requestedEffort(&areq), areq.MaxTokens)
 
-	stream, err := s.kiro.Send(r.Context(), kreq)
+	stream, err := s.sendWithReasoningRetry(r.Context(), kreq)
 	if err != nil {
 		status, errType := mapUpstreamError(err)
 		writeAnthropicError(w, status, errType, err.Error())
@@ -356,10 +362,42 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	s.aggregateMessages(w, r, &areq, stream, inputChars)
 }
 
+// sendWithReasoningRetry sends the request and, if the backend rejects a stale
+// or invalid extended-thinking signature, retries once with reasoningContent
+// stripped from history. This mirrors Kiro's own recovery and matters most
+// during multi-turn / context compaction, where a signature may no longer
+// validate. The retry only fires when there was reasoning in history to strip.
+func (s *Server) sendWithReasoningRetry(ctx context.Context, kreq *kiroRequest) (*kiroStream, error) {
+	stream, err := s.kiro.Send(ctx, kreq)
+	if err == nil {
+		return stream, nil
+	}
+	if isThinkingSignatureError(err) && stripReasoningFromHistory(kreq) {
+		return s.kiro.Send(ctx, kreq)
+	}
+	return nil, err
+}
+
+// isThinkingSignatureError reports whether err is a request-validation failure
+// caused by an invalid or stale extended-thinking signature.
+func isThinkingSignatureError(err error) bool {
+	he, ok := err.(*kiroHTTPError)
+	if !ok || he.Status != http.StatusBadRequest {
+		return false
+	}
+	if he.reason() == "THINKING_SIGNATURE_INVALID" {
+		return true
+	}
+	// Fallback when the machine reason is absent: sniff the message text.
+	body := strings.ToLower(he.Body)
+	return strings.Contains(body, "thinking") && strings.Contains(body, "signature")
+}
+
 // aggregateMessages handles non-streaming requests: collect all events, then
 // return a single Anthropic message.
 func (s *Server) aggregateMessages(w http.ResponseWriter, r *http.Request, areq *anthropicRequest, stream *kiroStream, inputChars int) {
 	asm := newBlockAssembler(nil)
+	asm.emitThinking = !thinkingSuppressed(areq)
 
 	for {
 		ev, err := stream.Recv()
@@ -371,6 +409,8 @@ func (s *Server) aggregateMessages(w http.ResponseWriter, r *http.Request, areq 
 			return
 		}
 		switch ev.Kind {
+		case evReasoning:
+			_ = asm.addReasoning(ev)
 		case evText:
 			_ = asm.addText(ev.Text)
 		case evToolUse:
@@ -453,6 +493,7 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, areq *an
 	_ = emit("ping", map[string]any{"type": "ping"})
 
 	asm := newBlockAssembler(emit)
+	asm.emitThinking = !thinkingSuppressed(areq)
 
 	for {
 		ev, err := stream.Recv()
@@ -467,6 +508,10 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, areq *an
 			return
 		}
 		switch ev.Kind {
+		case evReasoning:
+			if err := asm.addReasoning(ev); err != nil {
+				return
+			}
 		case evText:
 			if err := asm.addText(ev.Text); err != nil {
 				return

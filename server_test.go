@@ -152,3 +152,32 @@ func TestAuthorized(t *testing.T) {
 		t.Errorf("missing key should reject")
 	}
 }
+
+func TestApplyModelRequestFieldsMinimize(t *testing.T) {
+	s := testServerWithModels()
+	// thinking disabled -> minimize sentinel -> the model's lowest effort level.
+	k := reqForModel("claude-opus-4.8")
+	s.applyModelRequestFields(context.Background(), k, effortMinimize, 0)
+	if effortOf(k) != "low" {
+		t.Errorf("minimize effort = %q, want low", effortOf(k))
+	}
+}
+
+func TestIsThinkingSignatureError(t *testing.T) {
+	if !isThinkingSignatureError(&kiroHTTPError{Status: 400, Body: `{"message":"bad","reason":"THINKING_SIGNATURE_INVALID"}`}) {
+		t.Errorf("reason code should match")
+	}
+	// message sniff fallback when no machine reason present
+	if !isThinkingSignatureError(&kiroHTTPError{Status: 400, Body: `The thinking signature is invalid`}) {
+		t.Errorf("message sniff should match")
+	}
+	if isThinkingSignatureError(&kiroHTTPError{Status: 400, Body: `{"reason":"PROMPT_TOO_LONG"}`}) {
+		t.Errorf("unrelated reason should not match")
+	}
+	if isThinkingSignatureError(&kiroHTTPError{Status: 500, Body: `thinking signature`}) {
+		t.Errorf("non-400 should not match")
+	}
+	if isThinkingSignatureError(context.Canceled) {
+		t.Errorf("non-http error should not match")
+	}
+}

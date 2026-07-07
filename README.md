@@ -15,6 +15,7 @@
 - **图片输入**：base64 的 `png` / `jpeg` / `gif` / `webp`（已实测可正常识图）。
 - **系统提示词**：`system` 原生透传到 Kiro 的 `systemPrompt`。
 - **推理 effort**：读取请求里的 `output_config.effort` / `reasoning_effort`，**未指定时默认顶格**，并按每个模型的档位自动 clamp。
+- **扩展思考（extended thinking）**：模型的思考过程通过 Anthropic 原生的 `thinking` / `redacted_thinking` 内容块透传（流式下发 `thinking_delta` + `signature_delta`）。多轮对话时思考块连同 `signature` 原样回传给后端；若后端判定签名失效（`THINKING_SIGNATURE_INVALID`），自动剥离推理内容并重试一次。请求侧 `thinking: {type:"disabled"}` 会关闭思考块并把 effort 降到最低档。
 - **最大输出 tokens**：尊重调用方的 `max_tokens`，按模型的 `[min, max]` 范围 clamp，**未指定时默认顶格**。
 - **模型能力发现** `GET /v1/models`：返回 `max_input_tokens`、`max_tokens`、`capabilities.effort`（上下文窗口、effort 档位）。
 - **令牌自动刷新**：读取 Kiro 的登录缓存，快过期时用 SSO-OIDC 自动续期并写回。
@@ -115,13 +116,14 @@ curl --noproxy '*' http://127.0.0.1:17890/v1/messages \
 
 - `HTTPS_PROXY` / `HTTP_PROXY` / `https_proxy` / `http_proxy`：出站代理（被 `--proxy` 覆盖）。
 - `KIRO_DEBUG=1`：把发往 Kiro 的完整请求体打到 stderr，便于排查（不含密钥）。
+- `KIRO_DEBUG_STREAM=1`：把 Kiro 返回的每一帧事件（`:event-type` 与原始 payload）打到 stderr，便于排查思考/工具流。
 
 ---
 
 ## API 端点
 
 ### `POST /v1/messages`
-Anthropic Messages API。支持 `stream: true`（SSE：`message_start` / `content_block_start` / `content_block_delta` / `content_block_stop` / `message_delta` / `message_stop`）与非流式聚合响应。支持 `system`、`messages`、`tools`、`tool_result`、`image`、`output_config.effort` / `reasoning_effort`。
+Anthropic Messages API。支持 `stream: true`（SSE：`message_start` / `content_block_start` / `content_block_delta` / `content_block_stop` / `message_delta` / `message_stop`；`content_block_delta` 涵盖 `text_delta` / `thinking_delta` / `signature_delta` / `input_json_delta`）与非流式聚合响应。支持 `system`、`messages`、`tools`、`tool_result`、`image`、`thinking`、`output_config.effort` / `reasoning_effort`，以及历史消息中的 `thinking` / `redacted_thinking` 块回传。
 
 ### `GET /v1/models`
 返回账号可用模型，每项包含：`id`、`type`、`display_name`、`created_at`、`max_input_tokens`、`max_tokens`、`capabilities.effort`（`supported` 及 `low/medium/high/xhigh/max`）。
@@ -158,6 +160,14 @@ Anthropic Messages API。支持 `stream: true`（SSE：`message_start` / `conten
 - 尊重调用方的 `max_tokens`，并 clamp 到模型的 `[min, max]`（例如 opus-4.8 为 `[1024, 128000]`）。
 - **默认**：请求未指定时按模型上限下发。
 - 不支持该字段的模型不下发。
+
+### 扩展思考（extended thinking / reasoning）
+- Kiro 后端以 `reasoningContentEvent` 流式下发思考内容（先 `text` 分片，末尾一帧 `signature`）。本服务将其翻译为 Anthropic 的思考内容块：
+  - 流式：`content_block_start {type:"thinking"}` → 若干 `thinking_delta` → 一个 `signature_delta` → `content_block_stop`，然后才是正文 `text` 块。
+  - 非流式：`content` 数组里包含 `{"type":"thinking","thinking":"...","signature":"..."}`。
+  - 被后端加密的推理映射为 `redacted_thinking` 块（`data` 字段）。
+- **默认开启**：只要模型产出思考内容就透传（思考块始终排在正文之前）。请求带 `thinking: {"type":"disabled"}` 时不下发思考块，并把 effort 降到该模型最低档；`thinking: {"type":"enabled", "budget_tokens": N}` 按开启处理（`budget_tokens` 会被接收但不映射为 effort 档位，Kiro 用的是 effort 而非 token 预算）。
+- **多轮回传**：客户端把上一轮的 `thinking` / `redacted_thinking` 块（含 `signature`）放进 `messages` 历史时，会原样回传给后端（`assistantResponseMessage.reasoningContent`），以保持思考链连续。若后端返回 `THINKING_SIGNATURE_INVALID`（签名失效，常见于上下文压缩后），会自动剥离历史里的推理内容并重试一次。
 
 ### 图片
 - 支持 user 消息中的 base64 图片：`png` / `jpeg` / `gif` / `webp`。

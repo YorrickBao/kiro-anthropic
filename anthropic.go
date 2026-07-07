@@ -27,19 +27,47 @@ type anthropicRequest struct {
 	// Reasoning-effort control (native Anthropic field + OpenAI-style alias).
 	OutputConfig    *anthropicOutputConfig `json:"output_config,omitempty"`
 	ReasoningEffort string                 `json:"reasoning_effort,omitempty"`
+
+	// Extended-thinking toggle (Anthropic native). type is "enabled"|"disabled".
+	Thinking *anthropicThinking `json:"thinking,omitempty"`
 }
 
 type anthropicOutputConfig struct {
 	Effort string `json:"effort,omitempty"`
 }
 
+type anthropicThinking struct {
+	Type         string `json:"type"`                    // "enabled" | "disabled"
+	BudgetTokens int    `json:"budget_tokens,omitempty"` // accepted; Kiro maps effort, not token budgets
+}
+
+// effortMinimize is a sentinel returned by requestedEffort meaning "use the
+// model's lowest effort level" (the client asked to disable extended thinking,
+// which Kiro cannot fully turn off for reasoning models).
+const effortMinimize = "\x00min"
+
 // requestedEffort returns the effort level the client asked for, if any.
-// The native Anthropic field output_config.effort wins over the reasoning_effort alias.
+// Precedence: output_config.effort (native) > reasoning_effort (alias) >
+// thinking toggle. An explicit thinking.type=="disabled" minimizes effort;
+// "enabled" leaves the effort at its default (top-out) unless set above.
 func requestedEffort(areq *anthropicRequest) string {
 	if areq.OutputConfig != nil && areq.OutputConfig.Effort != "" {
 		return areq.OutputConfig.Effort
 	}
-	return areq.ReasoningEffort
+	if areq.ReasoningEffort != "" {
+		return areq.ReasoningEffort
+	}
+	if areq.Thinking != nil && strings.EqualFold(areq.Thinking.Type, "disabled") {
+		return effortMinimize
+	}
+	return ""
+}
+
+// thinkingSuppressed reports whether the client explicitly disabled extended
+// thinking, in which case reasoning content is dropped from the response
+// (matching Anthropic's contract that no thinking blocks appear when disabled).
+func thinkingSuppressed(areq *anthropicRequest) bool {
+	return areq.Thinking != nil && strings.EqualFold(areq.Thinking.Type, "disabled")
 }
 
 type anthropicMessage struct {
@@ -57,8 +85,15 @@ type anthropicTool struct {
 type anthropicContentBlock struct {
 	Type string `json:"type"`
 
-	// text / thinking
+	// text
 	Text string `json:"text,omitempty"`
+
+	// thinking
+	Thinking  string `json:"thinking,omitempty"`
+	Signature string `json:"signature,omitempty"`
+
+	// redacted_thinking
+	Data string `json:"data,omitempty"`
 
 	// image
 	Source *anthropicImageSource `json:"source,omitempty"`
@@ -125,8 +160,17 @@ type anthropicResponse struct {
 }
 
 type anthropicRespBlock struct {
-	Type  string          `json:"type"` // "text" | "tool_use"
-	Text  string          `json:"text,omitempty"`
+	Type string `json:"type"` // "text" | "thinking" | "redacted_thinking" | "tool_use"
+	Text string `json:"text,omitempty"`
+
+	// thinking
+	Thinking  string `json:"thinking,omitempty"`
+	Signature string `json:"signature,omitempty"`
+
+	// redacted_thinking
+	Data string `json:"data,omitempty"`
+
+	// tool_use
 	ID    string          `json:"id,omitempty"`
 	Name  string          `json:"name,omitempty"`
 	Input json.RawMessage `json:"input,omitempty"`
@@ -276,6 +320,19 @@ func convertMessage(m anthropicMessage, modelID string) (kiroMessage, error) {
 			switch b.Type {
 			case "text":
 				text.WriteString(b.Text)
+			case "thinking":
+				// Round-trip extended thinking (with its signature) so the
+				// backend can validate the reasoning chain on the next turn.
+				// The ReasoningContent union holds one member; first wins.
+				if am.ReasoningContent == nil && (b.Thinking != "" || b.Signature != "") {
+					am.ReasoningContent = &kiroReasoningContent{
+						ReasoningText: &kiroReasoningText{Text: b.Thinking, Signature: b.Signature},
+					}
+				}
+			case "redacted_thinking":
+				if am.ReasoningContent == nil && b.Data != "" {
+					am.ReasoningContent = &kiroReasoningContent{RedactedContent: b.Data}
+				}
 			case "tool_use":
 				input := b.Input
 				if len(input) == 0 {
@@ -372,6 +429,23 @@ func convertToolResult(b anthropicContentBlock) kiroToolResult {
 	return tr
 }
 
+// stripReasoningFromHistory removes reasoningContent from every assistant turn
+// in the request history, reporting whether anything was removed. Mirrors the
+// Kiro client's own recovery: when the backend rejects a stale or invalid
+// thinking signature (THINKING_SIGNATURE_INVALID), the request is retried once
+// with the reasoning stripped.
+func stripReasoningFromHistory(kreq *kiroRequest) bool {
+	stripped := false
+	for i := range kreq.ConversationState.History {
+		am := kreq.ConversationState.History[i].AssistantResponseMessage
+		if am != nil && am.ReasoningContent != nil {
+			am.ReasoningContent = nil
+			stripped = true
+		}
+	}
+	return stripped
+}
+
 // sanitizeHistory drops leading assistant turns and collapses so history begins
 // with a user turn, which the CodeWhisperer API expects.
 func sanitizeHistory(history []kiroMessage) []kiroMessage {
@@ -443,10 +517,18 @@ type emitFunc func(event string, data any) error
 type blockAssembler struct {
 	emit emitFunc
 
+	// emitThinking controls whether reasoning is surfaced as thinking blocks.
+	// Defaults to true; the server disables it when the client turned thinking
+	// off (thinking.type == "disabled").
+	emitThinking bool
+
 	index    int
-	openKind string // "", "text", "tool_use"
+	openKind string // "", "text", "thinking", "redacted_thinking", "tool_use"
 
 	textBuf      strings.Builder
+	thinkingBuf  strings.Builder
+	thinkingSig  strings.Builder
+	redactedBuf  strings.Builder
 	toolID       string
 	toolName     string
 	toolInputBuf strings.Builder
@@ -456,7 +538,72 @@ type blockAssembler struct {
 }
 
 func newBlockAssembler(emit emitFunc) *blockAssembler {
-	return &blockAssembler{emit: emit}
+	return &blockAssembler{emit: emit, emitThinking: true}
+}
+
+// addReasoning folds a Kiro reasoningContentEvent into a thinking (or
+// redacted_thinking) content block. Text streams as thinking_delta, the
+// signature as signature_delta; redacted reasoning is buffered and emitted
+// whole on close (Anthropic defines no delta event for it).
+func (a *blockAssembler) addReasoning(ev *kiroEvent) error {
+	if !a.emitThinking {
+		return nil // client disabled thinking: drop reasoning entirely
+	}
+
+	// Redacted reasoning is a distinct block type carrying opaque data.
+	if ev.ReasoningRedacted != "" {
+		if a.openKind != "redacted_thinking" {
+			if err := a.closeOpen(); err != nil {
+				return err
+			}
+			a.openKind = "redacted_thinking"
+			a.redactedBuf.Reset()
+		}
+		a.redactedBuf.WriteString(ev.ReasoningRedacted)
+		return nil
+	}
+
+	if ev.ReasoningText == "" && ev.ReasoningSignature == "" {
+		return nil
+	}
+
+	if a.openKind != "thinking" {
+		if err := a.closeOpen(); err != nil {
+			return err
+		}
+		a.openKind = "thinking"
+		a.thinkingBuf.Reset()
+		a.thinkingSig.Reset()
+		if err := a.send("content_block_start", map[string]any{
+			"type":          "content_block_start",
+			"index":         a.index,
+			"content_block": map[string]any{"type": "thinking", "thinking": ""},
+		}); err != nil {
+			return err
+		}
+	}
+
+	if ev.ReasoningText != "" {
+		a.thinkingBuf.WriteString(ev.ReasoningText)
+		if err := a.send("content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": a.index,
+			"delta": map[string]any{"type": "thinking_delta", "thinking": ev.ReasoningText},
+		}); err != nil {
+			return err
+		}
+	}
+	if ev.ReasoningSignature != "" {
+		a.thinkingSig.WriteString(ev.ReasoningSignature)
+		if err := a.send("content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": a.index,
+			"delta": map[string]any{"type": "signature_delta", "signature": ev.ReasoningSignature},
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (a *blockAssembler) addText(text string) error {
@@ -534,6 +681,24 @@ func (a *blockAssembler) closeOpen() error {
 	switch a.openKind {
 	case "text":
 		a.blocks = append(a.blocks, anthropicRespBlock{Type: "text", Text: a.textBuf.String()})
+	case "thinking":
+		a.blocks = append(a.blocks, anthropicRespBlock{
+			Type:      "thinking",
+			Thinking:  a.thinkingBuf.String(),
+			Signature: a.thinkingSig.String(),
+		})
+	case "redacted_thinking":
+		// No incremental deltas exist for redacted reasoning: emit the whole
+		// block now (start carries the full data), then fall through to stop.
+		data := a.redactedBuf.String()
+		if err := a.send("content_block_start", map[string]any{
+			"type":          "content_block_start",
+			"index":         a.index,
+			"content_block": map[string]any{"type": "redacted_thinking", "data": data},
+		}); err != nil {
+			return err
+		}
+		a.blocks = append(a.blocks, anthropicRespBlock{Type: "redacted_thinking", Data: data})
 	case "tool_use":
 		a.blocks = append(a.blocks, anthropicRespBlock{
 			Type:  "tool_use",
@@ -574,7 +739,7 @@ func (a *blockAssembler) stopReason() string {
 func (a *blockAssembler) outputChars() int {
 	n := 0
 	for _, b := range a.blocks {
-		n += len(b.Text) + len(b.Input)
+		n += len(b.Text) + len(b.Thinking) + len(b.Data) + len(b.Input)
 	}
 	return n
 }

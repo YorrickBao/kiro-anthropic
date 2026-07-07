@@ -137,14 +137,44 @@ func TestRawToInputString(t *testing.T) {
 	}
 }
 
-func TestExtractMessage(t *testing.T) {
-	if got := extractMessage([]byte(`{"message":"x"}`)); got != "x" {
-		t.Errorf("message = %q", got)
+func TestExtractMessageAndReason(t *testing.T) {
+	if got, reason := extractMessageAndReason([]byte(`{"message":"x"}`)); got != "x" || reason != "" {
+		t.Errorf("message = %q reason = %q", got, reason)
 	}
-	if got := extractMessage([]byte(`{"Message":"y"}`)); got != "y" {
+	if got, _ := extractMessageAndReason([]byte(`{"Message":"y"}`)); got != "y" {
 		t.Errorf("Message = %q", got)
 	}
-	if got := extractMessage([]byte(`plain`)); got != "plain" {
+	if got, _ := extractMessageAndReason([]byte(`plain`)); got != "plain" {
 		t.Errorf("plain = %q", got)
+	}
+	if got, reason := extractMessageAndReason([]byte(`{"message":"bad sig","reason":"THINKING_SIGNATURE_INVALID"}`)); got != "bad sig" || reason != "THINKING_SIGNATURE_INVALID" {
+		t.Errorf("reason parse = %q,%q", got, reason)
+	}
+}
+
+func TestKiroHTTPErrorReason(t *testing.T) {
+	e := &kiroHTTPError{Status: 400, Body: `{"message":"m","reason":"THINKING_SIGNATURE_INVALID"}`}
+	if e.reason() != "THINKING_SIGNATURE_INVALID" {
+		t.Errorf("reason() = %q", e.reason())
+	}
+	if (&kiroHTTPError{Body: "not json"}).reason() != "" {
+		t.Errorf("non-json reason should be empty")
+	}
+}
+
+func TestParseReasoningContentEvent(t *testing.T) {
+	// text chunk
+	ev := parseKiroMessage(&eventMessage{
+		headers: map[string]string{":event-type": "reasoningContentEvent"},
+		payload: []byte(`{"text":"let me think"}`)})
+	if ev.Kind != evReasoning || ev.ReasoningText != "let me think" || ev.ReasoningSignature != "" {
+		t.Errorf("reasoning text event = %+v", ev)
+	}
+	// signature-only frame
+	ev = parseKiroMessage(&eventMessage{
+		headers: map[string]string{":event-type": "reasoningContentEvent"},
+		payload: []byte(`{"signature":"SIG=="}`)})
+	if ev.Kind != evReasoning || ev.ReasoningText != "" || ev.ReasoningSignature != "SIG==" {
+		t.Errorf("reasoning signature event = %+v", ev)
 	}
 }

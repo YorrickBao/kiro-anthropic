@@ -141,6 +141,7 @@ type kiroEvent struct {
 	ToolStop  bool   // evToolUse (final chunk for this tool use)
 
 	ConversationID string // evMetadata
+	StopReason     string // evMetadata (CodeWhisperer stopReason, e.g. END_TURN / TOOL_USE / MAX_TOKENS)
 
 	ErrKind   string // evError
 	ErrMsg    string // evError
@@ -309,12 +310,17 @@ func parseKiroMessage(msg *eventMessage) *kiroEvent {
 			ToolStop:  p.Stop,
 		}
 
-	case "messageMetadataEvent":
+	case "metadataEvent":
+		// Terminal frame. stopReason is the backend's authoritative finish
+		// reason (END_TURN / TOOL_USE / MAX_TOKENS / ...); conversationId is
+		// included for completeness though it is usually empty (the live id
+		// arrives in the initial-response frame).
 		var p struct {
 			ConversationID string `json:"conversationId"`
+			StopReason     string `json:"stopReason"`
 		}
 		_ = json.Unmarshal(msg.payload, &p)
-		return &kiroEvent{Kind: evMetadata, ConversationID: p.ConversationID}
+		return &kiroEvent{Kind: evMetadata, ConversationID: p.ConversationID, StopReason: p.StopReason}
 
 	case "invalidStateEvent", "internalServerException", "throttlingError",
 		"serviceQuotaExceededError", "conversationExpiredError", "dryRunSucceedEvent":

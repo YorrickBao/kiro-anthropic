@@ -405,6 +405,32 @@ func TestBlockAssemblerReasoning(t *testing.T) {
 	}
 }
 
+func TestBlockAssemblerStopReason(t *testing.T) {
+	// 1. tool_use inferred from sawToolUse when no authoritative reason.
+	a := newBlockAssembler(nil)
+	_ = a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t", ToolName: "f"})
+	_ = a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t", ToolStop: true})
+	_ = a.closeOpen()
+	if got := a.stopReason(); got != "tool_use" {
+		t.Errorf("inferred tool_use = %q", got)
+	}
+
+	// 2. authoritative metadataEvent.stopReason wins over the guess.
+	a.setStopReason("MAX_TOKENS")
+	if got := a.stopReason(); got != "max_tokens" {
+		t.Errorf("authoritative should win, got %q", got)
+	}
+
+	// 3. unknown backend value is ignored -> fallback still applies.
+	a2 := newBlockAssembler(nil)
+	_ = a2.addText("hi")
+	_ = a2.closeOpen()
+	a2.setStopReason("WHATEVER")
+	if got := a2.stopReason(); got != "end_turn" {
+		t.Errorf("unknown reason should fall back, got %q", got)
+	}
+}
+
 func TestBlockAssemblerReasoningSSE(t *testing.T) {
 	type rec struct {
 		name string

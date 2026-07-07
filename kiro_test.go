@@ -101,12 +101,12 @@ func TestParseKiroMessage(t *testing.T) {
 		t.Errorf("toolUseEvent = %+v", ev)
 	}
 
-	// metadata
+	// metadata (terminal frame: authoritative stopReason + conversationId)
 	ev = parseKiroMessage(&eventMessage{
-		headers: map[string]string{":event-type": "messageMetadataEvent"},
-		payload: []byte(`{"conversationId":"c1"}`)})
-	if ev.Kind != evMetadata || ev.ConversationID != "c1" {
-		t.Errorf("messageMetadataEvent = %+v", ev)
+		headers: map[string]string{":event-type": "metadataEvent"},
+		payload: []byte(`{"stopReason":"TOOL_USE","conversationId":"c1"}`)})
+	if ev.Kind != evMetadata || ev.ConversationID != "c1" || ev.StopReason != "TOOL_USE" {
+		t.Errorf("metadataEvent = %+v", ev)
 	}
 
 	// exception via message-type header
@@ -176,5 +176,23 @@ func TestParseReasoningContentEvent(t *testing.T) {
 		payload: []byte(`{"signature":"SIG=="}`)})
 	if ev.Kind != evReasoning || ev.ReasoningText != "" || ev.ReasoningSignature != "SIG==" {
 		t.Errorf("reasoning signature event = %+v", ev)
+	}
+}
+
+func TestMapStopReason(t *testing.T) {
+	cases := map[string]string{
+		"END_TURN":      "end_turn",
+		"end_turn":      "end_turn", // case-insensitive
+		"TOOL_USE":      "tool_use",
+		"MAX_TOKENS":    "max_tokens",
+		"STOP_SEQUENCE": "stop_sequence",
+		"  tool_use  ":  "tool_use", // trimmed
+		"":              "",
+		"BOGUS":         "",
+	}
+	for in, want := range cases {
+		if got := mapStopReason(in); got != want {
+			t.Errorf("mapStopReason(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

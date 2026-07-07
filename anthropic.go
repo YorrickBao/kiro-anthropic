@@ -542,6 +542,11 @@ type blockAssembler struct {
 
 	blocks     []anthropicRespBlock
 	sawToolUse bool
+
+	// finalStopReason is the Anthropic stop_reason derived from the backend's
+	// authoritative metadataEvent.stopReason; wins over the sawToolUse guess
+	// when present. Empty until setStopReason is called.
+	finalStopReason string
 }
 
 func newBlockAssembler(emit emitFunc) *blockAssembler {
@@ -735,11 +740,41 @@ func (a *blockAssembler) send(event string, data any) error {
 }
 
 // stopReason reports the Anthropic stop_reason for the assembled message.
+// The backend's authoritative metadataEvent.stopReason wins when present;
+// otherwise fall back to inferring tool_use from the emitted blocks.
 func (a *blockAssembler) stopReason() string {
+	if a.finalStopReason != "" {
+		return a.finalStopReason
+	}
 	if a.sawToolUse {
 		return "tool_use"
 	}
 	return "end_turn"
+}
+
+// setStopReason records the stop reason carried by a metadataEvent, mapped to
+// Anthropic's vocabulary. Unknown backend values are ignored so the sawToolUse
+// fallback still applies.
+func (a *blockAssembler) setStopReason(kiroStop string) {
+	if r := mapStopReason(kiroStop); r != "" {
+		a.finalStopReason = r
+	}
+}
+
+// mapStopReason translates a CodeWhisperer stopReason enum value to the
+// corresponding Anthropic stop_reason. Returns "" for unknown / empty input.
+func mapStopReason(kiroStop string) string {
+	switch strings.ToUpper(strings.TrimSpace(kiroStop)) {
+	case "END_TURN":
+		return "end_turn"
+	case "TOOL_USE":
+		return "tool_use"
+	case "MAX_TOKENS":
+		return "max_tokens"
+	case "STOP_SEQUENCE":
+		return "stop_sequence"
+	}
+	return ""
 }
 
 // outputChars is a rough proxy for output length (used for usage heuristics).

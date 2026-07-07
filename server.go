@@ -431,6 +431,8 @@ func (s *Server) aggregateMessages(w http.ResponseWriter, r *http.Request, areq 
 			_ = asm.addText(ev.Text)
 		case evToolUse:
 			_ = asm.addToolUse(ev)
+		case evMetadata:
+			asm.setStopReason(ev.StopReason)
 		case evError:
 			writeAnthropicError(w, http.StatusBadGateway, "api_error", upstreamEventError(ev))
 			return
@@ -536,6 +538,8 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, areq *an
 			if err := asm.addToolUse(ev); err != nil {
 				return
 			}
+		case evMetadata:
+			asm.setStopReason(ev.StopReason)
 		case evError:
 			_ = emit("error", map[string]any{
 				"type":  "error",

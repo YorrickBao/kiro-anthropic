@@ -45,7 +45,8 @@ type Config struct {
 	ProfileArn string // optional explicit profileArn override
 	APIKey     string // optional key clients must send (x-api-key / Authorization)
 	AgentMode  string // Kiro agent mode, e.g. "vibe"
-	Region     string // optional region override (defaults to the token's region)
+	Region     string // optional SSO region override (defaults to the token's region); drives OIDC token refresh
+	APIRegion  string // optional Kiro API region override (defaults to Region); drives runtime/management.<region>.kiro.dev
 	Log        bool   // enable request logging (off by default); logs to stdout unless LogFile is set
 	LogFile    string // if set, write the request log here instead of stdout ("none"/"off" disables)
 }
@@ -116,7 +117,8 @@ func addServerFlags(cmd *cobra.Command, cfg *Config) {
 	f.StringVar(&cfg.ProfileArn, "profile-arn", "", "explicit CodeWhisperer profileArn (auto-resolved if empty)")
 	f.StringVar(&cfg.APIKey, "api-key", "", "if set, clients must present this key via x-api-key or Authorization: Bearer")
 	f.StringVar(&cfg.AgentMode, "agent-mode", "vibe", "Kiro agent mode")
-	f.StringVar(&cfg.Region, "region", "", "region override (defaults to the token's region)")
+	f.StringVar(&cfg.Region, "region", "", "SSO region override for OIDC token refresh (defaults to the token's region)")
+	f.StringVar(&cfg.APIRegion, "api-region", "", "Kiro API region for runtime/management.<region>.kiro.dev (defaults to --region; set only when the Q/Kiro API is served from a different region than your IdC)")
 	f.BoolVar(&cfg.Log, "log", false, "enable request logging to stdout (the window); off by default")
 	f.StringVar(&cfg.LogFile, "log-file", "", "write the request log to this file instead of stdout (implies --log); 'none' disables")
 }
@@ -343,7 +345,10 @@ func runStatus(cfg *Config) error {
 	fmt.Printf("token file : %s\n", cfg.TokenFile)
 	fmt.Printf("provider   : %s\n", orNone(tok.Provider))
 	fmt.Printf("authMethod : %s\n", orNone(tok.AuthMethod))
-	fmt.Printf("region     : %s\n", orNone(store.region()))
+	fmt.Printf("region     : %s (SSO/OIDC)\n", orNone(store.region()))
+	if store.apiRegion() != store.region() {
+		fmt.Printf("api region : %s (runtime/management.kiro.dev)\n", orNone(store.apiRegion()))
+	}
 	fmt.Printf("expiresAt  : %s\n", orNone(tok.ExpiresAt))
 	if tok.expiry().IsZero() {
 		fmt.Printf("expiry     : unknown\n")

@@ -125,7 +125,8 @@ func (s *TokenStore) snapshot() Token {
 	return s.tok
 }
 
-// region returns the effective region (config override > token > us-east-1).
+// region returns the SSO region used for OIDC token refresh
+// (oidc.<region>.amazonaws.com). Precedence: config override > token > us-east-1.
 func (s *TokenStore) region() string {
 	if s.cfg.Region != "" {
 		return s.cfg.Region
@@ -137,6 +138,19 @@ func (s *TokenStore) region() string {
 		return r
 	}
 	return "us-east-1"
+}
+
+// apiRegion returns the region hosting the Kiro API endpoints (runtime.<region>
+// and management.<region>.kiro.dev). It defaults to the SSO region but can be
+// overridden independently: enterprise IdC accounts sometimes have their
+// Identity Center in one region while the Q/Kiro API is served from another
+// (e.g. IdC in us-east-1, API in eu-central-1). Precedence:
+// --api-region > SSO region (region()).
+func (s *TokenStore) apiRegion() string {
+	if s.cfg.APIRegion != "" {
+		return s.cfg.APIRegion
+	}
+	return s.region()
 }
 
 // AccessToken returns a currently-valid bearer token, refreshing if needed.
@@ -329,7 +343,7 @@ func (s *TokenStore) listFirstProfileArn(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	region := s.region()
+	region := s.apiRegion()
 	endpoint := fmt.Sprintf("https://management.%s.kiro.dev/", region)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader([]byte("{}")))

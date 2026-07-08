@@ -167,7 +167,7 @@ func NewKiroClient(cfg *Config, store *TokenStore, client *http.Client) *KiroCli
 }
 
 func (c *KiroClient) runtimeEndpoint() string {
-	return fmt.Sprintf("https://runtime.%s.kiro.dev/", c.store.region())
+	return fmt.Sprintf("https://runtime.%s.kiro.dev/", c.store.apiRegion())
 }
 
 // kiroStream is an open streaming response.
@@ -687,7 +687,7 @@ func (c *KiroClient) getUsageOnce(ctx context.Context) ([]byte, int, error) {
 	}
 	arn, _ := c.store.ProfileArn(ctx) // best effort; some tiers don't need it
 
-	endpoint := fmt.Sprintf("https://management.%s.kiro.dev/getUsageLimits", c.store.region())
+	endpoint := fmt.Sprintf("https://management.%s.kiro.dev/getUsageLimits", c.store.apiRegion())
 	q := url.Values{
 		"origin":          {"AI_EDITOR"},
 		"resourceType":    {"AGENTIC_REQUEST"},
@@ -733,7 +733,7 @@ func (c *KiroClient) ListModels(ctx context.Context) ([]kiroModelInfo, error) {
 	}
 	payload, _ := json.Marshal(reqBody)
 
-	endpoint := fmt.Sprintf("https://management.%s.kiro.dev/", c.store.region())
+	endpoint := fmt.Sprintf("https://management.%s.kiro.dev/", c.store.apiRegion())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err

@@ -123,7 +123,8 @@ curl --noproxy '*' http://127.0.0.1:17890/v1/messages \
 | `--profile-arn` | 自动解析 | 显式指定 CodeWhisperer profileArn |
 | `--api-key` | 空（开放） | 设置后客户端须用 `x-api-key` 或 `Authorization: Bearer` 携带 |
 | `--agent-mode` | `vibe` | Kiro agent 模式 |
-| `--region` | 取自令牌 | 覆盖区域 |
+| `--region` | 取自令牌 | 覆盖 **SSO 区域**（用于 OIDC 令牌刷新 `oidc.<region>.amazonaws.com`） |
+| `--api-region` | 取自 `--region` | 覆盖 **Kiro API 区域**（`runtime` / `management.<region>.kiro.dev`）。仅当 Q/Kiro API 与你的 IdC 不在同一区域时才需要设置（如 IdC 在 `us-east-1`，API 在 `eu-central-1`） |
 | `--log` | `false` | 开启请求访问日志（输出到 stdout/当前窗口）；默认关闭 |
 | `--log-file` | 空 | 把访问日志写到指定文件（隐含 `--log`）；特殊值 `stdout`/`stderr`/`none` |
 
@@ -266,6 +267,23 @@ export NO_PROXY=127.0.0.1,localhost
 - 优先级：`--proxy` > `http(s)_proxy` 环境变量 > 内置默认 `http://127.0.0.1:7890`。
 - 直连：`--proxy none`。
 - 因此本机若全局设了 `http_proxy`，用 `curl` / 客户端访问本地服务时记得设 `no_proxy=127.0.0.1,localhost` 或 `curl --noproxy '*'`，否则本地请求会被塞进代理。
+
+---
+
+## 区域说明
+
+本工具区分两个区域，默认相等、绝大多数账号无需关心：
+
+- **SSO 区域**（`--region`）：用于 OIDC 令牌刷新 `oidc.<region>.amazonaws.com`。默认取自令牌里的 `region`。
+- **API 区域**（`--api-region`）：用于 Kiro 的 `runtime.<region>.kiro.dev`（推理）与 `management.<region>.kiro.dev`（模型/profile/额度）。默认跟随 `--region`。
+
+只有**企业 IdC 账号的 Identity Center 与 Q/Kiro API 不在同一区域**时才需要分别设置——例如 IdC 在 `us-east-1`，而 API 只在 `eu-central-1` 提供：
+
+```bash
+./kiro-anthropic serve --region us-east-1 --api-region eu-central-1
+```
+
+此时 `status` 会额外打印一行 `api region`。不设 `--api-region` 时行为与旧版完全一致。
 
 ---
 

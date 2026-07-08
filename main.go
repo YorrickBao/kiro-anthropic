@@ -251,7 +251,7 @@ func runServe(cfg *Config) error {
 		if err != nil {
 			return fmt.Errorf("account store init failed: %w", err)
 		}
-		srv.accounts = accounts
+		srv.setAccounts(accounts, client)
 	}
 
 	logger, closeLog, logNote, err := setupRequestLog(cfg.Log, cfg.LogFile)

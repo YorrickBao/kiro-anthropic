@@ -166,8 +166,11 @@ func NewKiroClient(cfg *Config, store *TokenStore, client *http.Client) *KiroCli
 	return &KiroClient{cfg: cfg, store: store, client: client}
 }
 
-func (c *KiroClient) runtimeEndpoint() string {
-	return fmt.Sprintf("https://runtime.%s.kiro.dev/", c.store.apiRegion())
+func (c *KiroClient) runtimeEndpoint(region string) string {
+	if region == "" {
+		region = c.store.apiRegion()
+	}
+	return fmt.Sprintf("https://runtime.%s.kiro.dev/", region)
 }
 
 // kiroStream is an open streaming response.
@@ -176,10 +179,11 @@ type kiroStream struct {
 	dec  *eventStreamDecoder
 }
 
-// Send issues the request and returns a stream of events. On a 401/403 the
-// token is force-refreshed and the request retried once.
-func (c *KiroClient) Send(ctx context.Context, req *kiroRequest) (*kiroStream, error) {
-	stream, status, body, err := c.sendOnce(ctx, req)
+// Send issues the request using the supplied credentials and returns a stream
+// of events. On a 401/403 the credentials are refreshed and the request retried
+// once.
+func (c *KiroClient) Send(ctx context.Context, creds kiroCredentials, req *kiroRequest) (*kiroStream, error) {
+	stream, status, body, err := c.sendOnce(ctx, creds, req)
 	if err != nil {
 		return nil, err
 	}
@@ -188,8 +192,8 @@ func (c *KiroClient) Send(ctx context.Context, req *kiroRequest) (*kiroStream, e
 	}
 	// Non-2xx on first try.
 	if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		if rerr := c.store.ForceRefresh(ctx); rerr == nil {
-			stream, status, body, err = c.sendOnce(ctx, req)
+		if rerr := creds.refresh(ctx); rerr == nil {
+			stream, status, body, err = c.sendOnce(ctx, creds, req)
 			if err != nil {
 				return nil, err
 			}
@@ -203,8 +207,8 @@ func (c *KiroClient) Send(ctx context.Context, req *kiroRequest) (*kiroStream, e
 
 // sendOnce performs a single attempt. On success it returns a stream; on a
 // non-2xx response it returns (nil, status, body, nil).
-func (c *KiroClient) sendOnce(ctx context.Context, req *kiroRequest) (*kiroStream, int, string, error) {
-	token, err := c.store.AccessToken(ctx)
+func (c *KiroClient) sendOnce(ctx context.Context, creds kiroCredentials, req *kiroRequest) (*kiroStream, int, string, error) {
+	token, err := creds.accessToken(ctx)
 	if err != nil {
 		return nil, 0, "", err
 	}
@@ -214,11 +218,12 @@ func (c *KiroClient) sendOnce(ctx context.Context, req *kiroRequest) (*kiroStrea
 		return nil, 0, "", err
 	}
 
+	endpoint := c.runtimeEndpoint(creds.apiRegion())
 	if os.Getenv("KIRO_DEBUG") != "" {
-		fmt.Fprintf(os.Stderr, "[kiro-debug] POST %s\n[kiro-debug] body: %s\n", c.runtimeEndpoint(), payload)
+		fmt.Fprintf(os.Stderr, "[kiro-debug] POST %s\n[kiro-debug] body: %s\n", endpoint, payload)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.runtimeEndpoint(), bytes.NewReader(payload))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return nil, 0, "", err
 	}

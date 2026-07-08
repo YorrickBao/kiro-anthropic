@@ -21,9 +21,10 @@ type Server struct {
 	cfg      *Config
 	store    *TokenStore
 	kiro     *KiroClient
-	accounts *AccountStore // multi-account credential store (admin sign-in)
-	login    *loginManager // IdC sign-in flow driver
-	logger   *slog.Logger  // per-request access log; nil disables it
+	accounts *AccountStore    // multi-account credential store (admin sign-in)
+	login    *loginManager    // IdC sign-in flow driver
+	selector *accountSelector // round-robin picker over the account store
+	logger   *slog.Logger     // per-request access log; nil disables it
 
 	modelsMu    sync.Mutex
 	modelsCache []kiroModelInfo
@@ -50,6 +51,13 @@ func NewServer(cfg *Config, store *TokenStore, client *http.Client) *Server {
 		kiro:  NewKiroClient(cfg, store, client),
 		login: newLoginManager(client),
 	}
+}
+
+// setAccounts attaches the multi-account store and builds the round-robin
+// selector used to dispatch /v1/messages across stored accounts.
+func (s *Server) setAccounts(accounts *AccountStore, client *http.Client) {
+	s.accounts = accounts
+	s.selector = newAccountSelector(accounts, client)
 }
 
 func (s *Server) Handler() http.Handler {
@@ -377,18 +385,13 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve the profileArn required by the runtime.
-	arn, err := s.store.ProfileArn(r.Context())
-	if err != nil {
-		writeAnthropicError(w, r, http.StatusBadGateway, "api_error", "could not resolve profileArn: "+err.Error())
-		return
-	}
-	kreq.ProfileArn = arn
-
 	// Effort and max output tokens: request-driven, defaulting to the model max.
+	// Independent of the account, so compute once.
 	s.applyModelRequestFields(r.Context(), kreq, requestedEffort(&areq), areq.MaxTokens)
 
-	stream, err := s.sendWithReasoningRetry(r.Context(), kreq)
+	// Open the upstream stream, dispatching across accounts with pre-stream
+	// failover. Once streaming begins (headers sent) no further retry is possible.
+	stream, err := s.openStream(r.Context(), kreq)
 	if err != nil {
 		status, errType := mapUpstreamError(err)
 		writeAnthropicError(w, r, status, errType, err.Error())
@@ -408,14 +411,73 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	s.aggregateMessages(w, r, &areq, stream, inputChars)
 }
 
+// maxAccountAttempts caps how many accounts a single request will try before
+// giving up, bounding worst-case latency when many accounts are unhealthy.
+const maxAccountAttempts = 8
+
+// openStream opens the upstream stream, dispatching across stored accounts with
+// pre-stream failover. When the account store is empty it falls back to the
+// primary TokenStore (the original single-account behaviour, unchanged). The
+// per-account profileArn is set on kreq before each attempt.
+//
+// Failover happens only before streaming begins: an account failure (auth,
+// quota, 5xx, transport) moves on to the next account, while a request-level
+// error (e.g. a 400 that is not a thinking-signature issue) surfaces at once.
+func (s *Server) openStream(ctx context.Context, kreq *kiroRequest) (*kiroStream, error) {
+	// Empty pool (or no store): use the primary account, once.
+	if s.selector == nil || len(s.accounts.List()) == 0 {
+		creds := storeCreds{store: s.store}
+		arn, err := creds.profileArn(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("could not resolve profileArn: %w", err)
+		}
+		kreq.ProfileArn = arn
+		return s.sendWithReasoningRetry(ctx, creds, kreq)
+	}
+
+	tried := map[string]bool{}
+	var lastErr error
+	for attempt := 0; attempt < maxAccountAttempts; attempt++ {
+		creds, ok := s.selector.pick(tried)
+		if !ok {
+			break
+		}
+		tried[creds.id] = true
+
+		arn, err := creds.profileArn(ctx)
+		if err != nil {
+			lastErr = err
+			s.selector.recordFailure(creds.id)
+			continue
+		}
+		kreq.ProfileArn = arn
+
+		stream, err := s.sendWithReasoningRetry(ctx, creds, kreq)
+		if err == nil {
+			s.selector.recordSuccess(creds.id)
+			return stream, nil
+		}
+		lastErr = err
+		if !isAccountFailure(err) {
+			// A problem with the request itself: don't burn other accounts.
+			return nil, err
+		}
+		s.selector.recordFailure(creds.id)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no account available to serve the request")
+	}
+	return nil, lastErr
+}
+
 // sendWithReasoningRetry sends the request and, if the backend rejects a stale
 // or invalid extended-thinking signature, retries once with reasoningContent
 // stripped from history. This mirrors Kiro's own recovery and matters most
 // during multi-turn / context compaction, where a signature may no longer
 // validate.
-func (s *Server) sendWithReasoningRetry(ctx context.Context, kreq *kiroRequest) (*kiroStream, error) {
+func (s *Server) sendWithReasoningRetry(ctx context.Context, creds kiroCredentials, kreq *kiroRequest) (*kiroStream, error) {
 	return withReasoningRetry(kreq, func(k *kiroRequest) (*kiroStream, error) {
-		return s.kiro.Send(ctx, k)
+		return s.kiro.Send(ctx, creds, k)
 	})
 }
 

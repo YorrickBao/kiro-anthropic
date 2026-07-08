@@ -14,6 +14,14 @@ import (
 // The client intentionally has no overall Timeout because GenerateAssistantResponse
 // is a long-lived streaming call; per-attempt deadlines are applied by callers
 // via context instead.
+//
+// HTTP/2 PING keepalive is enabled via Transport.HTTP2: when no frame is read
+// from a connection for SendPingTimeout, the client sends a PING and closes the
+// connection if no ACK arrives within PingTimeout. Kiro's GenerateAssistantResponse
+// can sit silent for minutes (e.g. during extended thinking) and intermediate
+// proxies/gateways with shorter idle timeouts otherwise reset the stream with
+// INTERNAL_ERROR mid-response. The PING keeps the h2 connection alive across
+// those silent gaps so the stream completes instead of being torn down.
 func newHTTPClient(proxyURL string) *http.Client {
 	transport := &http.Transport{
 		Proxy:                 proxyFunc(proxyURL),
@@ -23,6 +31,10 @@ func newHTTPClient(proxyURL string) *http.Client {
 		TLSHandshakeTimeout:   20 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		ResponseHeaderTimeout: 120 * time.Second,
+		HTTP2: &http.HTTP2Config{
+			SendPingTimeout: 30 * time.Second,
+			PingTimeout:     15 * time.Second,
+		},
 	}
 	return &http.Client{Transport: transport}
 }

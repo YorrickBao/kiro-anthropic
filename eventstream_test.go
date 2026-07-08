@@ -5,8 +5,10 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"io"
-	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Note on scope: esFrame computes CRCs with crc32.ChecksumIEEE, the same
@@ -64,21 +66,13 @@ func TestEventStreamDecodeSingle(t *testing.T) {
 
 	d := newEventStreamDecoder(bytes.NewReader(frame))
 	msg, err := d.Next()
-	if err != nil {
-		t.Fatalf("Next: %v", err)
-	}
-	if msg.eventType() != "assistantResponseEvent" {
-		t.Errorf("eventType = %q", msg.eventType())
-	}
-	if msg.messageType() != "event" {
-		t.Errorf("messageType = %q", msg.messageType())
-	}
-	if string(msg.payload) != `{"content":"hello"}` {
-		t.Errorf("payload = %q", msg.payload)
-	}
-	if _, err := d.Next(); err != io.EOF {
-		t.Errorf("expected io.EOF at end, got %v", err)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, "assistantResponseEvent", msg.eventType())
+	assert.Equal(t, "event", msg.messageType())
+	assert.Equal(t, `{"content":"hello"}`, string(msg.payload))
+
+	_, err = d.Next()
+	assert.Equal(t, io.EOF, err, "expected io.EOF at end")
 }
 
 func TestEventStreamDecodeMultiple(t *testing.T) {
@@ -88,16 +82,11 @@ func TestEventStreamDecodeMultiple(t *testing.T) {
 
 	for _, want := range []string{`{"content":"a"}`, `{"content":"b"}`} {
 		msg, err := d.Next()
-		if err != nil {
-			t.Fatalf("Next: %v", err)
-		}
-		if string(msg.payload) != want {
-			t.Errorf("payload = %q, want %q", msg.payload, want)
-		}
+		require.NoError(t, err)
+		assert.Equal(t, want, string(msg.payload))
 	}
-	if _, err := d.Next(); err != io.EOF {
-		t.Errorf("expected io.EOF, got %v", err)
-	}
+	_, err := d.Next()
+	assert.Equal(t, io.EOF, err)
 }
 
 func TestEventStreamSkipsNonStringHeaders(t *testing.T) {
@@ -106,37 +95,29 @@ func TestEventStreamSkipsNonStringHeaders(t *testing.T) {
 	frame := esFrame(headers, []byte(`{}`))
 
 	msg, err := newEventStreamDecoder(bytes.NewReader(frame)).Next()
-	if err != nil {
-		t.Fatalf("Next: %v", err)
-	}
-	if msg.eventType() != "toolUseEvent" {
-		t.Errorf("eventType = %q", msg.eventType())
-	}
-	if _, ok := msg.headers["count"]; ok {
-		t.Errorf("int32 header should not be stored")
-	}
+	require.NoError(t, err)
+	assert.Equal(t, "toolUseEvent", msg.eventType())
+	_, ok := msg.headers["count"]
+	assert.False(t, ok, "int32 header should not be stored")
 }
 
 func TestEventStreamPreludeCRCMismatch(t *testing.T) {
 	frame := esFrame(esStringHeader(":event-type", "x"), []byte(`{}`))
 	frame[8] ^= 0xff // corrupt prelude CRC
-	if _, err := newEventStreamDecoder(bytes.NewReader(frame)).Next(); err == nil ||
-		!strings.Contains(err.Error(), "prelude CRC") {
-		t.Errorf("expected prelude CRC error, got %v", err)
-	}
+	// smithy-go surfaces any CRC failure (prelude or message) as a single
+	// "message checksum mismatch" error, so we only assert detection here.
+	_, err := newEventStreamDecoder(bytes.NewReader(frame)).Next()
+	assert.ErrorContains(t, err, "checksum")
 }
 
 func TestEventStreamMessageCRCMismatch(t *testing.T) {
 	frame := esFrame(esStringHeader(":event-type", "x"), []byte(`{"a":1}`))
 	frame[len(frame)-1] ^= 0xff // corrupt trailing message CRC
-	if _, err := newEventStreamDecoder(bytes.NewReader(frame)).Next(); err == nil ||
-		!strings.Contains(err.Error(), "message CRC") {
-		t.Errorf("expected message CRC error, got %v", err)
-	}
+	_, err := newEventStreamDecoder(bytes.NewReader(frame)).Next()
+	assert.ErrorContains(t, err, "checksum")
 }
 
 func TestEventStreamEmpty(t *testing.T) {
-	if _, err := newEventStreamDecoder(bytes.NewReader(nil)).Next(); err != io.EOF {
-		t.Errorf("expected io.EOF on empty stream, got %v", err)
-	}
+	_, err := newEventStreamDecoder(bytes.NewReader(nil)).Next()
+	assert.Equal(t, io.EOF, err, "expected io.EOF on empty stream")
 }

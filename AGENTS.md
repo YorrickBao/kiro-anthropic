@@ -6,7 +6,7 @@
 
 `kiro-anthropic` 是一个本地 HTTP 服务，把 Kiro（Amazon Q Developer / CodeWhisperer）账号通过 **Anthropic Messages API** 协议暴露出来，使任何 Anthropic 兼容客户端都能调用 Kiro 的 Claude 模型。纯 Go 项目（见 `go.mod`，无 Node 依赖）。
 
-主要源码：`main.go`（入口/CLI）、`server.go`（HTTP 服务）、`anthropic.go`（Anthropic 协议）、`kiro.go`（Kiro 后端）、`token.go`（鉴权/令牌）、`eventstream.go`（流式）、`httpclient.go`、`util.go`，各文件有对应的 `*_test.go`。
+主要源码：`main.go`（入口/CLI，cobra）、`server.go`（HTTP 服务）、`anthropic.go`（Anthropic 协议）、`kiro.go`（Kiro 后端）、`token.go`（鉴权/令牌）、`eventstream.go`（流式，基于 smithy-go）、`upgrade.go`（GitHub Release 自更新）、`httpclient.go`、`util.go`，各文件有对应的 `*_test.go`。
 
 ## 构建与测试
 

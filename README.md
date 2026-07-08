@@ -9,7 +9,7 @@
 
 把 **Kiro**（Amazon Q Developer / CodeWhisperer）账号代理成 **Anthropic Messages API** 的本地服务。任何兼容 Anthropic 协议的客户端（Claude Code、各类 SDK 等）都能直接指向本服务，用上 Kiro 里的 Claude（以及 DeepSeek / GLM / MiniMax / Qwen 等）模型。
 
-零第三方依赖，单个静态二进制。默认监听 `127.0.0.1:17890`。
+单个静态二进制，内置 `upgrade` 自更新。默认监听 `127.0.0.1:17890`。
 
 > 非官方工具。请在遵守 Kiro / AWS 服务条款的前提下使用。
 
@@ -80,6 +80,10 @@ VERSION=1.0.0 ./build.sh   # 打版本号进二进制
 
 # 列出账号可用模型（含上下文窗口与 effort 档位）
 ./kiro-anthropic models
+
+# 检查并升级到 GitHub 最新 release（见下文“升级”一节）
+./kiro-anthropic upgrade --check
+./kiro-anthropic upgrade            # 交互确认后替换当前二进制
 ```
 
 调用（注意：本机若设了 `http_proxy`，`curl` 访问本地服务要加 `--noproxy '*'`）：
@@ -103,6 +107,7 @@ curl --noproxy '*' http://127.0.0.1:17890/v1/messages \
 | `serve` | 启动 Anthropic 兼容服务（默认端口 17890） |
 | `status` | 显示当前令牌、区域、过期时间、profileArn、出站代理 |
 | `models` | 列出账号可用模型 ID，含上下文窗口与 effort 档位 |
+| `upgrade` | 从 GitHub Release 下载并原地替换当前二进制 |
 | `version` | 打印版本 |
 | `help` | 帮助 |
 
@@ -118,12 +123,43 @@ curl --noproxy '*' http://127.0.0.1:17890/v1/messages \
 | `--api-key` | 空（开放） | 设置后客户端须用 `x-api-key` 或 `Authorization: Bearer` 携带 |
 | `--agent-mode` | `vibe` | Kiro agent 模式 |
 | `--region` | 取自令牌 | 覆盖区域 |
+| `--log` | `false` | 开启请求访问日志（输出到 stdout/当前窗口）；默认关闭 |
+| `--log-file` | 空 | 把访问日志写到指定文件（隐含 `--log`）；特殊值 `stdout`/`stderr`/`none` |
+
+访问日志为结构化单行（Go `slog`），字段含 `method` / `path` / `status` / `duration` / `bytes`（`/v1/messages` 另加 `model` / `mode`）。级别按结果分：`5xx → ERROR`、`4xx 或请求中途出错 → WARN`、其余 `INFO`；出错时附带 `error=<原因>`。
 
 ### 环境变量
 
 - `HTTPS_PROXY` / `HTTP_PROXY` / `https_proxy` / `http_proxy`：出站代理（被 `--proxy` 覆盖）。
 - `KIRO_DEBUG=1`：把发往 Kiro 的完整请求体打到 stderr，便于排查（不含密钥）。
 - `KIRO_DEBUG_STREAM=1`：把 Kiro 返回的每一帧事件（`:event-type` 与原始 payload）打到 stderr，便于排查思考/工具流。
+
+---
+
+## 升级
+
+`upgrade` 子命令从 GitHub Releases 拉取匹配当前平台（`GOOS`/`GOARCH`）的归档，校验 `checksums.txt` 的 SHA-256，解出二进制后**原地替换**正在运行的可执行文件（Windows 上先把旧 exe 重命名为 `.old`，下次启动清理）。
+
+```bash
+./kiro-anthropic upgrade --check            # 只检查是否有新版，不下载不替换
+./kiro-anthropic upgrade                    # 交互确认后替换
+./kiro-anthropic upgrade -y                 # 跳过确认
+./kiro-anthropic upgrade --version v0.2.0   # 安装指定 tag（可降级/回滚）
+```
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--proxy` | 同 `serve` | GitHub API / 下载的出站代理；国内访问 GitHub 一般需要 |
+| `--check` | `false` | 仅检查，不下载不安装 |
+| `-y`, `--yes` | `false` | 跳过确认提示 |
+| `--version` | latest | 指定 release tag（如 `v0.2.0`） |
+| `--allow-unverified` | `false` | 即使缺少 `checksums.txt` 或未列出该资产也继续安装（不推荐） |
+
+说明：
+- 出站代理语义与 `serve` 完全一致：`--proxy` > `http(s)_proxy` 环境变量 > 内置默认 `http://127.0.0.1:7890`。GitHub 访问不通时按需设置 `--proxy none` 或可用代理。
+- 若可执行文件位于需要 root 的目录（如 `/usr/local/bin`），替换会失败，请用 `sudo` 重试或手动替换。
+- 可选设置 `GITHUB_TOKEN` 环境变量以提高 API 限流额度（未鉴权时 GitHub 有 60 次/小时限制）。
+- 版本比较走语义化版本（semver）。`dev` / 本地 `go build` 产物无法判定高低，会提示"开发版"并要求确认。
 
 ---
 
@@ -220,13 +256,14 @@ export NO_PROXY=127.0.0.1,localhost
 ## 目录结构
 
 ```
-main.go          CLI 入口、参数、代理解析、启动
+main.go          CLI 入口（cobra）、参数、代理解析、启动
 httpclient.go    出站 HTTP 客户端（代理感知）
 token.go         令牌加载/刷新（SSO-OIDC）、profileArn 解析
-eventstream.go   AWS vnd.amazon.eventstream 解码器
+eventstream.go   AWS vnd.amazon.eventstream 解码（基于 smithy-go）
 kiro.go          Kiro 运行时客户端、请求/响应类型、模型列表
 anthropic.go     Anthropic 类型、模型映射、请求翻译、SSE 组装
-server.go        HTTP 服务与各端点
+server.go        HTTP 服务与各端点、结构化访问日志（slog）
+upgrade.go       从 GitHub Release 自更新（minio/selfupdate + semver）
 build.sh         跨平台构建脚本
 ```
 

@@ -35,6 +35,7 @@ func (s *Server) AdminHandler() http.Handler {
 	r.Get("/api/accounts.json", s.handleAccountsList)
 	r.Post("/api/login/start", s.handleLoginStart)
 	r.Post("/api/accounts/delete", s.handleAccountDelete)
+	r.Post("/api/accounts/import", s.handleAccountImport)
 	r.Get("/oauth/callback", s.handleLoginCallback)
 	return r
 }
@@ -206,6 +207,31 @@ func (s *Server) handleLoginCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	renderCallbackPage(w, true, "Signed in successfully. You can close this window and return to the admin page.")
+}
+
+// handleAccountImport imports the credentials from the local Kiro auth cache
+// (the --token-file and its client registration) into the multi-account store.
+// A credential already present (same clientId + refreshToken) is not duplicated.
+func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
+	if s.accounts == nil {
+		adminError(w, http.StatusServiceUnavailable, "account store is not configured")
+		return
+	}
+	acct, err := importLocalCredentials(r.Context(), s.login.client, s.cfg.TokenFile)
+	if err != nil {
+		noteError(r.Context(), err.Error())
+		adminError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if id, ok := s.accounts.FindByRefreshToken(acct.ClientID, acct.RefreshToken); ok {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id, "already_present": true})
+		return
+	}
+	if err := s.accounts.Add(acct); err != nil {
+		adminError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": acct.ID, "already_present": false})
 }
 
 // handleAccountDelete removes a stored account by id.

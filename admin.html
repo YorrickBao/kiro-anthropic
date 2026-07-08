@@ -79,6 +79,7 @@
       <div class="field"><label for="login-label">备注（可选）</label>
         <input id="login-label" type="text" placeholder="团队 A / 生产" /></div>
       <button id="login-btn" type="button">开始登录</button>
+      <button id="import-btn" type="button" style="background:transparent;color:var(--accent);border:1px solid var(--line)">导入本机凭据</button>
       <span id="login-msg" class="muted"></span>
     </div>
     <div id="accounts-list" style="margin-top:14px"></div>
@@ -255,7 +256,24 @@ async function tick() {
   }
 }
 
+async function importLocal() {
+  const btn = $("import-btn"), msg = $("login-msg");
+  btn.disabled = true; msg.textContent = "正在读取本机凭据…";
+  try {
+    const res = await fetch("/api/accounts/import", { method: "POST" });
+    const d = await res.json();
+    if (!res.ok) throw new Error((d.error && d.error.message) || ("HTTP " + res.status));
+    msg.textContent = d.already_present ? "该凭据已在账号列表中。" : "已导入本机凭据。";
+    loadAccounts();
+  } catch (e) {
+    msg.innerHTML = `<span class="err-box">导入失败: ${esc(e.message)}</span>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 $("login-btn").addEventListener("click", startLogin);
+$("import-btn").addEventListener("click", importLocal);
 tick();
 loadAccounts();
 setInterval(tick, REFRESH_MS);

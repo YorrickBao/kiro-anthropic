@@ -172,6 +172,7 @@ http://127.0.0.1:27890/health      # 健康检查
   # 然后在本地浏览器打开 http://localhost:27890
   ```
 
+- **导入本机现有凭据**：管理页的「导入本机凭据」按钮会读取 `--token-file`（默认 `~/.aws/sso/cache/kiro-auth-token.json`）及其客户端注册文件（`<clientIdHash>.json`，找不到时扫描同目录），把当前 Kiro 桌面端已登录的账号一键纳入多账号存储；同一凭据（clientId + refreshToken）已存在时不重复导入。
 - 目前多账号**仅登录与存储**，尚未接入 `/v1/messages` 的请求分发（后续版本提供）。
 
 ### 环境变量

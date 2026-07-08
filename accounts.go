@@ -199,6 +199,23 @@ func (s *AccountStore) Remove(id string) error {
 	return s.saveLocked()
 }
 
+// FindByRefreshToken returns the id of an account whose clientId and
+// refreshToken both match, if any. Used to avoid importing a duplicate of a
+// credential the store already holds.
+func (s *AccountStore) FindByRefreshToken(clientID, refreshToken string) (string, bool) {
+	if refreshToken == "" {
+		return "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, a := range s.accounts {
+		if a.RefreshToken == refreshToken && a.ClientID == clientID {
+			return a.ID, true
+		}
+	}
+	return "", false
+}
+
 // List returns copies of all stored accounts, ordered by creation time.
 func (s *AccountStore) List() []StoredAccount {
 	s.mu.Lock()

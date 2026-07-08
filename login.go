@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -285,6 +287,87 @@ func (m *loginManager) completeLogin(ctx context.Context, state, code string) (*
 		acct.ProfileArn = arn
 	}
 	return acct, nil
+}
+
+// importLocalCredentials builds a StoredAccount from an existing Kiro auth cache
+// (the same files TokenStore reads): the token file plus its client
+// registration companion. It resolves the profileArn best-effort. The returned
+// account has a fresh id; the caller is responsible for dedup and persistence.
+func importLocalCredentials(ctx context.Context, client *http.Client, tokenFile string) (*StoredAccount, error) {
+	tok, _, err := loadToken(tokenFile)
+	if err != nil {
+		return nil, fmt.Errorf("read token file: %w", err)
+	}
+	if tok.RefreshToken == "" {
+		return nil, fmt.Errorf("token file has no refreshToken (nothing to import)")
+	}
+
+	clientID, clientSecret := findClientRegistration(tokenFile, tok.ClientIDHash)
+
+	region := tok.Region
+	if region == "" {
+		region = "us-east-1"
+	}
+	acct := &StoredAccount{
+		ID:           uuid.NewString(),
+		Label:        "imported",
+		Provider:     tok.Provider,
+		AuthMethod:   tok.AuthMethod,
+		Region:       region,
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		AccessToken:  tok.AccessToken,
+		RefreshToken: tok.RefreshToken,
+		ExpiresAt:    tok.ExpiresAt,
+		ProfileArn:   tok.ProfileArn,
+		CreatedAt:    time.Now().UTC().Format(time.RFC3339),
+	}
+	if acct.ProfileArn == "" && tok.AccessToken != "" {
+		if arn, err := resolveProfileArn(ctx, client, region, tok.AccessToken); err == nil {
+			acct.ProfileArn = arn
+		}
+	}
+	return acct, nil
+}
+
+// findClientRegistration locates the clientId/clientSecret for an imported
+// token. It first tries the <clientIdHash>.json companion next to the token
+// file, then falls back to scanning the directory for any registration file.
+func findClientRegistration(tokenFile, clientIDHash string) (clientID, clientSecret string) {
+	dir := filepath.Dir(tokenFile)
+	if clientIDHash != "" {
+		if reg, err := readClientRegistration(filepath.Join(dir, clientIDHash+".json")); err == nil {
+			return reg.ClientID, reg.ClientSecret
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", ""
+	}
+	base := filepath.Base(tokenFile)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") || e.Name() == base {
+			continue
+		}
+		if reg, err := readClientRegistration(filepath.Join(dir, e.Name())); err == nil &&
+			reg.ClientID != "" && reg.ClientSecret != "" {
+			return reg.ClientID, reg.ClientSecret
+		}
+	}
+	return "", ""
+}
+
+// readClientRegistration reads a <clientIdHash>.json client registration file.
+func readClientRegistration(path string) (clientRegistration, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return clientRegistration{}, err
+	}
+	var reg clientRegistration
+	if err := json.Unmarshal(data, &reg); err != nil {
+		return clientRegistration{}, err
+	}
+	return reg, nil
 }
 
 // refreshAccountToken performs an SSO-OIDC refresh_token grant for a stored IdC

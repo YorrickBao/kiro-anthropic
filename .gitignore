@@ -42,3 +42,11 @@ go.work.sum
 .DS_Store
 **/.DS_Store
 Thumbs.db
+
+# ===== IDE / AI tooling =====
+.idea/
+.vscode/
+.kiro/
+.zcode/
+*.swp
+

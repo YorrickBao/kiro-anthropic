@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMapModel(t *testing.T) {
@@ -19,9 +21,7 @@ func TestMapModel(t *testing.T) {
 		"glm-5":                      "glm-5",
 	}
 	for in, want := range cases {
-		if got := mapModel(in); got != want {
-			t.Errorf("mapModel(%q) = %q, want %q", in, got, want)
-		}
+		assert.Equalf(t, want, mapModel(in), "mapModel(%q)", in)
 	}
 }
 
@@ -31,14 +31,13 @@ func TestMediaTypeToKiroImageFormat(t *testing.T) {
 		"image/gif": "gif", "image/webp": "webp", "IMAGE/PNG": "png", " image/png ": "png",
 	}
 	for mt, want := range ok {
-		if got, valid := mediaTypeToKiroImageFormat(mt); !valid || got != want {
-			t.Errorf("mediaTypeToKiroImageFormat(%q) = %q,%v; want %q,true", mt, got, valid, want)
-		}
+		got, valid := mediaTypeToKiroImageFormat(mt)
+		assert.Truef(t, valid, "mediaTypeToKiroImageFormat(%q) should be valid", mt)
+		assert.Equalf(t, want, got, "mediaTypeToKiroImageFormat(%q)", mt)
 	}
 	for _, mt := range []string{"", "image/svg+xml", "text/plain"} {
-		if _, valid := mediaTypeToKiroImageFormat(mt); valid {
-			t.Errorf("mediaTypeToKiroImageFormat(%q) should be invalid", mt)
-		}
+		_, valid := mediaTypeToKiroImageFormat(mt)
+		assert.Falsef(t, valid, "mediaTypeToKiroImageFormat(%q) should be invalid", mt)
 	}
 }
 
@@ -46,88 +45,73 @@ func TestConvertImage(t *testing.T) {
 	b := anthropicContentBlock{Type: "image", Source: &anthropicImageSource{
 		Type: "base64", MediaType: "image/png", Data: "QUJD"}}
 	img, ok := convertImage(b)
-	if !ok || img.Format != "png" || img.Source.Bytes != "QUJD" {
-		t.Errorf("convertImage base64 = %+v,%v", img, ok)
-	}
+	require.True(t, ok)
+	assert.Equal(t, "png", img.Format)
+	assert.Equal(t, "QUJD", img.Source.Bytes)
+
 	// url source (no data) -> skipped
-	if _, ok := convertImage(anthropicContentBlock{Type: "image",
-		Source: &anthropicImageSource{Type: "url", URL: "http://x/y.png"}}); ok {
-		t.Errorf("url image should be skipped")
-	}
+	_, ok = convertImage(anthropicContentBlock{Type: "image",
+		Source: &anthropicImageSource{Type: "url", URL: "http://x/y.png"}})
+	assert.False(t, ok, "url image should be skipped")
+
 	// unsupported media type -> skipped
-	if _, ok := convertImage(anthropicContentBlock{Type: "image",
-		Source: &anthropicImageSource{Type: "base64", MediaType: "image/svg+xml", Data: "QQ=="}}); ok {
-		t.Errorf("svg image should be skipped")
-	}
+	_, ok = convertImage(anthropicContentBlock{Type: "image",
+		Source: &anthropicImageSource{Type: "base64", MediaType: "image/svg+xml", Data: "QQ=="}})
+	assert.False(t, ok, "svg image should be skipped")
 }
 
 func TestRequestedEffort(t *testing.T) {
-	if got := requestedEffort(&anthropicRequest{
-		OutputConfig: &anthropicOutputConfig{Effort: "high"}, ReasoningEffort: "low"}); got != "high" {
-		t.Errorf("output_config.effort should win, got %q", got)
-	}
-	if got := requestedEffort(&anthropicRequest{ReasoningEffort: "medium"}); got != "medium" {
-		t.Errorf("reasoning_effort fallback, got %q", got)
-	}
-	if got := requestedEffort(&anthropicRequest{}); got != "" {
-		t.Errorf("expected empty, got %q", got)
-	}
+	assert.Equal(t, "high", requestedEffort(&anthropicRequest{
+		OutputConfig: &anthropicOutputConfig{Effort: "high"}, ReasoningEffort: "low"}),
+		"output_config.effort should win")
+	assert.Equal(t, "medium", requestedEffort(&anthropicRequest{ReasoningEffort: "medium"}),
+		"reasoning_effort fallback")
+	assert.Equal(t, "", requestedEffort(&anthropicRequest{}))
 }
 
 func TestNormalizeToolInput(t *testing.T) {
-	if string(normalizeToolInput("")) != `{}` {
-		t.Errorf("empty should be {}")
-	}
-	if string(normalizeToolInput(`{"a":1}`)) != `{"a":1}` {
-		t.Errorf("valid json should pass through")
-	}
+	assert.Equal(t, `{}`, string(normalizeToolInput("")), "empty should be {}")
+	assert.Equal(t, `{"a":1}`, string(normalizeToolInput(`{"a":1}`)), "valid json should pass through")
+
 	got := normalizeToolInput("not json")
 	var m map[string]string
-	if err := json.Unmarshal(got, &m); err != nil || m["_raw"] != "not json" {
-		t.Errorf("invalid json should be wrapped, got %s", got)
-	}
+	require.NoError(t, json.Unmarshal(got, &m))
+	assert.Equal(t, "not json", m["_raw"], "invalid json should be wrapped")
 }
 
 func TestExtractText(t *testing.T) {
-	if got := extractText(json.RawMessage(`"hi"`)); got != "hi" {
-		t.Errorf("string system = %q", got)
-	}
-	if got := extractText(json.RawMessage(`[{"type":"text","text":"a"},{"type":"text","text":"b"}]`)); got != "ab" {
-		t.Errorf("array system = %q", got)
-	}
-	if got := extractText(nil); got != "" {
-		t.Errorf("nil system = %q", got)
-	}
+	assert.Equal(t, "hi", extractText(json.RawMessage(`"hi"`)))
+	assert.Equal(t, "ab", extractText(json.RawMessage(`[{"type":"text","text":"a"},{"type":"text","text":"b"}]`)))
+	assert.Equal(t, "", extractText(nil))
 }
 
 func TestConvertToolResult(t *testing.T) {
 	// string content
 	tr := convertToolResult(anthropicContentBlock{Type: "tool_result", ToolUseID: "t1",
 		Content: json.RawMessage(`"result text"`)})
-	if tr.ToolUseID != "t1" || tr.Status != "success" || len(tr.Content) != 1 || tr.Content[0].Text != "result text" {
-		t.Errorf("string tool_result = %+v", tr)
-	}
+	assert.Equal(t, "t1", tr.ToolUseID)
+	assert.Equal(t, "success", tr.Status)
+	require.Len(t, tr.Content, 1)
+	assert.Equal(t, "result text", tr.Content[0].Text)
+
 	// error flag
 	tr = convertToolResult(anthropicContentBlock{Type: "tool_result", ToolUseID: "t2",
 		IsError: true, Content: json.RawMessage(`"boom"`)})
-	if tr.Status != "error" {
-		t.Errorf("is_error should map to error status, got %q", tr.Status)
-	}
+	assert.Equal(t, "error", tr.Status, "is_error should map to error status")
+
 	// array of text blocks
 	tr = convertToolResult(anthropicContentBlock{Type: "tool_result", ToolUseID: "t3",
 		Content: json.RawMessage(`[{"type":"text","text":"x"}]`)})
-	if len(tr.Content) != 1 || tr.Content[0].Text != "x" {
-		t.Errorf("array tool_result = %+v", tr)
-	}
+	require.Len(t, tr.Content, 1)
+	assert.Equal(t, "x", tr.Content[0].Text)
+
 	// array with a non-text block -> preserved as JSON, not dropped
 	tr = convertToolResult(anthropicContentBlock{Type: "tool_result", ToolUseID: "t4",
 		Content: json.RawMessage(`[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"QQ=="}}]`)})
-	if len(tr.Content) != 1 || tr.Content[0].Text != "" || len(tr.Content[0].JSON) == 0 {
-		t.Errorf("non-text tool_result should be JSON, got %+v", tr.Content)
-	}
-	if !strings.Contains(string(tr.Content[0].JSON), "image") {
-		t.Errorf("non-text tool_result JSON = %s", tr.Content[0].JSON)
-	}
+	require.Len(t, tr.Content, 1)
+	assert.Empty(t, tr.Content[0].Text)
+	assert.NotEmpty(t, tr.Content[0].JSON)
+	assert.Contains(t, string(tr.Content[0].JSON), "image")
 }
 
 func TestBuildKiroRequestBasic(t *testing.T) {
@@ -137,25 +121,17 @@ func TestBuildKiroRequestBasic(t *testing.T) {
 		Messages: []anthropicMessage{{Role: "user", Content: json.RawMessage(`"hello"`)}},
 	}
 	k, err := buildKiroRequest(&Config{AgentMode: "vibe"}, areq)
-	if err != nil {
-		t.Fatalf("buildKiroRequest: %v", err)
-	}
-	if k.ConversationState.ChatTriggerType != "MANUAL" {
-		t.Errorf("chatTriggerType = %q", k.ConversationState.ChatTriggerType)
-	}
-	if k.SystemPrompt != "you are helpful" {
-		t.Errorf("systemPrompt = %q", k.SystemPrompt)
-	}
-	if k.AgentMode != "vibe" {
-		t.Errorf("agentMode = %q", k.AgentMode)
-	}
+	require.NoError(t, err)
+	assert.Equal(t, "MANUAL", k.ConversationState.ChatTriggerType)
+	assert.Equal(t, "you are helpful", k.SystemPrompt)
+	assert.Equal(t, "vibe", k.AgentMode)
+
 	um := k.ConversationState.CurrentMessage.UserInputMessage
-	if um == nil || um.Content != "hello" || um.ModelID != "claude-opus-4.8" || um.Origin != "AI_EDITOR" {
-		t.Errorf("current message = %+v", um)
-	}
-	if len(k.ConversationState.History) != 0 {
-		t.Errorf("history should be empty, got %d", len(k.ConversationState.History))
-	}
+	require.NotNil(t, um)
+	assert.Equal(t, "hello", um.Content)
+	assert.Equal(t, "claude-opus-4.8", um.ModelID)
+	assert.Equal(t, "AI_EDITOR", um.Origin)
+	assert.Empty(t, k.ConversationState.History, "history should be empty")
 }
 
 func TestBuildKiroRequestMultiTurnAndTools(t *testing.T) {
@@ -170,31 +146,27 @@ func TestBuildKiroRequestMultiTurnAndTools(t *testing.T) {
 		},
 	}
 	k, err := buildKiroRequest(&Config{}, areq)
-	if err != nil {
-		t.Fatalf("buildKiroRequest: %v", err)
-	}
+	require.NoError(t, err)
+
 	// current = last user (tool_result)
 	cur := k.ConversationState.CurrentMessage.UserInputMessage
-	if cur == nil || cur.UserInputMessageContext == nil || len(cur.UserInputMessageContext.ToolResults) != 1 {
-		t.Fatalf("current tool_result missing: %+v", cur)
-	}
-	if cur.UserInputMessageContext.ToolResults[0].ToolUseID != "tu1" {
-		t.Errorf("tool_result id = %q", cur.UserInputMessageContext.ToolResults[0].ToolUseID)
-	}
+	require.NotNil(t, cur)
+	require.NotNil(t, cur.UserInputMessageContext)
+	require.Len(t, cur.UserInputMessageContext.ToolResults, 1)
+	assert.Equal(t, "tu1", cur.UserInputMessageContext.ToolResults[0].ToolUseID)
+
 	// tools attached to current message
-	if len(cur.UserInputMessageContext.Tools) != 1 || cur.UserInputMessageContext.Tools[0].ToolSpecification.Name != "get_weather" {
-		t.Errorf("tools not attached: %+v", cur.UserInputMessageContext.Tools)
-	}
+	require.Len(t, cur.UserInputMessageContext.Tools, 1)
+	assert.Equal(t, "get_weather", cur.UserInputMessageContext.Tools[0].ToolSpecification.Name)
+
 	// history: [user, assistant] and starts with user
-	if len(k.ConversationState.History) != 2 {
-		t.Fatalf("history len = %d", len(k.ConversationState.History))
-	}
-	if k.ConversationState.History[0].UserInputMessage == nil {
-		t.Errorf("history should start with a user turn")
-	}
-	if am := k.ConversationState.History[1].AssistantResponseMessage; am == nil || len(am.ToolUses) != 1 || am.ToolUses[0].ToolUseID != "tu1" {
-		t.Errorf("assistant tool_use not converted: %+v", k.ConversationState.History[1])
-	}
+	require.Len(t, k.ConversationState.History, 2)
+	assert.NotNil(t, k.ConversationState.History[0].UserInputMessage, "history should start with a user turn")
+
+	am := k.ConversationState.History[1].AssistantResponseMessage
+	require.NotNil(t, am)
+	require.Len(t, am.ToolUses, 1)
+	assert.Equal(t, "tu1", am.ToolUses[0].ToolUseID)
 }
 
 func TestBuildKiroRequestImage(t *testing.T) {
@@ -204,19 +176,16 @@ func TestBuildKiroRequestImage(t *testing.T) {
 			`[{"type":"text","text":"what is this"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}}]`)}},
 	}
 	k, err := buildKiroRequest(&Config{}, areq)
-	if err != nil {
-		t.Fatalf("buildKiroRequest: %v", err)
-	}
+	require.NoError(t, err)
 	um := k.ConversationState.CurrentMessage.UserInputMessage
-	if len(um.Images) != 1 || um.Images[0].Format != "png" || um.Images[0].Source.Bytes != "QUJD" {
-		t.Errorf("image not converted: %+v", um.Images)
-	}
+	require.Len(t, um.Images, 1)
+	assert.Equal(t, "png", um.Images[0].Format)
+	assert.Equal(t, "QUJD", um.Images[0].Source.Bytes)
 }
 
 func TestBuildKiroRequestEmptyMessages(t *testing.T) {
-	if _, err := buildKiroRequest(&Config{}, &anthropicRequest{}); err == nil {
-		t.Errorf("expected error for empty messages")
-	}
+	_, err := buildKiroRequest(&Config{}, &anthropicRequest{})
+	assert.Error(t, err, "expected error for empty messages")
 }
 
 // When the last message is an assistant turn (prefill), the current message is
@@ -230,22 +199,18 @@ func TestBuildKiroRequestAssistantLast(t *testing.T) {
 		},
 	}
 	k, err := buildKiroRequest(&Config{}, areq)
-	if err != nil {
-		t.Fatalf("buildKiroRequest: %v", err)
-	}
+	require.NoError(t, err)
+
 	cur := k.ConversationState.CurrentMessage.UserInputMessage
-	if cur == nil || cur.Content != " " || cur.ModelID != "claude-opus-4.8" {
-		t.Errorf("synthesized current = %+v", cur)
-	}
-	if len(k.ConversationState.History) != 2 {
-		t.Fatalf("history len = %d, want 2", len(k.ConversationState.History))
-	}
-	if k.ConversationState.History[0].UserInputMessage == nil {
-		t.Errorf("history[0] should be the user turn")
-	}
-	if am := k.ConversationState.History[1].AssistantResponseMessage; am == nil || am.Content != "partial answer" {
-		t.Errorf("history[1] assistant = %+v", k.ConversationState.History[1])
-	}
+	require.NotNil(t, cur)
+	assert.Equal(t, " ", cur.Content)
+	assert.Equal(t, "claude-opus-4.8", cur.ModelID)
+
+	require.Len(t, k.ConversationState.History, 2)
+	assert.NotNil(t, k.ConversationState.History[0].UserInputMessage, "history[0] should be the user turn")
+	am := k.ConversationState.History[1].AssistantResponseMessage
+	require.NotNil(t, am)
+	assert.Equal(t, "partial answer", am.Content)
 }
 
 // --- blockAssembler ---
@@ -255,28 +220,23 @@ func TestBlockAssemblerText(t *testing.T) {
 	_ = a.addText("Hello")
 	_ = a.addText(" world")
 	_ = a.closeOpen()
-	if len(a.blocks) != 1 || a.blocks[0].Type != "text" || a.blocks[0].Text != "Hello world" {
-		t.Errorf("text blocks = %+v", a.blocks)
-	}
-	if a.stopReason() != "end_turn" {
-		t.Errorf("stopReason = %q", a.stopReason())
-	}
+	require.Len(t, a.blocks, 1)
+	assert.Equal(t, "text", a.blocks[0].Type)
+	assert.Equal(t, "Hello world", a.blocks[0].Text)
+	assert.Equal(t, "end_turn", a.stopReason())
 }
 
 func TestBlockAssemblerToolUse(t *testing.T) {
 	a := newBlockAssembler(nil)
 	_ = a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t1", ToolName: "get_weather", ToolInput: `{"city":`})
 	_ = a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t1", ToolInput: `"NYC"}`, ToolStop: true})
-	if len(a.blocks) != 1 {
-		t.Fatalf("blocks = %+v", a.blocks)
-	}
+	require.Len(t, a.blocks, 1)
 	b := a.blocks[0]
-	if b.Type != "tool_use" || b.ID != "t1" || b.Name != "get_weather" || string(b.Input) != `{"city":"NYC"}` {
-		t.Errorf("tool_use block = %+v (input %s)", b, b.Input)
-	}
-	if a.stopReason() != "tool_use" {
-		t.Errorf("stopReason = %q", a.stopReason())
-	}
+	assert.Equal(t, "tool_use", b.Type)
+	assert.Equal(t, "t1", b.ID)
+	assert.Equal(t, "get_weather", b.Name)
+	assert.Equal(t, `{"city":"NYC"}`, string(b.Input))
+	assert.Equal(t, "tool_use", a.stopReason())
 }
 
 func TestBlockAssemblerTextThenTool(t *testing.T) {
@@ -284,9 +244,9 @@ func TestBlockAssemblerTextThenTool(t *testing.T) {
 	_ = a.addText("Answer:")
 	_ = a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t9", ToolName: "f", ToolInput: `{}`, ToolStop: true})
 	_ = a.closeOpen()
-	if len(a.blocks) != 2 || a.blocks[0].Type != "text" || a.blocks[1].Type != "tool_use" {
-		t.Errorf("blocks = %+v", a.blocks)
-	}
+	require.Len(t, a.blocks, 2)
+	assert.Equal(t, "text", a.blocks[0].Type)
+	assert.Equal(t, "tool_use", a.blocks[1].Type)
 }
 
 func TestBlockAssemblerSSEEvents(t *testing.T) {
@@ -298,15 +258,7 @@ func TestBlockAssemblerSSEEvents(t *testing.T) {
 	a := newBlockAssembler(emit)
 	_ = a.addText("hi")
 	_ = a.closeOpen()
-	want := []string{"content_block_start", "content_block_delta", "content_block_stop"}
-	if len(events) != len(want) {
-		t.Fatalf("events = %v", events)
-	}
-	for i := range want {
-		if events[i] != want[i] {
-			t.Errorf("event[%d] = %q, want %q", i, events[i], want[i])
-		}
-	}
+	assert.Equal(t, []string{"content_block_start", "content_block_delta", "content_block_stop"}, events)
 }
 
 func TestBlockAssemblerToolUseSSE(t *testing.T) {
@@ -323,34 +275,27 @@ func TestBlockAssemblerToolUseSSE(t *testing.T) {
 	_ = a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t1", ToolName: "get_weather",
 		ToolInput: `{"city":"NYC"}`, ToolStop: true})
 
-	if len(got) != 3 {
-		t.Fatalf("events = %+v", got)
-	}
-	if got[0].name != "content_block_start" {
-		t.Errorf("event[0] = %q", got[0].name)
-	}
+	require.Len(t, got, 3)
+	assert.Equal(t, "content_block_start", got[0].name)
 	cb, _ := got[0].data["content_block"].(map[string]any)
-	if cb == nil || cb["type"] != "tool_use" || cb["id"] != "t1" || cb["name"] != "get_weather" {
-		t.Errorf("content_block_start payload = %+v", got[0].data)
-	}
-	if got[1].name != "content_block_delta" {
-		t.Errorf("event[1] = %q", got[1].name)
-	}
+	require.NotNil(t, cb)
+	assert.Equal(t, "tool_use", cb["type"])
+	assert.Equal(t, "t1", cb["id"])
+	assert.Equal(t, "get_weather", cb["name"])
+
+	assert.Equal(t, "content_block_delta", got[1].name)
 	delta, _ := got[1].data["delta"].(map[string]any)
-	if delta == nil || delta["type"] != "input_json_delta" || delta["partial_json"] != `{"city":"NYC"}` {
-		t.Errorf("delta payload = %+v", got[1].data)
-	}
-	if got[2].name != "content_block_stop" {
-		t.Errorf("event[2] = %q", got[2].name)
-	}
+	require.NotNil(t, delta)
+	assert.Equal(t, "input_json_delta", delta["type"])
+	assert.Equal(t, `{"city":"NYC"}`, delta["partial_json"])
+
+	assert.Equal(t, "content_block_stop", got[2].name)
 }
 
 func TestEstimateTokens(t *testing.T) {
 	cases := map[int]int{0: 0, -5: 0, 1: 1, 4: 1, 5: 2, 8: 2, 9: 3}
 	for in, want := range cases {
-		if got := estimateTokens(in); got != want {
-			t.Errorf("estimateTokens(%d) = %d, want %d", in, got, want)
-		}
+		assert.Equalf(t, want, estimateTokens(in), "estimateTokens(%d)", in)
 	}
 }
 
@@ -358,29 +303,23 @@ func TestEstimateTokens(t *testing.T) {
 
 func TestRequestedEffortThinking(t *testing.T) {
 	// thinking disabled -> minimize sentinel
-	if got := requestedEffort(&anthropicRequest{Thinking: &anthropicThinking{Type: "disabled"}}); got != effortMinimize {
-		t.Errorf("disabled thinking -> %q, want minimize sentinel", got)
-	}
+	assert.Equal(t, effortMinimize, requestedEffort(&anthropicRequest{Thinking: &anthropicThinking{Type: "disabled"}}),
+		"disabled thinking -> minimize sentinel")
 	// thinking enabled -> default (empty = top out)
-	if got := requestedEffort(&anthropicRequest{Thinking: &anthropicThinking{Type: "enabled", BudgetTokens: 5000}}); got != "" {
-		t.Errorf("enabled thinking -> %q, want empty", got)
-	}
+	assert.Equal(t, "", requestedEffort(&anthropicRequest{Thinking: &anthropicThinking{Type: "enabled", BudgetTokens: 5000}}),
+		"enabled thinking -> empty")
 	// explicit effort still wins over the thinking toggle
-	if got := requestedEffort(&anthropicRequest{
+	assert.Equal(t, "high", requestedEffort(&anthropicRequest{
 		OutputConfig: &anthropicOutputConfig{Effort: "high"},
-		Thinking:     &anthropicThinking{Type: "disabled"}}); got != "high" {
-		t.Errorf("explicit effort should win, got %q", got)
-	}
+		Thinking:     &anthropicThinking{Type: "disabled"}}),
+		"explicit effort should win")
 	// suppression flag
-	if !thinkingSuppressed(&anthropicRequest{Thinking: &anthropicThinking{Type: "disabled"}}) {
-		t.Errorf("disabled thinking should be suppressed")
-	}
-	if thinkingSuppressed(&anthropicRequest{Thinking: &anthropicThinking{Type: "enabled"}}) {
-		t.Errorf("enabled thinking should not be suppressed")
-	}
-	if thinkingSuppressed(&anthropicRequest{}) {
-		t.Errorf("absent thinking should not be suppressed")
-	}
+	assert.True(t, thinkingSuppressed(&anthropicRequest{Thinking: &anthropicThinking{Type: "disabled"}}),
+		"disabled thinking should be suppressed")
+	assert.False(t, thinkingSuppressed(&anthropicRequest{Thinking: &anthropicThinking{Type: "enabled"}}),
+		"enabled thinking should not be suppressed")
+	assert.False(t, thinkingSuppressed(&anthropicRequest{}),
+		"absent thinking should not be suppressed")
 }
 
 func TestBlockAssemblerReasoning(t *testing.T) {
@@ -390,19 +329,14 @@ func TestBlockAssemblerReasoning(t *testing.T) {
 	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningSignature: "SIG=="})
 	_ = a.addText("answer")
 	_ = a.closeOpen()
-	if len(a.blocks) != 2 {
-		t.Fatalf("blocks = %+v", a.blocks)
-	}
-	if a.blocks[0].Type != "thinking" || a.blocks[0].Thinking != "let me think" || a.blocks[0].Signature != "SIG==" {
-		t.Errorf("thinking block = %+v", a.blocks[0])
-	}
-	if a.blocks[1].Type != "text" || a.blocks[1].Text != "answer" {
-		t.Errorf("text block = %+v", a.blocks[1])
-	}
+	require.Len(t, a.blocks, 2)
+	assert.Equal(t, "thinking", a.blocks[0].Type)
+	assert.Equal(t, "let me think", a.blocks[0].Thinking)
+	assert.Equal(t, "SIG==", a.blocks[0].Signature)
+	assert.Equal(t, "text", a.blocks[1].Type)
+	assert.Equal(t, "answer", a.blocks[1].Text)
 	// thinking precedes text and is not a tool turn
-	if a.stopReason() != "end_turn" {
-		t.Errorf("stopReason = %q", a.stopReason())
-	}
+	assert.Equal(t, "end_turn", a.stopReason())
 }
 
 func TestBlockAssemblerStopReason(t *testing.T) {
@@ -411,24 +345,18 @@ func TestBlockAssemblerStopReason(t *testing.T) {
 	_ = a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t", ToolName: "f"})
 	_ = a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t", ToolStop: true})
 	_ = a.closeOpen()
-	if got := a.stopReason(); got != "tool_use" {
-		t.Errorf("inferred tool_use = %q", got)
-	}
+	assert.Equal(t, "tool_use", a.stopReason(), "inferred tool_use")
 
 	// 2. authoritative metadataEvent.stopReason wins over the guess.
 	a.setStopReason("MAX_TOKENS")
-	if got := a.stopReason(); got != "max_tokens" {
-		t.Errorf("authoritative should win, got %q", got)
-	}
+	assert.Equal(t, "max_tokens", a.stopReason(), "authoritative should win")
 
 	// 3. unknown backend value is ignored -> fallback still applies.
 	a2 := newBlockAssembler(nil)
 	_ = a2.addText("hi")
 	_ = a2.closeOpen()
 	a2.setStopReason("WHATEVER")
-	if got := a2.stopReason(); got != "end_turn" {
-		t.Errorf("unknown reason should fall back, got %q", got)
-	}
+	assert.Equal(t, "end_turn", a2.stopReason(), "unknown reason should fall back")
 }
 
 func TestBlockAssemblerReasoningSSE(t *testing.T) {
@@ -446,24 +374,22 @@ func TestBlockAssemblerReasoningSSE(t *testing.T) {
 	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningSignature: "SIG=="})
 	_ = a.closeOpen()
 	// content_block_start(thinking) -> thinking_delta -> signature_delta -> stop
-	if len(got) != 4 {
-		t.Fatalf("events = %+v", got)
-	}
+	require.Len(t, got, 4)
 	cb := got[0].data["content_block"].(map[string]any)
-	if got[0].name != "content_block_start" || cb["type"] != "thinking" {
-		t.Errorf("start = %+v", got[0])
-	}
+	assert.Equal(t, "content_block_start", got[0].name)
+	assert.Equal(t, "thinking", cb["type"])
+
 	d1 := got[1].data["delta"].(map[string]any)
-	if got[1].name != "content_block_delta" || d1["type"] != "thinking_delta" || d1["thinking"] != "hmm" {
-		t.Errorf("delta1 = %+v", got[1])
-	}
+	assert.Equal(t, "content_block_delta", got[1].name)
+	assert.Equal(t, "thinking_delta", d1["type"])
+	assert.Equal(t, "hmm", d1["thinking"])
+
 	d2 := got[2].data["delta"].(map[string]any)
-	if got[2].name != "content_block_delta" || d2["type"] != "signature_delta" || d2["signature"] != "SIG==" {
-		t.Errorf("delta2 = %+v", got[2])
-	}
-	if got[3].name != "content_block_stop" {
-		t.Errorf("stop = %+v", got[3])
-	}
+	assert.Equal(t, "content_block_delta", got[2].name)
+	assert.Equal(t, "signature_delta", d2["type"])
+	assert.Equal(t, "SIG==", d2["signature"])
+
+	assert.Equal(t, "content_block_stop", got[3].name)
 }
 
 func TestBlockAssemblerReasoningSuppressed(t *testing.T) {
@@ -473,9 +399,8 @@ func TestBlockAssemblerReasoningSuppressed(t *testing.T) {
 	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningSignature: "SIG=="})
 	_ = a.addText("answer")
 	_ = a.closeOpen()
-	if len(a.blocks) != 1 || a.blocks[0].Type != "text" {
-		t.Errorf("suppressed blocks = %+v", a.blocks)
-	}
+	require.Len(t, a.blocks, 1)
+	assert.Equal(t, "text", a.blocks[0].Type)
 }
 
 func TestBlockAssemblerRedactedThinking(t *testing.T) {
@@ -484,13 +409,11 @@ func TestBlockAssemblerRedactedThinking(t *testing.T) {
 	a := newBlockAssembler(emit)
 	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningRedacted: "REDACTED=="})
 	_ = a.closeOpen()
-	if len(a.blocks) != 1 || a.blocks[0].Type != "redacted_thinking" || a.blocks[0].Data != "REDACTED==" {
-		t.Errorf("redacted block = %+v", a.blocks)
-	}
+	require.Len(t, a.blocks, 1)
+	assert.Equal(t, "redacted_thinking", a.blocks[0].Type)
+	assert.Equal(t, "REDACTED==", a.blocks[0].Data)
 	// redacted reasoning has no delta: start (carrying data) then stop.
-	if len(events) != 2 || events[0] != "content_block_start" || events[1] != "content_block_stop" {
-		t.Errorf("redacted events = %v", events)
-	}
+	assert.Equal(t, []string{"content_block_start", "content_block_stop"}, events)
 }
 
 func TestBuildKiroRequestThinkingHistory(t *testing.T) {
@@ -503,24 +426,18 @@ func TestBuildKiroRequestThinkingHistory(t *testing.T) {
 		},
 	}
 	k, err := buildKiroRequest(&Config{}, areq)
-	if err != nil {
-		t.Fatalf("buildKiroRequest: %v", err)
-	}
+	require.NoError(t, err)
 	am := k.ConversationState.History[1].AssistantResponseMessage
-	if am == nil || am.ReasoningContent == nil || am.ReasoningContent.ReasoningText == nil {
-		t.Fatalf("reasoningContent missing: %+v", am)
-	}
-	if am.ReasoningContent.ReasoningText.Text != "reasoning..." || am.ReasoningContent.ReasoningText.Signature != "SIG==" {
-		t.Errorf("reasoningText = %+v", am.ReasoningContent.ReasoningText)
-	}
-	if am.Content != "the answer" {
-		t.Errorf("content = %q", am.Content)
-	}
+	require.NotNil(t, am)
+	require.NotNil(t, am.ReasoningContent)
+	require.NotNil(t, am.ReasoningContent.ReasoningText)
+	assert.Equal(t, "reasoning...", am.ReasoningContent.ReasoningText.Text)
+	assert.Equal(t, "SIG==", am.ReasoningContent.ReasoningText.Signature)
+	assert.Equal(t, "the answer", am.Content)
+
 	// the round-tripped reasoningContent must serialize under the union shape.
 	raw, _ := json.Marshal(am)
-	if !strings.Contains(string(raw), `"reasoningContent":{"reasoningText":{"text":"reasoning...","signature":"SIG=="}}`) {
-		t.Errorf("reasoningContent wire shape = %s", raw)
-	}
+	assert.Contains(t, string(raw), `"reasoningContent":{"reasoningText":{"text":"reasoning...","signature":"SIG=="}}`)
 }
 
 func TestBuildKiroRequestRedactedThinkingHistory(t *testing.T) {
@@ -533,13 +450,11 @@ func TestBuildKiroRequestRedactedThinkingHistory(t *testing.T) {
 		},
 	}
 	k, err := buildKiroRequest(&Config{}, areq)
-	if err != nil {
-		t.Fatalf("buildKiroRequest: %v", err)
-	}
+	require.NoError(t, err)
 	am := k.ConversationState.History[1].AssistantResponseMessage
-	if am == nil || am.ReasoningContent == nil || am.ReasoningContent.RedactedContent != "ENC==" {
-		t.Errorf("redactedContent = %+v", am.ReasoningContent)
-	}
+	require.NotNil(t, am)
+	require.NotNil(t, am.ReasoningContent)
+	assert.Equal(t, "ENC==", am.ReasoningContent.RedactedContent)
 }
 
 func TestStripReasoningFromHistory(t *testing.T) {
@@ -548,14 +463,9 @@ func TestStripReasoningFromHistory(t *testing.T) {
 		{AssistantResponseMessage: &kiroAssistantMessage{Content: "a",
 			ReasoningContent: &kiroReasoningContent{ReasoningText: &kiroReasoningText{Text: "t", Signature: "s"}}}},
 	}}}
-	if !stripReasoningFromHistory(kreq) {
-		t.Errorf("should report stripped")
-	}
-	if kreq.ConversationState.History[1].AssistantResponseMessage.ReasoningContent != nil {
-		t.Errorf("reasoningContent not stripped")
-	}
+	assert.True(t, stripReasoningFromHistory(kreq), "should report stripped")
+	assert.Nil(t, kreq.ConversationState.History[1].AssistantResponseMessage.ReasoningContent,
+		"reasoningContent not stripped")
 	// nothing left to strip -> false
-	if stripReasoningFromHistory(kreq) {
-		t.Errorf("second strip should be false")
-	}
+	assert.False(t, stripReasoningFromHistory(kreq), "second strip should be false")
 }

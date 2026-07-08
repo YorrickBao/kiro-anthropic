@@ -2,41 +2,36 @@ package main
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestProxyFunc(t *testing.T) {
-	if proxyFunc("") != nil {
-		t.Errorf(`proxyFunc("") should be nil (direct)`)
-	}
+	assert.Nil(t, proxyFunc(""), `proxyFunc("") should be nil (direct)`)
+
 	f := proxyFunc("http://127.0.0.1:7890")
-	if f == nil {
-		t.Fatalf("proxyFunc(valid) should return a resolver")
-	}
+	require.NotNil(t, f, "proxyFunc(valid) should return a resolver")
 	u, err := f(nil)
-	if err != nil || u == nil || u.Host != "127.0.0.1:7890" {
-		t.Errorf("resolver returned %v, %v", u, err)
-	}
-	if proxyFunc("://bad") != nil {
-		t.Errorf("proxyFunc(invalid) should be nil")
-	}
+	require.NoError(t, err)
+	require.NotNil(t, u)
+	assert.Equal(t, "127.0.0.1:7890", u.Host)
+
+	assert.Nil(t, proxyFunc("://bad"), "proxyFunc(invalid) should be nil")
 }
 
 func TestConfigureProxy(t *testing.T) {
 	// disable keywords -> direct ("")
 	for _, kw := range []string{"none", "off", "direct", "NONE"} {
 		cfg := &Config{ProxyURL: kw}
-		configureProxy(cfg)
-		if cfg.ProxyURL != "" {
-			t.Errorf("keyword %q should disable proxy, got %q", kw, cfg.ProxyURL)
-		}
+		require.NoError(t, configureProxy(cfg))
+		assert.Emptyf(t, cfg.ProxyURL, "keyword %q should disable proxy", kw)
 	}
 
 	// explicit value wins
 	cfg := &Config{ProxyURL: "http://explicit:1234"}
-	configureProxy(cfg)
-	if cfg.ProxyURL != "http://explicit:1234" {
-		t.Errorf("explicit proxy = %q", cfg.ProxyURL)
-	}
+	require.NoError(t, configureProxy(cfg))
+	assert.Equal(t, "http://explicit:1234", cfg.ProxyURL)
 
 	// empty + env set -> env value
 	t.Setenv("HTTPS_PROXY", "")
@@ -44,10 +39,8 @@ func TestConfigureProxy(t *testing.T) {
 	t.Setenv("HTTP_PROXY", "http://envproxy:8080")
 	t.Setenv("http_proxy", "")
 	cfg = &Config{ProxyURL: ""}
-	configureProxy(cfg)
-	if cfg.ProxyURL != "http://envproxy:8080" {
-		t.Errorf("env proxy = %q", cfg.ProxyURL)
-	}
+	require.NoError(t, configureProxy(cfg))
+	assert.Equal(t, "http://envproxy:8080", cfg.ProxyURL)
 
 	// empty + no env -> built-in default
 	t.Setenv("HTTPS_PROXY", "")
@@ -55,8 +48,6 @@ func TestConfigureProxy(t *testing.T) {
 	t.Setenv("HTTP_PROXY", "")
 	t.Setenv("http_proxy", "")
 	cfg = &Config{ProxyURL: ""}
-	configureProxy(cfg)
-	if cfg.ProxyURL != defaultProxyURL {
-		t.Errorf("default proxy = %q, want %q", cfg.ProxyURL, defaultProxyURL)
-	}
+	require.NoError(t, configureProxy(cfg))
+	assert.Equal(t, defaultProxyURL, cfg.ProxyURL)
 }

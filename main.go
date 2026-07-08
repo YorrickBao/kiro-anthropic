@@ -9,9 +9,9 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +20,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/spf13/cobra"
 )
 
 // Build metadata. version/commit/date are overridden at build time via
@@ -56,70 +58,110 @@ func defaultTokenFile() string {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(1)
-	}
-
-	cmd := os.Args[1]
-	args := os.Args[2:]
-
-	switch cmd {
-	case "serve":
-		runServe(args)
-	case "status":
-		runStatus(args)
-	case "models":
-		runModels(args)
-	case "version", "-v", "--version":
-		fmt.Printf("kiro-anthropic %s\n", version)
-		if commit != "" {
-			fmt.Printf("commit: %s\n", commit)
-		}
-		if date != "" {
-			fmt.Printf("built:  %s\n", date)
-		}
-	case "help", "-h", "--help":
-		usage()
-	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", cmd)
-		usage()
+	if err := newRootCmd().Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func usage() {
-	fmt.Fprint(os.Stderr, `kiro-anthropic - expose a Kiro account as an Anthropic-compatible API
-
-USAGE:
-  kiro-anthropic <command> [flags]
-
-COMMANDS:
-  serve      Start the Anthropic-compatible HTTP server (default port 17890)
-  status     Show the current Kiro auth/token status
-  models     List the model IDs available to this Kiro account
-  version    Print version
-  help       Show this help
-
-Run "kiro-anthropic serve -h" for serve flags.
-`)
+// newRootCmd builds the cobra command tree.
+func newRootCmd() *cobra.Command {
+	root := &cobra.Command{
+		Use:   "kiro-anthropic",
+		Short: "expose a Kiro account as an Anthropic-compatible API",
+		Long: "kiro-anthropic - expose a Kiro account as an Anthropic-compatible API\n\n" +
+			"Proxies a Kiro (Amazon Q Developer / CodeWhisperer) account behind the\n" +
+			"Anthropic Messages API so any Anthropic-compatible client can use it.",
+		// We print errors ourselves in main and don't want usage spam on
+		// every runtime error.
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Version:       version,
+	}
+	root.SetVersionTemplate(versionString())
+	root.AddCommand(
+		newServeCmd(),
+		newStatusCmd(),
+		newModelsCmd(),
+		newVersionCmd(),
+		newUpgradeCmd(),
+	)
+	return root
 }
 
-// newServeFlags builds the flag set shared by "serve".
-func newServeFlags() (*flag.FlagSet, *Config) {
+// versionString renders the multi-line version banner shared by the "version"
+// subcommand and the --version flag.
+func versionString() string {
+	s := fmt.Sprintf("kiro-anthropic %s\n", version)
+	if commit != "" {
+		s += fmt.Sprintf("commit: %s\n", commit)
+	}
+	if date != "" {
+		s += fmt.Sprintf("built:  %s\n", date)
+	}
+	return s
+}
+
+// addServerFlags registers the flags shared by serve/status/models. status and
+// models only read a subset (proxy, token, region, profile-arn) but accept the
+// rest for symmetry.
+func addServerFlags(cmd *cobra.Command, cfg *Config) {
+	f := cmd.Flags()
+	f.StringVar(&cfg.Host, "host", "127.0.0.1", "host/interface to bind")
+	f.IntVar(&cfg.Port, "port", 17890, "port to listen on")
+	f.StringVar(&cfg.ProxyURL, "proxy", "", "outbound HTTP proxy for AWS/Kiro calls; precedence: this flag > http(s)_proxy env > default "+defaultProxyURL+"; use 'none' to connect directly")
+	f.StringVar(&cfg.TokenFile, "token-file", defaultTokenFile(), "path to Kiro auth token JSON")
+	f.StringVar(&cfg.ProfileArn, "profile-arn", "", "explicit CodeWhisperer profileArn (auto-resolved if empty)")
+	f.StringVar(&cfg.APIKey, "api-key", "", "if set, clients must present this key via x-api-key or Authorization: Bearer")
+	f.StringVar(&cfg.AgentMode, "agent-mode", "vibe", "Kiro agent mode")
+	f.StringVar(&cfg.Region, "region", "", "region override (defaults to the token's region)")
+	f.BoolVar(&cfg.Log, "log", false, "enable request logging to stdout (the window); off by default")
+	f.StringVar(&cfg.LogFile, "log-file", "", "write the request log to this file instead of stdout (implies --log); 'none' disables")
+}
+
+func newServeCmd() *cobra.Command {
 	cfg := &Config{}
-	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	fs.StringVar(&cfg.Host, "host", "127.0.0.1", "host/interface to bind")
-	fs.IntVar(&cfg.Port, "port", 17890, "port to listen on")
-	fs.StringVar(&cfg.ProxyURL, "proxy", "", "outbound HTTP proxy for AWS/Kiro calls; precedence: this flag > http(s)_proxy env > default "+defaultProxyURL+"; use 'none' to connect directly")
-	fs.StringVar(&cfg.TokenFile, "token-file", defaultTokenFile(), "path to Kiro auth token JSON")
-	fs.StringVar(&cfg.ProfileArn, "profile-arn", "", "explicit CodeWhisperer profileArn (auto-resolved if empty)")
-	fs.StringVar(&cfg.APIKey, "api-key", "", "if set, clients must present this key via x-api-key or Authorization: Bearer")
-	fs.StringVar(&cfg.AgentMode, "agent-mode", "vibe", "Kiro agent mode")
-	fs.StringVar(&cfg.Region, "region", "", "region override (defaults to the token's region)")
-	fs.BoolVar(&cfg.Log, "log", false, "enable request logging to stdout (the window); off by default")
-	fs.StringVar(&cfg.LogFile, "log-file", "", "write the request log to this file instead of stdout (implies --log); 'none' disables")
-	return fs, cfg
+	cmd := &cobra.Command{
+		Use:   "serve",
+		Short: "Start the Anthropic-compatible HTTP server (default port 17890)",
+		Args:  cobra.NoArgs,
+		RunE:  func(_ *cobra.Command, _ []string) error { return runServe(cfg) },
+	}
+	addServerFlags(cmd, cfg)
+	return cmd
+}
+
+func newStatusCmd() *cobra.Command {
+	cfg := &Config{}
+	cmd := &cobra.Command{
+		Use:   "status",
+		Short: "Show the current Kiro auth/token status",
+		Args:  cobra.NoArgs,
+		RunE:  func(_ *cobra.Command, _ []string) error { return runStatus(cfg) },
+	}
+	addServerFlags(cmd, cfg)
+	return cmd
+}
+
+func newModelsCmd() *cobra.Command {
+	cfg := &Config{}
+	cmd := &cobra.Command{
+		Use:   "models",
+		Short: "List the model IDs available to this Kiro account",
+		Args:  cobra.NoArgs,
+		RunE:  func(_ *cobra.Command, _ []string) error { return runModels(cfg) },
+	}
+	addServerFlags(cmd, cfg)
+	return cmd
+}
+
+func newVersionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print version",
+		Args:  cobra.NoArgs,
+		Run:   func(_ *cobra.Command, _ []string) { fmt.Print(versionString()) },
+	}
 }
 
 // configureProxy resolves the outbound proxy in place, with precedence:
@@ -127,11 +169,11 @@ func newServeFlags() (*flag.FlagSet, *Config) {
 //	--proxy flag  >  http(s)_proxy env  >  built-in default (defaultProxyURL)
 //
 // The special values none/off/direct disable proxying (direct connection).
-func configureProxy(cfg *Config) {
+func configureProxy(cfg *Config) error {
 	switch strings.ToLower(strings.TrimSpace(cfg.ProxyURL)) {
 	case "none", "off", "direct", "false", "no":
 		cfg.ProxyURL = "" // explicit direct connection
-		return
+		return nil
 	}
 	if strings.TrimSpace(cfg.ProxyURL) == "" {
 		if env := firstNonEmptyEnv("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"); env != "" {
@@ -141,12 +183,14 @@ func configureProxy(cfg *Config) {
 		}
 	}
 	if _, err := url.Parse(cfg.ProxyURL); err != nil {
-		fatalf("invalid --proxy %q: %v", cfg.ProxyURL, err)
+		return fmt.Errorf("invalid --proxy %q: %w", cfg.ProxyURL, err)
 	}
+	return nil
 }
 
-// setupRequestLog resolves the --log / --log-file flags into a request logger.
-// Logging is OFF unless --log is set or --log-file names a destination:
+// setupRequestLog resolves the --log / --log-file flags into a structured
+// (slog) request logger. Logging is OFF unless --log is set or --log-file names
+// a destination:
 //
 //	--log=false, --log-file=""  -> disabled (nil logger, no access log)
 //	--log,       --log-file=""  -> stdout (the window)
@@ -157,7 +201,10 @@ func configureProxy(cfg *Config) {
 //
 // It returns the logger (nil when disabled), an optional closer for an opened
 // file, a short note for the startup banner, and any file-open error.
-func setupRequestLog(enable bool, file string) (*log.Logger, func(), string, error) {
+func setupRequestLog(enable bool, file string) (*slog.Logger, func(), string, error) {
+	newLogger := func(w io.Writer) *slog.Logger {
+		return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	}
 	switch strings.ToLower(strings.TrimSpace(file)) {
 	case "none", "off", "false", "no", "disabled":
 		return nil, nil, "disabled", nil
@@ -165,38 +212,37 @@ func setupRequestLog(enable bool, file string) (*log.Logger, func(), string, err
 		if !enable {
 			return nil, nil, "disabled", nil
 		}
-		return log.New(os.Stdout, "", log.LstdFlags), nil, "stdout (window)", nil
+		return newLogger(os.Stdout), nil, "stdout (window)", nil
 	case "stdout", "-":
-		return log.New(os.Stdout, "", log.LstdFlags), nil, "stdout (window)", nil
+		return newLogger(os.Stdout), nil, "stdout (window)", nil
 	case "stderr":
-		return log.New(os.Stderr, "", log.LstdFlags), nil, "stderr", nil
+		return newLogger(os.Stderr), nil, "stderr", nil
 	default:
 		f, err := os.OpenFile(file, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
 			return nil, nil, "", err
 		}
-		return log.New(f, "", log.LstdFlags), func() { _ = f.Close() }, file, nil
+		return newLogger(f), func() { _ = f.Close() }, file, nil
 	}
 }
 
-func runServe(args []string) {
-	fs, cfg := newServeFlags()
-	_ = fs.Parse(args)
-
-	configureProxy(cfg)
+func runServe(cfg *Config) error {
+	if err := configureProxy(cfg); err != nil {
+		return err
+	}
 
 	client := newHTTPClient(cfg.ProxyURL)
 
 	store, err := NewTokenStore(cfg, client)
 	if err != nil {
-		fatalf("auth init failed: %v", err)
+		return fmt.Errorf("auth init failed: %w", err)
 	}
 
 	srv := NewServer(cfg, store, client)
 
 	logger, closeLog, logNote, err := setupRequestLog(cfg.Log, cfg.LogFile)
 	if err != nil {
-		fatalf("could not open --log-file %q: %v", cfg.LogFile, err)
+		return fmt.Errorf("could not open --log-file %q: %w", cfg.LogFile, err)
 	}
 	if closeLog != nil {
 		defer closeLog()
@@ -214,6 +260,7 @@ func runServe(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	serveErr := make(chan error, 1)
 	go func() {
 		proxyNote := "direct (no proxy)"
 		if cfg.ProxyURL != "" {
@@ -234,29 +281,31 @@ func runServe(args []string) {
 		fmt.Printf("  log       : %s\n", logNote)
 		fmt.Println("  ready. press Ctrl+C to stop.")
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			fatalf("server error: %v", err)
+			serveErr <- fmt.Errorf("server error: %w", err)
 		}
 	}()
 
-	<-ctx.Done()
+	select {
+	case err := <-serveErr:
+		return err
+	case <-ctx.Done():
+	}
 	fmt.Println("\nshutting down...")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpServer.Shutdown(shutdownCtx)
+	return nil
 }
 
-func runStatus(args []string) {
-	fs, cfg := newServeFlags()
-	fs.SetOutput(os.Stderr)
-	// status shares the same flags; only a subset matters.
-	_ = fs.Parse(args)
-
-	configureProxy(cfg)
+func runStatus(cfg *Config) error {
+	if err := configureProxy(cfg); err != nil {
+		return err
+	}
 	client := newHTTPClient(cfg.ProxyURL)
 
 	store, err := NewTokenStore(cfg, client)
 	if err != nil {
-		fatalf("auth init failed: %v", err)
+		return fmt.Errorf("auth init failed: %w", err)
 	}
 
 	tok := store.snapshot()
@@ -292,29 +341,28 @@ func runStatus(args []string) {
 	} else {
 		fmt.Printf("profileArn : %s\n", orNone(arn))
 	}
+	return nil
 }
 
-func runModels(args []string) {
-	fs, cfg := newServeFlags()
-	fs.SetOutput(os.Stderr)
-	_ = fs.Parse(args)
-
-	configureProxy(cfg)
+func runModels(cfg *Config) error {
+	if err := configureProxy(cfg); err != nil {
+		return err
+	}
 	client := newHTTPClient(cfg.ProxyURL)
 
 	store, err := NewTokenStore(cfg, client)
 	if err != nil {
-		fatalf("auth init failed: %v", err)
+		return fmt.Errorf("auth init failed: %w", err)
 	}
 
 	kc := NewKiroClient(cfg, store, client)
 	models, err := kc.ListModels(context.Background())
 	if err != nil {
-		fatalf("list models failed: %v", err)
+		return fmt.Errorf("list models failed: %w", err)
 	}
 	if len(models) == 0 {
 		fmt.Println("(no models returned)")
-		return
+		return nil
 	}
 	fmt.Printf("%d models available to this account:\n", len(models))
 	for _, m := range models {
@@ -341,6 +389,7 @@ func runModels(args []string) {
 	}
 	fmt.Println("\nUse any of these IDs as the Anthropic \"model\", or aliases like")
 	fmt.Println("\"claude-opus-...\"/\"...sonnet...\" (mapped automatically), or \"auto\".")
+	return nil
 }
 
 // firstNonEmptyEnv returns the first non-empty environment variable value.
@@ -386,9 +435,4 @@ func masked(s string) string {
 		return "****"
 	}
 	return s[:6] + "..." + s[len(s)-4:]
-}
-
-func fatalf(format string, a ...any) {
-	fmt.Fprintf(os.Stderr, "error: "+format+"\n", a...)
-	os.Exit(1)
 }

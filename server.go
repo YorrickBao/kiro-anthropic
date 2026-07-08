@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
 )
 
 // Server wires the Anthropic-facing HTTP API to the Kiro backend.
@@ -17,7 +21,7 @@ type Server struct {
 	cfg    *Config
 	store  *TokenStore
 	kiro   *KiroClient
-	logger *log.Logger // per-request access log; nil disables it
+	logger *slog.Logger // per-request access log; nil disables it
 
 	modelsMu    sync.Mutex
 	modelsCache []kiroModelInfo
@@ -38,11 +42,17 @@ func NewServer(cfg *Config, store *TokenStore, client *http.Client) *Server {
 }
 
 func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/v1/models", s.handleModels)
-	mux.HandleFunc("/v1/messages", s.handleMessages)
-	return s.logRequests(mux)
+	r := chi.NewRouter()
+	if s.logger != nil {
+		r.Use(s.accessLog)
+	}
+	// Handle (not Get/Post) preserves the previous ServeMux behaviour of
+	// accepting any method; handleMessages does its own method check so it can
+	// return an Anthropic-shaped 405.
+	r.Handle("/health", http.HandlerFunc(s.handleHealth))
+	r.Handle("/v1/models", http.HandlerFunc(s.handleModels))
+	r.Handle("/v1/messages", http.HandlerFunc(s.handleMessages))
+	return r
 }
 
 // ---- request logging ----
@@ -54,6 +64,7 @@ type ctxKeyAccess struct{}
 type accessInfo struct {
 	model  string
 	stream bool
+	errMsg string // failure cause, recorded when the request errors
 }
 
 func accessFrom(ctx context.Context) *accessInfo {
@@ -61,64 +72,60 @@ func accessFrom(ctx context.Context) *accessInfo {
 	return a
 }
 
-// statusWriter records the response status and byte count while preserving the
-// http.Flusher behaviour that streaming (SSE) responses depend on.
-type statusWriter struct {
-	http.ResponseWriter
-	status  int
-	bytes   int
-	written bool
-}
-
-func (w *statusWriter) WriteHeader(code int) {
-	if !w.written {
-		w.status = code
-		w.written = true
-	}
-	w.ResponseWriter.WriteHeader(code)
-}
-
-func (w *statusWriter) Write(b []byte) (int, error) {
-	if !w.written {
-		w.status = http.StatusOK
-		w.written = true
-	}
-	n, err := w.ResponseWriter.Write(b)
-	w.bytes += n
-	return n, err
-}
-
-func (w *statusWriter) Flush() {
-	if f, ok := w.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
+// noteError records a failure cause on the request's accessInfo so the access
+// log can surface it and raise the level. No-op when logging is disabled (no
+// accessInfo in context).
+func noteError(ctx context.Context, msg string) {
+	if a := accessFrom(ctx); a != nil {
+		a.errMsg = msg
 	}
 }
 
-// logRequests wraps h with a one-line-per-request access log. When request
-// logging is disabled (s.logger == nil) it returns h unchanged.
-func (s *Server) logRequests(h http.Handler) http.Handler {
-	if s.logger == nil {
-		return h
-	}
+// accessLog is a chi middleware that emits one structured (slog) access-log
+// line per request. chi's WrapResponseWriter captures the status and byte count
+// while preserving the http.Flusher behaviour that streaming (SSE) depends on.
+func (s *Server) accessLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		info := &accessInfo{}
 		r = r.WithContext(context.WithValue(r.Context(), ctxKeyAccess{}, info))
-		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 
-		h.ServeHTTP(sw, r)
+		next.ServeHTTP(ww, r)
 
-		detail := ""
+		status := ww.Status()
+		if status == 0 {
+			status = http.StatusOK // body written without an explicit WriteHeader
+		}
+		attrs := []any{
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.Int("status", status),
+			slog.Duration("duration", time.Since(start).Round(time.Millisecond)),
+			slog.Int("bytes", ww.BytesWritten()),
+		}
 		if info.model != "" {
+			attrs = append(attrs, slog.String("model", info.model))
 			mode := "sync"
 			if info.stream {
 				mode = "stream"
 			}
-			detail = fmt.Sprintf(" model=%s %s", info.model, mode)
+			attrs = append(attrs, slog.String("mode", mode))
 		}
-		s.logger.Printf("%s %s %d %s %dB%s",
-			r.Method, r.URL.Path, sw.status,
-			time.Since(start).Round(time.Millisecond), sw.bytes, detail)
+
+		// Level tracks the outcome: 5xx -> Error, 4xx (or a recorded failure
+		// cause, e.g. a mid-stream error after the 200 header) -> Warn, else Info.
+		level := slog.LevelInfo
+		switch {
+		case status >= 500:
+			level = slog.LevelError
+		case status >= 400 || info.errMsg != "":
+			level = slog.LevelWarn
+		}
+		if info.errMsg != "" {
+			attrs = append(attrs, slog.String("error", info.errMsg))
+		}
+		s.logger.Log(r.Context(), level, "request", attrs...)
 	})
 }
 
@@ -132,7 +139,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if !s.authorized(r) {
-		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "invalid api key")
+		writeAnthropicError(w, r, http.StatusUnauthorized, "authentication_error", "invalid api key")
 		return
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -300,23 +307,23 @@ func (s *Server) applyModelRequestFields(ctx context.Context, kreq *kiroRequest,
 
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
+		writeAnthropicError(w, r, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 		return
 	}
 	if !s.authorized(r) {
-		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "invalid api key")
+		writeAnthropicError(w, r, http.StatusUnauthorized, "authentication_error", "invalid api key")
 		return
 	}
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, 32*1024*1024))
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "failed to read request body")
+		writeAnthropicError(w, r, http.StatusBadRequest, "invalid_request_error", "failed to read request body")
 		return
 	}
 
 	var areq anthropicRequest
 	if err := json.Unmarshal(body, &areq); err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON: "+err.Error())
+		writeAnthropicError(w, r, http.StatusBadRequest, "invalid_request_error", "invalid JSON: "+err.Error())
 		return
 	}
 
@@ -327,14 +334,14 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	kreq, err := buildKiroRequest(s.cfg, &areq)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		writeAnthropicError(w, r, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 
 	// Resolve the profileArn required by the runtime.
 	arn, err := s.store.ProfileArn(r.Context())
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "api_error", "could not resolve profileArn: "+err.Error())
+		writeAnthropicError(w, r, http.StatusBadGateway, "api_error", "could not resolve profileArn: "+err.Error())
 		return
 	}
 	kreq.ProfileArn = arn
@@ -345,7 +352,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	stream, err := s.sendWithReasoningRetry(r.Context(), kreq)
 	if err != nil {
 		status, errType := mapUpstreamError(err)
-		writeAnthropicError(w, status, errType, err.Error())
+		writeAnthropicError(w, r, status, errType, err.Error())
 		return
 	}
 	defer stream.Close()
@@ -421,7 +428,7 @@ func (s *Server) aggregateMessages(w http.ResponseWriter, r *http.Request, areq 
 			break
 		}
 		if err != nil {
-			writeAnthropicError(w, http.StatusBadGateway, "api_error", "stream read error: "+err.Error())
+			writeAnthropicError(w, r, http.StatusBadGateway, "api_error", "stream read error: "+err.Error())
 			return
 		}
 		switch ev.Kind {
@@ -434,7 +441,7 @@ func (s *Server) aggregateMessages(w http.ResponseWriter, r *http.Request, areq 
 		case evMetadata:
 			asm.setStopReason(ev.StopReason)
 		case evError:
-			writeAnthropicError(w, http.StatusBadGateway, "api_error", upstreamEventError(ev))
+			writeAnthropicError(w, r, http.StatusBadGateway, "api_error", upstreamEventError(ev))
 			return
 		}
 	}
@@ -446,7 +453,7 @@ func (s *Server) aggregateMessages(w http.ResponseWriter, r *http.Request, areq 
 	}
 
 	resp := anthropicResponse{
-		ID:         "msg_" + strings.ReplaceAll(newUUID(), "-", ""),
+		ID:         "msg_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
 		Type:       "message",
 		Role:       "assistant",
 		Model:      mapModel(areq.Model),
@@ -464,7 +471,7 @@ func (s *Server) aggregateMessages(w http.ResponseWriter, r *http.Request, areq 
 func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, areq *anthropicRequest, stream *kiroStream, inputChars int) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeAnthropicError(w, http.StatusInternalServerError, "api_error", "streaming unsupported by server")
+		writeAnthropicError(w, r, http.StatusInternalServerError, "api_error", "streaming unsupported by server")
 		return
 	}
 
@@ -487,7 +494,7 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, areq *an
 		return nil
 	}
 
-	msgID := "msg_" + strings.ReplaceAll(newUUID(), "-", "")
+	msgID := "msg_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 
 	// message_start
 	if err := emit("message_start", map[string]any{
@@ -519,6 +526,7 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, areq *an
 			break
 		}
 		if err != nil {
+			noteError(r.Context(), "stream read error: "+err.Error())
 			_ = emit("error", map[string]any{
 				"type":  "error",
 				"error": map[string]any{"type": "api_error", "message": "stream read error: " + err.Error()},
@@ -541,6 +549,7 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, areq *an
 		case evMetadata:
 			asm.setStopReason(ev.StopReason)
 		case evError:
+			noteError(r.Context(), upstreamEventError(ev))
 			_ = emit("error", map[string]any{
 				"type":  "error",
 				"error": map[string]any{"type": "api_error", "message": upstreamEventError(ev)},
@@ -617,7 +626,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func writeAnthropicError(w http.ResponseWriter, status int, errType, message string) {
+func writeAnthropicError(w http.ResponseWriter, r *http.Request, status int, errType, message string) {
+	noteError(r.Context(), message)
 	writeJSON(w, status, map[string]any{
 		"type":  "error",
 		"error": map[string]any{"type": errType, "message": message},

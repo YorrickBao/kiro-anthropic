@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 // ---------------------------------------------------------------------------
@@ -303,7 +305,7 @@ func buildKiroRequest(cfg *Config, areq *anthropicRequest) (*kiroRequest, error)
 	return &kiroRequest{
 		ConversationState: kiroConversationState{
 			ChatTriggerType: "MANUAL",
-			ConversationID:  newUUID(),
+			ConversationID:  uuid.NewString(),
 			CurrentMessage:  current,
 			History:         history,
 		},

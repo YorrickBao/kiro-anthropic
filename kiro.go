@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -517,6 +519,203 @@ func (m kiroModelInfo) effort() (effortConfig, bool) {
 		}
 	}
 	return effortConfig{}, false
+}
+
+// ---------------------------------------------------------------------------
+// Account usage / limits (GetUsageLimits).
+//
+// GetUsageLimits is a KiroControlPlaneBearerClient operation with the HTTP
+// binding GET /getUsageLimits, served from the same management.<region>.kiro.dev
+// host we already use for ListAvailableModels / ListAvailableProfiles. Kiro's
+// own IDE queries it here (the AWS-native q.<region>.amazonaws.com endpoint is
+// an equivalent alternative we do not need).
+// ---------------------------------------------------------------------------
+
+// kiroUsage is a parsed, page-friendly view of a GetUsageLimits response. Raw
+// preserves the full upstream JSON so the admin page can surface every field.
+type kiroUsage struct {
+	SubscriptionTitle string           `json:"subscription_title,omitempty"`
+	SubscriptionType  string           `json:"subscription_type,omitempty"`
+	Email             string           `json:"email,omitempty"`
+	UserID            string           `json:"user_id,omitempty"`
+	NextDateReset     float64          `json:"next_date_reset,omitempty"` // Unix seconds
+	ResetAt           string           `json:"reset_at,omitempty"`        // RFC3339 (from NextDateReset)
+	OverageStatus     string           `json:"overage_status,omitempty"`
+	Credit            *kiroCreditUsage `json:"credit,omitempty"`
+	Raw               json.RawMessage  `json:"raw,omitempty"`
+}
+
+// kiroCreditUsage is the CREDIT line of usageBreakdownList, with free-trial
+// allowances merged in (matching how Kiro presents the combined balance).
+type kiroCreditUsage struct {
+	DisplayName     string  `json:"display_name,omitempty"`
+	Unit            string  `json:"unit,omitempty"`
+	Currency        string  `json:"currency,omitempty"`
+	Used            float64 `json:"used"`
+	Limit           float64 `json:"limit"`
+	Remaining       float64 `json:"remaining"`
+	OverageCap      float64 `json:"overage_cap,omitempty"`
+	OverageRate     float64 `json:"overage_rate,omitempty"`
+	FreeTrialActive bool    `json:"free_trial_active,omitempty"`
+	FreeTrialUsed   float64 `json:"free_trial_used,omitempty"`
+	FreeTrialLimit  float64 `json:"free_trial_limit,omitempty"`
+}
+
+// usageLimitsWire mirrors the fields of a GetUsageLimits response we care about.
+type usageLimitsWire struct {
+	NextDateReset    float64 `json:"nextDateReset"`
+	SubscriptionInfo struct {
+		SubscriptionTitle string `json:"subscriptionTitle"`
+		Type              string `json:"type"`
+	} `json:"subscriptionInfo"`
+	OverageConfiguration struct {
+		OverageStatus string `json:"overageStatus"`
+	} `json:"overageConfiguration"`
+	UserInfo struct {
+		Email  string `json:"email"`
+		UserID string `json:"userId"`
+	} `json:"userInfo"`
+	UsageBreakdownList []struct {
+		ResourceType              string  `json:"resourceType"`
+		DisplayName               string  `json:"displayName"`
+		Unit                      string  `json:"unit"`
+		Currency                  string  `json:"currency"`
+		CurrentUsage              float64 `json:"currentUsage"`
+		CurrentUsageWithPrecision float64 `json:"currentUsageWithPrecision"`
+		UsageLimit                float64 `json:"usageLimit"`
+		UsageLimitWithPrecision   float64 `json:"usageLimitWithPrecision"`
+		OverageCap                float64 `json:"overageCap"`
+		OverageCapWithPrecision   float64 `json:"overageCapWithPrecision"`
+		OverageRate               float64 `json:"overageRate"`
+		FreeTrialInfo             *struct {
+			FreeTrialStatus           string  `json:"freeTrialStatus"`
+			CurrentUsage              float64 `json:"currentUsage"`
+			CurrentUsageWithPrecision float64 `json:"currentUsageWithPrecision"`
+			UsageLimit                float64 `json:"usageLimit"`
+			UsageLimitWithPrecision   float64 `json:"usageLimitWithPrecision"`
+		} `json:"freeTrialInfo"`
+	} `json:"usageBreakdownList"`
+}
+
+// pick returns the precise value when present, else the integer fallback.
+func pick(precise, fallback float64) float64 {
+	if precise != 0 {
+		return precise
+	}
+	return fallback
+}
+
+// parseKiroUsage turns a raw GetUsageLimits body into a kiroUsage. The CREDIT
+// breakdown line drives the balance; an ACTIVE free trial is merged into the
+// totals. Raw is retained verbatim for full display.
+func parseKiroUsage(raw []byte) (*kiroUsage, error) {
+	var w usageLimitsWire
+	if err := json.Unmarshal(raw, &w); err != nil {
+		return nil, fmt.Errorf("decode usage: %w", err)
+	}
+
+	u := &kiroUsage{
+		SubscriptionTitle: w.SubscriptionInfo.SubscriptionTitle,
+		SubscriptionType:  w.SubscriptionInfo.Type,
+		Email:             w.UserInfo.Email,
+		UserID:            w.UserInfo.UserID,
+		NextDateReset:     w.NextDateReset,
+		OverageStatus:     w.OverageConfiguration.OverageStatus,
+		Raw:               json.RawMessage(raw),
+	}
+	if w.NextDateReset > 0 {
+		u.ResetAt = time.Unix(int64(w.NextDateReset), 0).UTC().Format(time.RFC3339)
+	}
+
+	for _, b := range w.UsageBreakdownList {
+		if b.ResourceType != "CREDIT" && b.DisplayName != "Credit" && b.DisplayName != "Credits" {
+			continue
+		}
+		c := &kiroCreditUsage{
+			DisplayName: b.DisplayName,
+			Unit:        b.Unit,
+			Currency:    b.Currency,
+			Used:        pick(b.CurrentUsageWithPrecision, b.CurrentUsage),
+			Limit:       pick(b.UsageLimitWithPrecision, b.UsageLimit),
+			OverageCap:  pick(b.OverageCapWithPrecision, b.OverageCap),
+			OverageRate: b.OverageRate,
+		}
+		if ft := b.FreeTrialInfo; ft != nil && ft.FreeTrialStatus == "ACTIVE" {
+			c.FreeTrialActive = true
+			c.FreeTrialUsed = pick(ft.CurrentUsageWithPrecision, ft.CurrentUsage)
+			c.FreeTrialLimit = pick(ft.UsageLimitWithPrecision, ft.UsageLimit)
+			c.Used += c.FreeTrialUsed
+			c.Limit += c.FreeTrialLimit
+		}
+		c.Remaining = c.Limit - c.Used
+		if c.Remaining < 0 {
+			c.Remaining = 0
+		}
+		u.Credit = c
+		break
+	}
+	return u, nil
+}
+
+// GetUsage fetches the account's usage/limits from the control plane. On a
+// 401/403 the token is force-refreshed and the request retried once.
+func (c *KiroClient) GetUsage(ctx context.Context) (*kiroUsage, error) {
+	raw, status, err := c.getUsageOnce(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		if rerr := c.store.ForceRefresh(ctx); rerr == nil {
+			raw, status, err = c.getUsageOnce(ctx)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if status < 200 || status >= 300 {
+		return nil, &kiroHTTPError{Status: status, Body: string(raw)}
+	}
+	return parseKiroUsage(raw)
+}
+
+// getUsageOnce performs a single GET /getUsageLimits attempt, returning the body
+// and HTTP status.
+func (c *KiroClient) getUsageOnce(ctx context.Context) ([]byte, int, error) {
+	token, err := c.store.AccessToken(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	arn, _ := c.store.ProfileArn(ctx) // best effort; some tiers don't need it
+
+	endpoint := fmt.Sprintf("https://management.%s.kiro.dev/getUsageLimits", c.store.region())
+	q := url.Values{
+		"origin":          {"AI_EDITOR"},
+		"resourceType":    {"AGENTIC_REQUEST"},
+		"isEmailRequired": {"true"},
+	}
+	if arn != "" {
+		q.Set("profileArn", arn)
+	}
+	reqURL := endpoint + "?" + q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", "kiro-anthropic/"+version)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, resp.StatusCode, err
+	}
+	return body, resp.StatusCode, nil
 }
 
 // ListModels queries the Kiro control plane for the model IDs available to this

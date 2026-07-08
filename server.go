@@ -25,7 +25,15 @@ type Server struct {
 
 	modelsMu    sync.Mutex
 	modelsCache []kiroModelInfo
+
+	usageMu      sync.Mutex
+	usageCache   *kiroUsage
+	usageFetched time.Time
 }
+
+// usageCacheTTL is how long a GetUsageLimits result is reused before refetching,
+// so the auto-refreshing admin page does not hammer the control plane.
+const usageCacheTTL = 60 * time.Second
 
 // fallbackModels is used for /v1/models if the live ListAvailableModels call fails.
 var fallbackModels = []string{
@@ -217,6 +225,29 @@ func (s *Server) ensureModels(ctx context.Context) []kiroModelInfo {
 	s.modelsCache = models
 	s.modelsMu.Unlock()
 	return models
+}
+
+// ensureUsage returns the account usage, fetching it at most once per
+// usageCacheTTL. A failed fetch is not cached (it retries next call) and is
+// surfaced to the caller.
+func (s *Server) ensureUsage(ctx context.Context) (*kiroUsage, error) {
+	s.usageMu.Lock()
+	if s.usageCache != nil && time.Since(s.usageFetched) < usageCacheTTL {
+		u := s.usageCache
+		s.usageMu.Unlock()
+		return u, nil
+	}
+	s.usageMu.Unlock()
+
+	u, err := s.kiro.GetUsage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.usageMu.Lock()
+	s.usageCache = u
+	s.usageFetched = time.Now()
+	s.usageMu.Unlock()
+	return u, nil
 }
 
 // availableModelIDs returns the account's model IDs (static fallback on error).

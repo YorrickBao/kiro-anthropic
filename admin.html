@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>kiro-anthropic · admin</title>
+<style>
+  :root {
+    --bg: #0f1115; --card: #171a21; --line: #262b36; --fg: #e6e9ef;
+    --muted: #8b93a7; --accent: #6ea8fe; --ok: #4ade80; --warn: #fbbf24; --err: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    padding: 18px 24px; border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .ver { color: var(--muted); font-size: 12px; }
+  header .spacer { flex: 1; }
+  header .updated { color: var(--muted); font-size: 12px; }
+  .wrap { padding: 20px 24px; max-width: 1100px; margin: 0 auto; display: grid; gap: 18px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 14px; }
+  .kv { display: grid; grid-template-columns: 180px 1fr; gap: 6px 14px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; word-break: break-all; }
+  .pill { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); }
+  .pill.ok { color: var(--ok); border-color: #234; } .pill.warn { color: var(--warn); } .pill.err { color: var(--err); }
+  .bar { height: 10px; border-radius: 6px; background: #222836; overflow: hidden; margin-top: 6px; }
+  .bar > span { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), #a78bfa); }
+  .big { font-size: 22px; font-weight: 600; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; }
+  .stat { background: #12151c; border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  .stat .lbl { color: var(--muted); font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  details { margin-top: 12px; } summary { cursor: pointer; color: var(--muted); }
+  pre { background: #0b0d11; border: 1px solid var(--line); border-radius: 8px; padding: 12px; overflow: auto; font-size: 12px; }
+  .err-box { color: var(--err); }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>kiro-anthropic</h1>
+  <span class="ver" id="ver"></span>
+  <span class="spacer"></span>
+  <span class="updated" id="updated">加载中…</span>
+</header>
+<div class="wrap">
+  <section class="card" id="account-card"><h2>账号信息</h2><dl class="kv" id="account"></dl></section>
+  <section class="card" id="usage-card"><h2>额度信息</h2><div id="usage"></div></section>
+  <section class="card" id="models-card"><h2>模型信息</h2><div id="models"></div></section>
+</div>
+<script>
+const REFRESH_MS = 10000;
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function row(k, v) { return `<dt>${esc(k)}</dt><dd>${v}</dd>`; }
+function fmtNum(n) { return (n == null) ? "—" : Number(n).toLocaleString(undefined, {maximumFractionDigits: 2}); }
+function fmtDate(s) { if (!s) return "—"; const d = new Date(s); return isNaN(d) ? esc(s) : d.toLocaleString(); }
+
+function expiryPill(state, secs) {
+  const cls = state === "valid" ? "ok" : (state === "expiring soon" ? "warn" : (state === "unknown" ? "" : "err"));
+  let txt = state;
+  if (typeof secs === "number") {
+    const s = Math.max(0, secs), h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
+    txt += ` · ${h>0? h+"h ":""}${m}m`;
+  }
+  return `<span class="pill ${cls}">${esc(txt)}</span>`;
+}
+
+function renderAccount(a) {
+  const el = $("account");
+  if (!a) { el.innerHTML = ""; return; }
+  const rows = [];
+  rows.push(row("邮箱", esc(a.email || "—")));
+  rows.push(row("Provider", esc(a.provider || "—")));
+  rows.push(row("Auth Method", esc(a.auth_method || "—")));
+  rows.push(row("Region", esc(a.region || "—")));
+  rows.push(row("过期状态", expiryPill(a.expiry_state, a.expires_in_seconds)));
+  rows.push(row("过期时间", esc(a.expires_at || "—")));
+  rows.push(row("profileArn", a.profile_arn_error ? `<span class="err-box">解析失败: ${esc(a.profile_arn_error)}</span>` : esc(a.profile_arn || "—")));
+  rows.push(row("Access Token", `<code>${esc(a.access_token_masked || "—")}</code>`));
+  rows.push(row("Token 文件", esc(a.token_file || "—")));
+  rows.push(row("出站代理", esc(a.outbound_proxy || "—")));
+  rows.push(row("本地鉴权", a.api_key_required ? '<span class="pill warn">需要 api-key</span>' : '<span class="pill">开放</span>'));
+  el.innerHTML = rows.join("");
+}
+
+function renderUsage(u) {
+  const el = $("usage");
+  if (!u) { el.innerHTML = '<span class="muted">—</span>'; return; }
+  if (u.error) { el.innerHTML = `<div class="err-box">获取额度失败: ${esc(u.error)}</div>`; return; }
+
+  let html = "";
+  const sub = u.subscription_title || u.subscription_type;
+  if (sub) html += `<div style="margin-bottom:14px"><span class="pill ok">${esc(u.subscription_title || "")}</span> <span class="muted">${esc(u.subscription_type || "")}</span></div>`;
+
+  const c = u.credit;
+  if (c) {
+    const pct = c.limit > 0 ? Math.min(100, (c.used / c.limit) * 100) : 0;
+    html += `<div class="grid2" style="margin-bottom:12px">
+      <div class="stat"><div class="lbl">剩余额度</div><div class="big">${fmtNum(c.remaining)}</div><div class="muted">${esc(c.unit||"")} ${esc(c.currency||"")}</div></div>
+      <div class="stat"><div class="lbl">已用 / 总额度</div><div class="big">${fmtNum(c.used)} <span class="muted">/ ${fmtNum(c.limit)}</span></div>
+        <div class="bar"><span style="width:${pct.toFixed(1)}%"></span></div></div>
+      <div class="stat"><div class="lbl">重置日期</div><div class="big" style="font-size:16px">${fmtDate(u.reset_at)}</div></div>
+    </div>`;
+    const extra = [];
+    if (c.free_trial_active) extra.push(row("试用额度", `${fmtNum(c.free_trial_used)} / ${fmtNum(c.free_trial_limit)} <span class="pill ok">ACTIVE</span>`));
+    if (c.overage_cap) extra.push(row("超额封顶", `${fmtNum(c.overage_cap)} ${esc(c.unit||"")}`));
+    if (c.overage_rate) extra.push(row("超额单价", `${fmtNum(c.overage_rate)} ${esc(c.currency||"")}`));
+    if (u.overage_status) extra.push(row("超额状态", esc(u.overage_status)));
+    if (extra.length) html += `<dl class="kv">${extra.join("")}</dl>`;
+  }
+
+  if (u.raw) {
+    html += `<details><summary>完整原始数据 (getUsageLimits)</summary><pre>${esc(JSON.stringify(u.raw, null, 2))}</pre></details>`;
+  }
+  el.innerHTML = html;
+}
+
+function renderModels(models) {
+  const el = $("models");
+  if (!models || !models.length) { el.innerHTML = '<span class="muted">—</span>'; return; }
+  const rows = models.map(m => {
+    const eff = m.capabilities && m.capabilities.effort;
+    let effTxt = "—";
+    if (eff && eff.supported) {
+      effTxt = ["low","medium","high","xhigh","max"].filter(l => eff[l]).join(" / ") || "yes";
+    }
+    return `<tr>
+      <td><code>${esc(m.id)}</code></td>
+      <td>${esc(m.display_name || "")}</td>
+      <td class="num">${m.max_input_tokens ? fmtNum(m.max_input_tokens) : "—"}</td>
+      <td class="num">${m.max_tokens ? fmtNum(m.max_tokens) : "—"}</td>
+      <td>${esc(effTxt)}</td>
+    </tr>`;
+  }).join("");
+  el.innerHTML = `<table><thead><tr><th>模型 ID</th><th>名称</th><th class="num">最大输入</th><th class="num">最大输出</th><th>Effort</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+async function tick() {
+  try {
+    const res = await fetch("/api/status.json", { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const d = await res.json();
+    $("ver").textContent = d.version ? "v" + d.version : "";
+    renderAccount(d.account);
+    renderUsage(d.usage);
+    renderModels(d.models);
+    $("updated").textContent = "更新于 " + new Date().toLocaleTimeString();
+  } catch (e) {
+    $("updated").innerHTML = `<span class="err-box">刷新失败: ${esc(e.message)}</span>`;
+  }
+}
+
+tick();
+setInterval(tick, REFRESH_MS);
+</script>
+</body>
+</html>

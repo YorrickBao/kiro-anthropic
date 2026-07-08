@@ -116,7 +116,8 @@ curl --noproxy '*' http://127.0.0.1:17890/v1/messages \
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `--host` | `127.0.0.1` | 监听地址 |
-| `--port` | `17890` | 监听端口 |
+| `--port` | `17890` | 监听端口（被占用时自动 +1 重试） |
+| `--admin-port` | `27890` | 管理页端口，**仅限本机访问**（被占用时自动 +1 重试） |
 | `--proxy` | `http://127.0.0.1:7890` | 出站代理；优先级：本参数 > `http(s)_proxy` 环境变量 > 内置默认；`none` 表示直连 |
 | `--token-file` | `~/.aws/sso/cache/kiro-auth-token.json` | Kiro 令牌文件路径 |
 | `--profile-arn` | 自动解析 | 显式指定 CodeWhisperer profileArn |
@@ -127,6 +128,28 @@ curl --noproxy '*' http://127.0.0.1:17890/v1/messages \
 | `--log-file` | 空 | 把访问日志写到指定文件（隐含 `--log`）；特殊值 `stdout`/`stderr`/`none` |
 
 访问日志为结构化单行（Go `slog`），字段含 `method` / `path` / `status` / `duration` / `bytes`（`/v1/messages` 另加 `model` / `mode`）。级别按结果分：`5xx → ERROR`、`4xx 或请求中途出错 → WARN`、其余 `INFO`；出错时附带 `error=<原因>`。
+
+### 管理页（`--admin-port`）
+
+`serve` 会在 API 端口之外，额外起一个**只监听 `127.0.0.1`** 的管理端口（默认 `27890`），提供一个只读的账号状态页面：
+
+```
+http://127.0.0.1:27890/            # 管理页（HTML，每 10s 自动刷新）
+http://127.0.0.1:27890/api/status.json   # 页面数据源（账号 / 额度 / 模型）
+http://127.0.0.1:27890/health      # 健康检查
+```
+
+页面展示三块：
+
+- **账号**：provider、authMethod、区域、profileArn、令牌过期倒计时、账号邮箱、打码后的 access token、出站代理、是否需要 api-key。
+- **额度**：账号订阅级别、剩余 / 已用 / 总额度（credits，带进度条）、重置日期、试用额度（若在生效期）、超额封顶 / 单价 / 状态，以及完整原始 `getUsageLimits` 数据。额度来自与模型列表同源的控制面 `management.<region>.kiro.dev/getUsageLimits`，服务端缓存 60s。
+- **模型**：账号可用模型的 ID、名称、最大输入 / 输出 tokens、effort 档位（与 `/v1/models` 同源）。
+
+安全说明：
+
+- 管理端口**强制绑定 `127.0.0.1`**，且每个请求都经两道校验——按真实 TCP 对端 IP 限定回环（不信任 `X-Forwarded-For`），并校验 `Host` 头必须是 `localhost` / 回环地址（防 DNS 重绑定与跨站请求）。
+- access token 只以打码形式展示，不渲染完整值。
+- **端口自增**：`--port` 与 `--admin-port` 若被占用，会自动 +1 逐个重试直到找到空闲端口（上限 65535）。启动横幅会打印两个端口的**实际**监听地址——若发生自增，请以横幅为准。
 
 ### 环境变量
 
@@ -164,6 +187,8 @@ curl --noproxy '*' http://127.0.0.1:17890/v1/messages \
 ---
 
 ## API 端点
+
+以下端点在 **API 端口**（`--port`，默认 17890）上。管理页端点（账号/额度/模型）在独立的**管理端口**上，见上文「管理页」一节。
 
 ### `POST /v1/messages`
 Anthropic Messages API。支持 `stream: true`（SSE：`message_start` / `content_block_start` / `content_block_delta` / `content_block_stop` / `message_delta` / `message_stop`；`content_block_delta` 涵盖 `text_delta` / `thinking_delta` / `signature_delta` / `input_json_delta`）与非流式聚合响应。支持 `system`、`messages`、`tools`、`tool_result`、`image`、`thinking`、`output_config.effort` / `reasoning_effort`，以及历史消息中的 `thinking` / `redacted_thinking` 块回传。
@@ -262,9 +287,12 @@ main.go          CLI 入口（cobra）、参数、代理解析、启动
 httpclient.go    出站 HTTP 客户端（代理感知）
 token.go         令牌加载/刷新（SSO-OIDC）、profileArn 解析
 eventstream.go   AWS vnd.amazon.eventstream 解码（基于 smithy-go）
-kiro.go          Kiro 运行时客户端、请求/响应类型、模型列表
+kiro.go          Kiro 运行时客户端、请求/响应类型、模型列表、账号额度（getUsageLimits）
 anthropic.go     Anthropic 类型、模型映射、请求翻译、SSE 组装
 server.go        HTTP 服务与各端点、结构化访问日志（slog）
+admin.go         管理页（仅本机）：路由、回环 + Host 校验、账号/额度/模型聚合 JSON
+admin.html       管理页前端（内嵌，go:embed）
+listen.go        监听辅助：端口被占用时自动 +1 重试
 upgrade.go       从 GitHub Release 自更新（minio/selfupdate + semver）
 build.sh         跨平台构建脚本
 ```

@@ -39,6 +39,7 @@ const defaultProxyURL = "http://127.0.0.1:7890"
 type Config struct {
 	Host       string
 	Port       int
+	AdminPort  int    // loopback-only management port (default 27890)
 	ProxyURL   string // outbound proxy for calls to AWS / kiro.dev (e.g. http://127.0.0.1:7890)
 	TokenFile  string // path to kiro-auth-token.json
 	ProfileArn string // optional explicit profileArn override
@@ -109,6 +110,7 @@ func addServerFlags(cmd *cobra.Command, cfg *Config) {
 	f := cmd.Flags()
 	f.StringVar(&cfg.Host, "host", "127.0.0.1", "host/interface to bind")
 	f.IntVar(&cfg.Port, "port", 17890, "port to listen on")
+	f.IntVar(&cfg.AdminPort, "admin-port", 27890, "loopback-only management port (auto-increments if in use)")
 	f.StringVar(&cfg.ProxyURL, "proxy", "", "outbound HTTP proxy for AWS/Kiro calls; precedence: this flag > http(s)_proxy env > default "+defaultProxyURL+"; use 'none' to connect directly")
 	f.StringVar(&cfg.TokenFile, "token-file", defaultTokenFile(), "path to Kiro auth token JSON")
 	f.StringVar(&cfg.ProfileArn, "profile-arn", "", "explicit CodeWhisperer profileArn (auto-resolved if empty)")
@@ -249,41 +251,64 @@ func runServe(cfg *Config) error {
 	}
 	srv.logger = logger
 
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	httpServer := &http.Server{
-		Addr:              addr,
-		Handler:           srv.Handler(),
-		ReadHeaderTimeout: 30 * time.Second,
+	// Bind the API listener first, then the admin listener. Both auto-increment
+	// their port if it is already in use; binding the API first means the admin
+	// listener naturally skips past it. The admin port is locked to loopback.
+	const adminHost = "127.0.0.1"
+
+	apiLn, apiPort, err := listenWithAutoIncrement(cfg.Host, cfg.Port)
+	if err != nil {
+		return fmt.Errorf("bind API port: %w", err)
 	}
+	cfg.Port = apiPort
+	addr := fmt.Sprintf("%s:%d", cfg.Host, apiPort)
+
+	adminLn, adminPort, err := listenWithAutoIncrement(adminHost, cfg.AdminPort)
+	if err != nil {
+		_ = apiLn.Close()
+		return fmt.Errorf("bind admin port: %w", err)
+	}
+	cfg.AdminPort = adminPort
+	adminAddr := fmt.Sprintf("%s:%d", adminHost, adminPort)
+
+	httpServer := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 30 * time.Second}
+	adminServer := &http.Server{Handler: srv.AdminHandler(), ReadHeaderTimeout: 30 * time.Second}
 
 	// Graceful shutdown on SIGINT/SIGTERM.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	serveErr := make(chan error, 1)
+	serveErr := make(chan error, 2)
 	go func() {
-		proxyNote := "direct (no proxy)"
-		if cfg.ProxyURL != "" {
-			proxyNote = cfg.ProxyURL
-		}
-		fmt.Printf("kiro-anthropic %s\n", version)
-		fmt.Printf("  listening : http://%s\n", addr)
-		fmt.Printf("  endpoint  : POST http://%s/v1/messages\n", addr)
-		fmt.Printf("  outbound  : %s\n", proxyNote)
-		fmt.Printf("  token     : %s\n", cfg.TokenFile)
-		if cfg.APIKey == "" {
-			fmt.Printf("  auth      : open (no api key required; bound to %s)\n", cfg.Host)
-		} else {
-			fmt.Printf("  auth      : x-api-key required\n")
-		}
-		fmt.Printf("  effort    : per request, default max (output_config.effort / reasoning_effort)\n")
-		fmt.Printf("  max-tokens: passed through to Kiro (backend does not enforce it)\n")
-		fmt.Printf("  log       : %s\n", logNote)
-		fmt.Println("  ready. press Ctrl+C to stop.")
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpServer.Serve(apiLn); err != nil && err != http.ErrServerClosed {
 			serveErr <- fmt.Errorf("server error: %w", err)
 		}
 	}()
+	go func() {
+		if err := adminServer.Serve(adminLn); err != nil && err != http.ErrServerClosed {
+			serveErr <- fmt.Errorf("admin server error: %w", err)
+		}
+	}()
+
+	proxyNote := "direct (no proxy)"
+	if cfg.ProxyURL != "" {
+		proxyNote = cfg.ProxyURL
+	}
+	fmt.Printf("kiro-anthropic %s\n", version)
+	fmt.Printf("  listening : http://%s\n", addr)
+	fmt.Printf("  endpoint  : POST http://%s/v1/messages\n", addr)
+	fmt.Printf("  admin     : http://%s  (localhost only)\n", adminAddr)
+	fmt.Printf("  outbound  : %s\n", proxyNote)
+	fmt.Printf("  token     : %s\n", cfg.TokenFile)
+	if cfg.APIKey == "" {
+		fmt.Printf("  auth      : open (no api key required; bound to %s)\n", cfg.Host)
+	} else {
+		fmt.Printf("  auth      : x-api-key required\n")
+	}
+	fmt.Printf("  effort    : per request, default max (output_config.effort / reasoning_effort)\n")
+	fmt.Printf("  max-tokens: passed through to Kiro (backend does not enforce it)\n")
+	fmt.Printf("  log       : %s\n", logNote)
+	fmt.Println("  ready. press Ctrl+C to stop.")
 
 	select {
 	case err := <-serveErr:
@@ -294,6 +319,7 @@ func runServe(cfg *Config) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpServer.Shutdown(shutdownCtx)
+	_ = adminServer.Shutdown(shutdownCtx)
 	return nil
 }
 

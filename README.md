@@ -120,6 +120,7 @@ curl --noproxy '*' http://127.0.0.1:17890/v1/messages \
 | `--admin-port` | `27890` | 管理页端口，**仅限本机访问**（被占用时自动 +1 重试） |
 | `--proxy` | `http://127.0.0.1:7890` | 出站代理；优先级：本参数 > `http(s)_proxy` 环境变量 > 内置默认；`none` 表示直连 |
 | `--token-file` | `~/.aws/sso/cache/kiro-auth-token.json` | Kiro 令牌文件路径 |
+| `--accounts-file` | `~/.kiro-anthropic/accounts.json` | 管理页自助登录的多账号凭据存储路径 |
 | `--profile-arn` | 自动解析 | 显式指定 CodeWhisperer profileArn |
 | `--api-key` | 空（开放） | 设置后客户端须用 `x-api-key` 或 `Authorization: Bearer` 携带 |
 | `--agent-mode` | `vibe` | Kiro agent 模式 |
@@ -132,25 +133,46 @@ curl --noproxy '*' http://127.0.0.1:17890/v1/messages \
 
 ### 管理页（`--admin-port`）
 
-`serve` 会在 API 端口之外，额外起一个**只监听 `127.0.0.1`** 的管理端口（默认 `27890`），提供一个只读的账号状态页面：
+`serve` 会在 API 端口之外，额外起一个**只监听 `127.0.0.1`** 的管理端口（默认 `27890`），提供账号状态页面，并支持自助登录企业账号：
 
 ```
 http://127.0.0.1:27890/            # 管理页（HTML，每 10s 自动刷新）
-http://127.0.0.1:27890/api/status.json   # 页面数据源（账号 / 额度 / 模型）
+http://127.0.0.1:27890/api/status.json     # 页面数据源（账号 / 额度 / 模型）
+http://127.0.0.1:27890/api/accounts.json   # 已登录的多账号列表（脱敏）
 http://127.0.0.1:27890/health      # 健康检查
 ```
 
-页面展示三块：
+页面展示：
 
 - **账号**：provider、authMethod、区域、profileArn、令牌过期倒计时、账号邮箱、打码后的 access token、出站代理、是否需要 api-key。
+- **多账号登录（企业 IdC）**：填入 Identity Center 的 **Start URL** 与 **Region**（可加备注）即可发起登录，见下节。已登录账号以列表展示（备注 / provider / region / profileArn / 过期状态 / 打码 token），可逐个删除。
 - **额度**：账号订阅级别、剩余 / 已用 / 总额度（credits，带进度条）、重置日期、试用额度（若在生效期）、超额封顶 / 单价 / 状态，以及完整原始 `getUsageLimits` 数据。额度来自与模型列表同源的控制面 `management.<region>.kiro.dev/getUsageLimits`，服务端缓存 60s。
 - **模型**：账号可用模型的 ID、名称、最大输入 / 输出 tokens、effort 档位（与 `/v1/models` 同源）。
 
 安全说明：
 
 - 管理端口**强制绑定 `127.0.0.1`**，且每个请求都经两道校验——按真实 TCP 对端 IP 限定回环（不信任 `X-Forwarded-For`），并校验 `Host` 头必须是 `localhost` / 回环地址（防 DNS 重绑定与跨站请求）。
-- access token 只以打码形式展示，不渲染完整值。
+- access token 只以打码形式展示，不渲染完整值。多账号存储里的 `refreshToken` / `clientSecret` **不会**通过任何 API 返回。
 - **端口自增**：`--port` 与 `--admin-port` 若被占用，会自动 +1 逐个重试直到找到空闲端口（上限 65535）。启动横幅会打印两个端口的**实际**监听地址——若发生自增，请以横幅为准。
+
+#### 多账号登录与凭据存储
+
+管理页可直接登录**企业 IdC（IAM Identity Center）账号**，凭据由本服务自行保存，不依赖 Kiro 桌面端：
+
+1. 在「多账号登录」填入 IdC 的 Start URL（形如 `https://your-org.awsapps.com/start`）与 Region，点「开始登录」。
+2. 服务向 `oidc.<region>.amazonaws.com` 注册一个公共客户端，浏览器新窗口打开 AWS 授权页（**authorization_code + PKCE** 流程）。
+3. 你在浏览器批准后，AWS 回跳到管理页的 `/oauth/callback`，服务用授权码换取 `accessToken` / `refreshToken`，自动解析 `profileArn`，并写入多账号存储。
+
+- **存储位置**：默认 `~/.kiro-anthropic/accounts.json`（可用 `--accounts-file` 覆盖）。目录 `0700`、文件 `0600`、原子写。文件含长期凭据（`refreshToken` / `clientSecret`），请妥善保管。
+- **自动续期**：`serve` 期间后台每 60s 扫描存储，对已过期或距过期不足 5 分钟的账号，用其自带的 `clientId` / `clientSecret` / `refreshToken` 经 SSO-OIDC 自动刷新并写回；失败仅记日志、下轮重试。
+- **回跳与远程部署**：回调地址取自管理页请求的 Host（受回环校验保证是本机）。若服务部署在远程主机，请通过 SSH 端口转发访问管理页，使浏览器的 `localhost` 与服务端回环一致：
+
+  ```bash
+  ssh -L 27890:localhost:27890 <server>
+  # 然后在本地浏览器打开 http://localhost:27890
+  ```
+
+- 目前多账号**仅登录与存储**，尚未接入 `/v1/messages` 的请求分发（后续版本提供）。
 
 ### 环境变量
 
@@ -308,8 +330,11 @@ eventstream.go   AWS vnd.amazon.eventstream 解码（基于 smithy-go）
 kiro.go          Kiro 运行时客户端、请求/响应类型、模型列表、账号额度（getUsageLimits）
 anthropic.go     Anthropic 类型、模型映射、请求翻译、SSE 组装
 server.go        HTTP 服务与各端点、结构化访问日志（slog）
-admin.go         管理页（仅本机）：路由、回环 + Host 校验、账号/额度/模型聚合 JSON
+admin.go         管理页（仅本机）：路由、回环 + Host 校验、账号/额度/模型聚合 JSON、登录/账号端点
 admin.html       管理页前端（内嵌，go:embed）
+login.go         企业 IdC 登录（authorization_code + PKCE）、账号令牌刷新
+accounts.go      多账号凭据存储（JSON 持久化、原子写、脱敏视图）
+refresher.go     后台定期刷新已存账号的令牌
 listen.go        监听辅助：端口被占用时自动 +1 重试
 upgrade.go       从 GitHub Release 自更新（minio/selfupdate + semver）
 build.sh         跨平台构建脚本

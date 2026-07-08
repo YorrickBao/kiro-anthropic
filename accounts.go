@@ -158,6 +158,24 @@ func (s *AccountStore) Add(a *StoredAccount) error {
 	return s.saveLocked()
 }
 
+// UpdateTokens updates the token fields of an existing account and persists the
+// store. It is a no-op error if the id is unknown. Only token/expiry fields are
+// touched; registration and identity fields are left intact.
+func (s *AccountStore) UpdateTokens(id, accessToken, refreshToken, expiresAt string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.accounts[id]
+	if !ok {
+		return fmt.Errorf("account %s not found", id)
+	}
+	a.AccessToken = accessToken
+	if refreshToken != "" {
+		a.RefreshToken = refreshToken
+	}
+	a.ExpiresAt = expiresAt
+	return s.saveLocked()
+}
+
 // Get returns a copy of the account with the given id.
 func (s *AccountStore) Get(id string) (StoredAccount, bool) {
 	s.mu.Lock()

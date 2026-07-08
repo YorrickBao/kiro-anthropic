@@ -290,6 +290,12 @@ func runServe(cfg *Config) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Periodically refresh stored (self-managed) accounts before their tokens
+	// expire. Stops when ctx is cancelled.
+	if srv.accounts != nil {
+		go newAccountRefresher(srv.accounts, client, logger).Run(ctx)
+	}
+
 	serveErr := make(chan error, 2)
 	go func() {
 		if err := httpServer.Serve(apiLn); err != nil && err != http.ErrServerClosed {

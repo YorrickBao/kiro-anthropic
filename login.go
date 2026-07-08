@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ssooidc"
 	"github.com/google/uuid"
 )
 
@@ -283,6 +285,54 @@ func (m *loginManager) completeLogin(ctx context.Context, state, code string) (*
 		acct.ProfileArn = arn
 	}
 	return acct, nil
+}
+
+// refreshAccountToken performs an SSO-OIDC refresh_token grant for a stored IdC
+// account, using the account's own clientId/clientSecret/refreshToken. It
+// returns the new access token, refresh token (may be unchanged) and RFC3339
+// expiry. It mirrors TokenStore.refreshLocked but operates on a StoredAccount
+// and does not touch Kiro's on-disk cache.
+func refreshAccountToken(ctx context.Context, client *http.Client, a StoredAccount) (accessToken, refreshToken, expiresAt string, err error) {
+	if a.RefreshToken == "" {
+		return "", "", "", fmt.Errorf("account has no refreshToken")
+	}
+	if a.ClientID == "" || a.ClientSecret == "" {
+		return "", "", "", fmt.Errorf("account has no client registration")
+	}
+	region := a.Region
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	// CreateToken is an unauthenticated public API; AnonymousCredentials skips
+	// SigV4 signing. Region drives the oidc.<region>.amazonaws.com endpoint and
+	// HTTPClient reuses our proxy-aware client.
+	oidc := ssooidc.New(ssooidc.Options{
+		Region:      region,
+		HTTPClient:  client,
+		Credentials: aws.AnonymousCredentials{},
+	})
+	out, err := oidc.CreateToken(ctx, &ssooidc.CreateTokenInput{
+		ClientId:     aws.String(a.ClientID),
+		ClientSecret: aws.String(a.ClientSecret),
+		GrantType:    aws.String("refresh_token"),
+		RefreshToken: aws.String(a.RefreshToken),
+	})
+	if err != nil {
+		return "", "", "", fmt.Errorf("call SSO-OIDC CreateToken: %w", err)
+	}
+	if out.AccessToken == nil || *out.AccessToken == "" {
+		return "", "", "", fmt.Errorf("CreateToken returned an empty accessToken")
+	}
+	accessToken = *out.AccessToken
+	if out.RefreshToken != nil {
+		refreshToken = *out.RefreshToken
+	}
+	if out.ExpiresIn > 0 {
+		expiresAt = time.Now().Add(time.Duration(out.ExpiresIn) * time.Second).
+			UTC().Format("2006-01-02T15:04:05.000Z")
+	}
+	return accessToken, refreshToken, expiresAt, nil
 }
 
 // randomURLSafe returns n random bytes encoded as base64url without padding.

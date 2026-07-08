@@ -10,6 +10,9 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/ssooidc"
 )
 
 // tokenRefreshBuffer is how long before real expiry we proactively refresh.
@@ -164,15 +167,8 @@ func (s *TokenStore) AccessToken(ctx context.Context) (string, error) {
 	return s.tok.AccessToken, nil
 }
 
-// createTokenResponse is the SSO-OIDC CreateToken response.
-type createTokenResponse struct {
-	AccessToken  string `json:"accessToken"`
-	RefreshToken string `json:"refreshToken"`
-	ExpiresIn    int    `json:"expiresIn"`
-	TokenType    string `json:"tokenType"`
-}
-
-// refreshLocked performs an SSO-OIDC CreateToken refresh_token grant and
+// refreshLocked performs an SSO-OIDC CreateToken refresh_token grant (via the
+// aws-sdk-go-v2 ssooidc client, routed through our proxy-aware HTTP client) and
 // persists the result. Caller must hold s.mu.
 func (s *TokenStore) refreshLocked(ctx context.Context) error {
 	if s.tok.RefreshToken == "" {
@@ -184,47 +180,34 @@ func (s *TokenStore) refreshLocked(ctx context.Context) error {
 		return fmt.Errorf("load client registration: %w", err)
 	}
 
-	region := s.region()
-	endpoint := fmt.Sprintf("https://oidc.%s.amazonaws.com/token", region)
-
-	reqBody, _ := json.Marshal(map[string]string{
-		"clientId":     reg.ClientID,
-		"clientSecret": reg.ClientSecret,
-		"grantType":    "refresh_token",
-		"refreshToken": s.tok.RefreshToken,
+	// CreateToken is an unauthenticated public API; AnonymousCredentials skips
+	// SigV4 signing. Region drives the default oidc.<region>.amazonaws.com
+	// endpoint, and HTTPClient reuses our proxy-aware client.
+	oidc := ssooidc.New(ssooidc.Options{
+		Region:      s.region(),
+		HTTPClient:  s.client,
+		Credentials: aws.AnonymousCredentials{},
 	})
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(reqBody))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := s.client.Do(req)
+	out, err := oidc.CreateToken(ctx, &ssooidc.CreateTokenInput{
+		ClientId:     aws.String(reg.ClientID),
+		ClientSecret: aws.String(reg.ClientSecret),
+		GrantType:    aws.String("refresh_token"),
+		RefreshToken: aws.String(s.tok.RefreshToken),
+	})
 	if err != nil {
 		return fmt.Errorf("call SSO-OIDC CreateToken: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body := readSnippet(resp.Body)
-		return fmt.Errorf("SSO-OIDC CreateToken failed: %s: %s", resp.Status, body)
-	}
-
-	var tr createTokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tr); err != nil {
-		return fmt.Errorf("decode CreateToken response: %w", err)
-	}
-	if tr.AccessToken == "" {
+	if out.AccessToken == nil || *out.AccessToken == "" {
 		return fmt.Errorf("CreateToken returned an empty accessToken")
 	}
 
-	s.tok.AccessToken = tr.AccessToken
-	if tr.RefreshToken != "" {
-		s.tok.RefreshToken = tr.RefreshToken
+	s.tok.AccessToken = *out.AccessToken
+	if out.RefreshToken != nil && *out.RefreshToken != "" {
+		s.tok.RefreshToken = *out.RefreshToken
 	}
-	if tr.ExpiresIn > 0 {
-		s.tok.ExpiresAt = time.Now().Add(time.Duration(tr.ExpiresIn) * time.Second).
+	if out.ExpiresIn > 0 {
+		s.tok.ExpiresAt = time.Now().Add(time.Duration(out.ExpiresIn) * time.Second).
 			UTC().Format("2006-01-02T15:04:05.000Z")
 	}
 

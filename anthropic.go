@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/google/uuid"
@@ -549,6 +550,11 @@ type blockAssembler struct {
 	// authoritative metadataEvent.stopReason; wins over the sawToolUse guess
 	// when present. Empty until setStopReason is called.
 	finalStopReason string
+
+	// leakCarry buffers trailing text that might be (the start of) a stray
+	// tool-call opening marker, held across frames until it can be decided.
+	// See the leak-filter section below.
+	leakCarry string
 }
 
 func newBlockAssembler(emit emitFunc) *blockAssembler {
@@ -562,6 +568,9 @@ func newBlockAssembler(emit emitFunc) *blockAssembler {
 func (a *blockAssembler) addReasoning(ev *kiroEvent) error {
 	if !a.emitThinking {
 		return nil // client disabled thinking: drop reasoning entirely
+	}
+	if err := a.flushLeakCarry(); err != nil {
+		return err
 	}
 
 	// Redacted reasoning is a distinct block type carrying opaque data.
@@ -647,6 +656,9 @@ func (a *blockAssembler) addText(text string) error {
 }
 
 func (a *blockAssembler) addToolUse(ev *kiroEvent) error {
+	if err := a.flushLeakCarry(); err != nil {
+		return err
+	}
 	newTool := ev.ToolUseID != "" && (a.openKind != "tool_use" || ev.ToolUseID != a.toolID)
 	if newTool {
 		if err := a.closeOpen(); err != nil {
@@ -808,4 +820,109 @@ func estimateTokens(chars int) int {
 		return 0
 	}
 	return (chars + 3) / 4
+}
+
+// ---------------------------------------------------------------------------
+// Tool-call marker leak fix.
+//
+// The Kiro backend occasionally emits a model's tool-call opening marker as
+// plain text inside assistantResponseEvent while the actual call still arrives
+// as a structured toolUseEvent. Observed on deepseek-3.2, whose marker is
+// "<｜DSML｜function_calls" (｜ = U+FF5C); Anthropic-style "<function_calls>" is
+// handled too. The marker can be split across streaming frames.
+//
+// The fix is deliberately minimal: strip a stray opening marker where it dangles
+// at the end of a text run. Structured tool calls are untouched, so tools keep
+// working. We do NOT parse tool calls out of leaked XML or synthesize tool_use
+// blocks: that would risk mangling text and inventing phantom tool calls when a
+// model legitimately writes this markup in prose.
+//
+// Implementation: ingestText buffers a possibly-incomplete trailing marker in
+// leakCarry across frames; everything ahead of it flows straight to addText.
+// ---------------------------------------------------------------------------
+
+// dsmlFunctionCalls is deepseek's tool-call opening marker (｜ is U+FF5C, a
+// fullwidth vertical bar, not an ASCII pipe).
+const dsmlFunctionCalls = "<｜DSML｜function_calls"
+
+// toolOpenMarkers are the complete opening markers stripped when they dangle at
+// the end of a text run.
+var toolOpenMarkers = []string{"<function_calls>", dsmlFunctionCalls}
+
+// toolOpenerRe strips a bare trailing opening marker from a text run.
+var toolOpenerRe = regexp.MustCompile(`(?:<function_calls>|<｜DSML｜function_calls>?)\s*$`)
+
+// ingestText is the text entry point used by the event loop. It strips stray
+// tool-call opening markers, buffering an ambiguous trailing fragment in
+// leakCarry until the next frame (or end of stream) can decide it.
+func (a *blockAssembler) ingestText(text string) error {
+	if text == "" {
+		return nil
+	}
+	a.leakCarry += text
+	hold := pendingMarkerTail(a.leakCarry)
+	cut := len(a.leakCarry) - hold
+	if err := a.addText(a.leakCarry[:cut]); err != nil {
+		return err
+	}
+	a.leakCarry = a.leakCarry[cut:]
+	return nil
+}
+
+// flushLeakCarry emits any buffered trailing text, stripping a bare opening
+// marker if that is all that was held. Called before the assembler switches to a
+// non-text block and once at end of stream (via finish).
+func (a *blockAssembler) flushLeakCarry() error {
+	if a.leakCarry == "" {
+		return nil
+	}
+	out := stripOpenerSuffix(a.leakCarry)
+	a.leakCarry = ""
+	return a.addText(out)
+}
+
+// finish flushes any held text and closes the open block. Both the streaming and
+// non-streaming loops call it once at end of stream in place of closeOpen.
+func (a *blockAssembler) finish() error {
+	if err := a.flushLeakCarry(); err != nil {
+		return err
+	}
+	return a.closeOpen()
+}
+
+// stripOpenerSuffix removes a bare trailing tool-call opening marker, leaving all
+// other text untouched.
+func stripOpenerSuffix(s string) string {
+	return toolOpenerRe.ReplaceAllString(s, "")
+}
+
+// pendingMarkerTail returns how many trailing bytes to hold back because they
+// might be a tool-call opening marker (possibly split across frames): either a
+// partial prefix of a marker, or a complete marker that may be a stray leak.
+func pendingMarkerTail(s string) int {
+	hold := 0
+	for _, tag := range toolOpenMarkers {
+		// Longest suffix of s that is a prefix of tag.
+		start := len(tag) - 1
+		if start > len(s) {
+			start = len(s)
+		}
+		for k := start; k >= 1; k-- {
+			if s[len(s)-k:] == tag[:k] {
+				if k > hold {
+					hold = k
+				}
+				break
+			}
+		}
+		// A complete marker at the tail is a stray leak; hold all of it so flush
+		// can strip it.
+		if strings.HasSuffix(s, tag) && len(tag) > hold {
+			hold = len(tag)
+		}
+	}
+	if hold > len(s) {
+		hold = len(s)
+	}
+	return hold
 }

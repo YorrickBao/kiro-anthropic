@@ -440,7 +440,7 @@ func (s *Server) aggregateMessages(w http.ResponseWriter, r *http.Request, areq 
 		case evReasoning:
 			_ = asm.addReasoning(ev)
 		case evText:
-			_ = asm.addText(ev.Text)
+			_ = asm.ingestText(ev.Text)
 		case evToolUse:
 			_ = asm.addToolUse(ev)
 		case evMetadata:
@@ -450,7 +450,7 @@ func (s *Server) aggregateMessages(w http.ResponseWriter, r *http.Request, areq 
 			return
 		}
 	}
-	_ = asm.closeOpen()
+	_ = asm.finish()
 
 	blocks := asm.blocks
 	if len(blocks) == 0 {
@@ -544,7 +544,7 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, areq *an
 				return
 			}
 		case evText:
-			if err := asm.addText(ev.Text); err != nil {
+			if err := asm.ingestText(ev.Text); err != nil {
 				return
 			}
 		case evToolUse:
@@ -562,7 +562,7 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, areq *an
 			return
 		}
 	}
-	if err := asm.closeOpen(); err != nil {
+	if err := asm.finish(); err != nil {
 		return
 	}
 

@@ -251,6 +251,7 @@ export NO_PROXY=127.0.0.1,localhost
 - **采样参数**：`temperature` / `top_p` / `top_k` 不透传（Opus 4.7+ 本身也不支持）。
 - **usage 为估算**：返回的 `input_tokens` / `output_tokens` 是基于字符数的粗略估算（非精确计费值）。Kiro 后端只提供上下文占用百分比与 credit 计费，不提供真实 token 计数，故无法返回精确值。
 - **stop_reason**：取自 Kiro 结束帧（`metadataEvent.stopReason`）的权威值（`END_TURN`/`TOOL_USE`/`MAX_TOKENS` 等），映射为 Anthropic 的 `end_turn`/`tool_use`/`max_tokens`。由于后端不强制 `max_tokens`，`max_tokens` 实际极少出现。
+- **工具调用标记泄漏**：个别模型（实测 `deepseek-3.2`）偶尔把工具调用的**起始标记**（`<｜DSML｜function_calls`、`<function_calls>`）当普通文本混进正文尾部，而真正的工具调用仍以结构化事件正常返回。本服务会自动剥离正文末尾这类残留标记（含跨帧拆分的情况），工具调用不受影响。仅做尾部标记剥离，不解析泄漏的 XML、不合成工具调用，因此不会误伤正文里合法出现的这类文本。
 
 ---
 

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -468,4 +469,182 @@ func TestStripReasoningFromHistory(t *testing.T) {
 		"reasoningContent not stripped")
 	// nothing left to strip -> false
 	assert.False(t, stripReasoningFromHistory(kreq), "second strip should be false")
+}
+
+// --- tool-call marker leak fix (strip-only) ---
+
+func firstText(blocks []anthropicRespBlock) string {
+	for _, b := range blocks {
+		if b.Type == "text" {
+			return b.Text
+		}
+	}
+	return ""
+}
+
+func countToolUse(blocks []anthropicRespBlock) int {
+	n := 0
+	for _, b := range blocks {
+		if b.Type == "tool_use" {
+			n++
+		}
+	}
+	return n
+}
+
+// deepseek leaks only the opening marker as trailing text; the tool itself
+// arrives structured. The marker must be stripped, the tool kept.
+func TestToolLeakDeepSeekTrailingMarker(t *testing.T) {
+	a := newBlockAssembler(nil)
+	require.NoError(t, a.ingestText("I'll get the weather.\n\n<｜DSML｜function_calls"))
+	require.NoError(t, a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t1",
+		ToolName: "get_weather", ToolInput: `{"city":"Paris"}`, ToolStop: true}))
+	require.NoError(t, a.finish())
+
+	txt := firstText(a.blocks)
+	assert.NotContains(t, txt, "DSML", "marker must be stripped")
+	assert.NotContains(t, txt, "function_calls")
+	assert.Equal(t, "I'll get the weather.\n\n", txt)
+	assert.Equal(t, 1, countToolUse(a.blocks))
+	assert.Equal(t, "tool_use", a.stopReason())
+}
+
+// The opening marker split across frames must still be stripped.
+func TestToolLeakCrossFrameSplitMarker(t *testing.T) {
+	a := newBlockAssembler(nil)
+	require.NoError(t, a.ingestText("Answer.\n\n<｜DSML｜function_c"))
+	require.NoError(t, a.ingestText("alls"))
+	require.NoError(t, a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t1",
+		ToolName: "f", ToolInput: `{}`, ToolStop: true}))
+	require.NoError(t, a.finish())
+
+	txt := firstText(a.blocks)
+	assert.NotContains(t, txt, "DSML")
+	assert.NotContains(t, txt, "function_c")
+	assert.Equal(t, "Answer.\n\n", txt)
+	assert.Equal(t, 1, countToolUse(a.blocks))
+}
+
+// The Anthropic-style "<function_calls>" opener is stripped too.
+func TestToolLeakAnthropicMarker(t *testing.T) {
+	a := newBlockAssembler(nil)
+	require.NoError(t, a.ingestText("Done.\n<function_calls>"))
+	require.NoError(t, a.finish())
+	assert.Equal(t, "Done.\n", firstText(a.blocks))
+}
+
+// A frame boundary landing inside the multibyte "｜" (U+FF5C, 3 bytes) of the
+// DSML marker must not split the rune in an emitted delta, and the marker must
+// still be stripped once completed.
+func TestToolLeakSplitInsideMultibyteRune(t *testing.T) {
+	var deltas []string
+	emit := func(event string, data any) error {
+		if event == "content_block_delta" {
+			m := data.(map[string]any)
+			if d, ok := m["delta"].(map[string]any); ok && d["type"] == "text_delta" {
+				deltas = append(deltas, d["text"].(string))
+			}
+		}
+		return nil
+	}
+	a := newBlockAssembler(emit)
+	// Split the marker mid-"｜": "<\xef" ends the first frame, "\xbd\x9c..." the next.
+	full := "Hi.\n\n" + dsmlFunctionCalls
+	mid := len("Hi.\n\n<") + 1 // one byte into the first ｜
+	require.NoError(t, a.ingestText(full[:mid]))
+	require.NoError(t, a.ingestText(full[mid:]))
+	require.NoError(t, a.finish())
+
+	for _, d := range deltas {
+		assert.True(t, utf8.ValidString(d), "each delta must be valid UTF-8: %q", d)
+	}
+	assert.Equal(t, "Hi.\n\n", firstText(a.blocks))
+}
+
+// A dangling marker with no following tool (pure leak) is stripped at flush.
+func TestToolLeakTrailingMarkerOnlyStripped(t *testing.T) {
+	a := newBlockAssembler(nil)
+	require.NoError(t, a.ingestText("Here you go.\n\n<｜DSML｜function_calls"))
+	require.NoError(t, a.finish())
+	assert.Equal(t, "Here you go.\n\n", firstText(a.blocks))
+	assert.Equal(t, 0, countToolUse(a.blocks))
+}
+
+// Leaked tool-call BODY is NOT parsed into a phantom tool: strip-only leaves the
+// markup as text and never invents a tool_use. (No parse/rescue by design.)
+func TestToolLeakBodyNotParsedIntoPhantomTool(t *testing.T) {
+	a := newBlockAssembler(nil)
+	require.NoError(t, a.ingestText(`x <invoke name="f"><parameter name="a">1</parameter></invoke>`))
+	require.NoError(t, a.finish())
+	assert.Equal(t, 0, countToolUse(a.blocks), "no phantom tool synthesized")
+	assert.Contains(t, firstText(a.blocks), "<invoke", "body kept as text")
+}
+
+// Legitimate text ending in "count" must not be eaten (no count-corruption rule).
+func TestToolLeakCountNotEaten(t *testing.T) {
+	a := newBlockAssembler(nil)
+	require.NoError(t, a.ingestText("The final word count"))
+	require.NoError(t, a.finish())
+	assert.Equal(t, "The final word count", firstText(a.blocks))
+	assert.Equal(t, 0, countToolUse(a.blocks))
+}
+
+// Prose mentioning "function" or a lone '<' is untouched, and a mid-text
+// "<function_calls>" (not at the end) is not stripped.
+func TestToolLeakNoFalsePositiveOnProse(t *testing.T) {
+	a := newBlockAssembler(nil)
+	require.NoError(t, a.ingestText("Use the function foo() when a < b holds"))
+	require.NoError(t, a.finish())
+	assert.Equal(t, "Use the function foo() when a < b holds", firstText(a.blocks))
+
+	b := newBlockAssembler(nil)
+	require.NoError(t, b.ingestText("The <function_calls> tag opens a call."))
+	require.NoError(t, b.finish())
+	assert.Equal(t, "The <function_calls> tag opens a call.", firstText(b.blocks))
+}
+
+// A held trailing fragment that turns out to be normal text is emitted intact
+// once more text arrives (no data loss from cross-frame hold).
+func TestToolLeakHeldFragmentReleased(t *testing.T) {
+	a := newBlockAssembler(nil)
+	require.NoError(t, a.ingestText("ends with <")) // '<' could start a marker
+	require.NoError(t, a.ingestText("b so a<b"))    // ...but it was just prose
+	require.NoError(t, a.finish())
+	assert.Equal(t, "ends with <b so a<b", firstText(a.blocks))
+}
+
+// Streaming: no text_delta ever carries the leaked marker, and the structured
+// tool block is still emitted.
+func TestToolLeakStreamingNoMarkerInDeltas(t *testing.T) {
+	var textDeltas []string
+	var sawToolStart bool
+	emit := func(event string, data any) error {
+		m := data.(map[string]any)
+		if event == "content_block_delta" {
+			if d, ok := m["delta"].(map[string]any); ok && d["type"] == "text_delta" {
+				textDeltas = append(textDeltas, d["text"].(string))
+			}
+		}
+		if event == "content_block_start" {
+			if cb, ok := m["content_block"].(map[string]any); ok && cb["type"] == "tool_use" {
+				sawToolStart = true
+			}
+		}
+		return nil
+	}
+	a := newBlockAssembler(emit)
+	require.NoError(t, a.ingestText("Weather:\n\n<｜DSML｜function_c"))
+	require.NoError(t, a.ingestText("alls"))
+	require.NoError(t, a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t1",
+		ToolName: "get_weather", ToolInput: `{"city":"Paris"}`, ToolStop: true}))
+	require.NoError(t, a.finish())
+
+	joined := ""
+	for _, d := range textDeltas {
+		joined += d
+	}
+	assert.NotContains(t, joined, "DSML", "no leaked marker in any text_delta")
+	assert.NotContains(t, joined, "function_c")
+	assert.Equal(t, "Weather:\n\n", joined)
+	assert.True(t, sawToolStart, "structured tool block still emitted")
 }

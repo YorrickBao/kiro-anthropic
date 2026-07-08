@@ -18,10 +18,12 @@ import (
 
 // Server wires the Anthropic-facing HTTP API to the Kiro backend.
 type Server struct {
-	cfg    *Config
-	store  *TokenStore
-	kiro   *KiroClient
-	logger *slog.Logger // per-request access log; nil disables it
+	cfg      *Config
+	store    *TokenStore
+	kiro     *KiroClient
+	accounts *AccountStore // multi-account credential store (admin sign-in)
+	login    *loginManager // IdC sign-in flow driver
+	logger   *slog.Logger  // per-request access log; nil disables it
 
 	modelsMu    sync.Mutex
 	modelsCache []kiroModelInfo
@@ -46,6 +48,7 @@ func NewServer(cfg *Config, store *TokenStore, client *http.Client) *Server {
 		cfg:   cfg,
 		store: store,
 		kiro:  NewKiroClient(cfg, store, client),
+		login: newLoginManager(client),
 	}
 }
 

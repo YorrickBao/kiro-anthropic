@@ -44,6 +44,20 @@
   pre { background: #0b0d11; border: 1px solid var(--line); border-radius: 8px; padding: 12px; overflow: auto; font-size: 12px; }
   .err-box { color: var(--err); }
   a { color: var(--accent); }
+  .muted { color: var(--muted); }
+  .login-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+  .login-form .field { display: flex; flex-direction: column; gap: 4px; }
+  .login-form label { color: var(--muted); font-size: 12px; }
+  .login-form input {
+    background: #12151c; border: 1px solid var(--line); border-radius: 6px;
+    color: var(--fg); padding: 7px 9px; min-width: 220px; font-size: 13px;
+  }
+  button {
+    background: var(--accent); color: #0b0d11; border: 0; border-radius: 6px;
+    padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  button.danger { background: transparent; color: var(--err); border: 1px solid var(--line); padding: 4px 10px; font-weight: 500; }
 </style>
 </head>
 <body>
@@ -55,6 +69,24 @@
 </header>
 <div class="wrap">
   <section class="card" id="account-card"><h2>账号信息</h2><dl class="kv" id="account"></dl></section>
+  <section class="card" id="accounts-card">
+    <h2>多账号登录（企业 IdC）</h2>
+    <div class="login-form">
+      <div class="field"><label for="login-starturl">Start URL</label>
+        <input id="login-starturl" type="text" placeholder="https://your-org.awsapps.com/start" /></div>
+      <div class="field"><label for="login-region">Region</label>
+        <input id="login-region" type="text" value="us-east-1" /></div>
+      <div class="field"><label for="login-label">备注（可选）</label>
+        <input id="login-label" type="text" placeholder="团队 A / 生产" /></div>
+      <button id="login-btn" type="button">开始登录</button>
+      <span id="login-msg" class="muted"></span>
+    </div>
+    <div id="accounts-list" style="margin-top:14px"></div>
+    <p class="muted" style="font-size:12px;margin-top:10px">
+      登录会在浏览器打开 AWS 授权页，完成后凭据保存在服务端。远程部署请通过 SSH 隧道访问本页
+      (<code>ssh -L 27890:localhost:27890 &lt;server&gt;</code>)，以便授权回跳到本机。
+    </p>
+  </section>
   <section class="card" id="usage-card"><h2>额度信息</h2><div id="usage"></div></section>
   <section class="card" id="models-card"><h2>模型信息</h2><div id="models"></div></section>
 </div>
@@ -147,6 +179,67 @@ function renderModels(models) {
   el.innerHTML = `<table><thead><tr><th>模型 ID</th><th>名称</th><th class="num">最大输入</th><th class="num">最大输出</th><th>Effort</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
+function renderAccounts(accounts) {
+  const el = $("accounts-list");
+  if (!accounts || !accounts.length) { el.innerHTML = '<span class="muted">尚无已登录账号。</span>'; return; }
+  const rows = accounts.map(a => `<tr>
+    <td>${esc(a.label || "—")}</td>
+    <td>${esc(a.provider || "—")}</td>
+    <td>${esc(a.region || "—")}</td>
+    <td>${expiryPill(a.expiry_state, a.expires_in_seconds)}</td>
+    <td style="max-width:280px"><code>${esc(a.profile_arn || "—")}</code></td>
+    <td><code>${esc(a.access_token || "—")}</code></td>
+    <td><button class="danger" data-id="${esc(a.id)}" type="button">删除</button></td>
+  </tr>`).join("");
+  el.innerHTML = `<table><thead><tr><th>备注</th><th>Provider</th><th>Region</th><th>过期</th><th>profileArn</th><th>Access Token</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+  el.querySelectorAll("button.danger").forEach(b => b.addEventListener("click", () => deleteAccount(b.dataset.id)));
+}
+
+async function loadAccounts() {
+  try {
+    const res = await fetch("/api/accounts.json", { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const d = await res.json();
+    renderAccounts(d.accounts);
+  } catch (e) {
+    $("accounts-list").innerHTML = `<span class="err-box">加载账号失败: ${esc(e.message)}</span>`;
+  }
+}
+
+async function deleteAccount(id) {
+  if (!id || !confirm("确定删除该账号凭据？")) return;
+  try {
+    const res = await fetch("/api/accounts/delete", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id })
+    });
+    if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error((d.error && d.error.message) || ("HTTP " + res.status)); }
+    loadAccounts();
+  } catch (e) { alert("删除失败: " + e.message); }
+}
+
+async function startLogin() {
+  const btn = $("login-btn"), msg = $("login-msg");
+  const start_url = $("login-starturl").value.trim();
+  const region = $("login-region").value.trim() || "us-east-1";
+  const label = $("login-label").value.trim();
+  if (!start_url) { msg.innerHTML = '<span class="err-box">请填写 Start URL</span>'; return; }
+  btn.disabled = true; msg.textContent = "正在注册客户端…";
+  try {
+    const res = await fetch("/api/login/start", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ start_url, region, label })
+    });
+    const d = await res.json();
+    if (!res.ok) throw new Error((d.error && d.error.message) || ("HTTP " + res.status));
+    msg.innerHTML = '已在新窗口打开授权页，完成后返回本页刷新账号列表。';
+    window.open(d.authorize_url, "_blank", "noopener");
+  } catch (e) {
+    msg.innerHTML = `<span class="err-box">登录失败: ${esc(e.message)}</span>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function tick() {
   try {
     const res = await fetch("/api/status.json", { cache: "no-store" });
@@ -162,8 +255,11 @@ async function tick() {
   }
 }
 
+$("login-btn").addEventListener("click", startLogin);
 tick();
+loadAccounts();
 setInterval(tick, REFRESH_MS);
+setInterval(loadAccounts, REFRESH_MS);
 </script>
 </body>
 </html>

@@ -37,18 +37,19 @@ const defaultProxyURL = "http://127.0.0.1:7890"
 
 // Config holds everything the server needs to run.
 type Config struct {
-	Host       string
-	Port       int
-	AdminPort  int    // loopback-only management port (default 27890)
-	ProxyURL   string // outbound proxy for calls to AWS / kiro.dev (e.g. http://127.0.0.1:7890)
-	TokenFile  string // path to kiro-auth-token.json
-	ProfileArn string // optional explicit profileArn override
-	APIKey     string // optional key clients must send (x-api-key / Authorization)
-	AgentMode  string // Kiro agent mode, e.g. "vibe"
-	Region     string // optional SSO region override (defaults to the token's region); drives OIDC token refresh
-	APIRegion  string // optional Kiro API region override (defaults to Region); drives runtime/management.<region>.kiro.dev
-	Log        bool   // enable request logging (off by default); logs to stdout unless LogFile is set
-	LogFile    string // if set, write the request log here instead of stdout ("none"/"off" disables)
+	Host         string
+	Port         int
+	AdminPort    int    // loopback-only management port (default 27890)
+	ProxyURL     string // outbound proxy for calls to AWS / kiro.dev (e.g. http://127.0.0.1:7890)
+	TokenFile    string // path to kiro-auth-token.json
+	AccountsFile string // path to the self-managed multi-account credential store
+	ProfileArn   string // optional explicit profileArn override
+	APIKey       string // optional key clients must send (x-api-key / Authorization)
+	AgentMode    string // Kiro agent mode, e.g. "vibe"
+	Region       string // optional SSO region override (defaults to the token's region); drives OIDC token refresh
+	APIRegion    string // optional Kiro API region override (defaults to Region); drives runtime/management.<region>.kiro.dev
+	Log          bool   // enable request logging (off by default); logs to stdout unless LogFile is set
+	LogFile      string // if set, write the request log here instead of stdout ("none"/"off" disables)
 }
 
 func defaultTokenFile() string {
@@ -114,6 +115,7 @@ func addServerFlags(cmd *cobra.Command, cfg *Config) {
 	f.IntVar(&cfg.AdminPort, "admin-port", 27890, "loopback-only management port (auto-increments if in use)")
 	f.StringVar(&cfg.ProxyURL, "proxy", "", "outbound HTTP proxy for AWS/Kiro calls; precedence: this flag > http(s)_proxy env > default "+defaultProxyURL+"; use 'none' to connect directly")
 	f.StringVar(&cfg.TokenFile, "token-file", defaultTokenFile(), "path to Kiro auth token JSON")
+	f.StringVar(&cfg.AccountsFile, "accounts-file", defaultAccountsFile(), "path to the self-managed multi-account credential store")
 	f.StringVar(&cfg.ProfileArn, "profile-arn", "", "explicit CodeWhisperer profileArn (auto-resolved if empty)")
 	f.StringVar(&cfg.APIKey, "api-key", "", "if set, clients must present this key via x-api-key or Authorization: Bearer")
 	f.StringVar(&cfg.AgentMode, "agent-mode", "vibe", "Kiro agent mode")
@@ -243,6 +245,14 @@ func runServe(cfg *Config) error {
 	}
 
 	srv := NewServer(cfg, store, client)
+
+	if cfg.AccountsFile != "" {
+		accounts, err := NewAccountStore(cfg.AccountsFile)
+		if err != nil {
+			return fmt.Errorf("account store init failed: %w", err)
+		}
+		srv.accounts = accounts
+	}
 
 	logger, closeLog, logNote, err := setupRequestLog(cfg.Log, cfg.LogFile)
 	if err != nil {

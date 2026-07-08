@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -30,6 +32,10 @@ func (s *Server) AdminHandler() http.Handler {
 	r.Get("/", s.handleAdminPage)
 	r.Get("/health", s.handleHealth)
 	r.Get("/api/status.json", s.handleAdminStatus)
+	r.Get("/api/accounts.json", s.handleAccountsList)
+	r.Post("/api/login/start", s.handleLoginStart)
+	r.Post("/api/accounts/delete", s.handleAccountDelete)
+	r.Get("/oauth/callback", s.handleLoginCallback)
 	return r
 }
 
@@ -126,6 +132,137 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleAccountsList returns the stored (self-managed) accounts, redacted.
+func (s *Server) handleAccountsList(w http.ResponseWriter, r *http.Request) {
+	if s.accounts == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"accounts": []any{}})
+		return
+	}
+	list := s.accounts.List()
+	views := make([]map[string]any, 0, len(list))
+	for _, a := range list {
+		views = append(views, a.view())
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": views})
+}
+
+// handleLoginStart begins an IdC authorization-code sign-in. It registers an
+// OIDC client and returns an authorize URL for the user's browser. The
+// redirect_uri points back to this admin origin's /oauth/callback; the
+// adminHostOnly middleware guarantees that origin is a loopback name.
+func (s *Server) handleLoginStart(w http.ResponseWriter, r *http.Request) {
+	if s.accounts == nil || s.login == nil {
+		adminError(w, http.StatusServiceUnavailable, "account store is not configured")
+		return
+	}
+	var body struct {
+		StartURL string `json:"start_url"`
+		Region   string `json:"region"`
+		Label    string `json:"label"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		adminError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+
+	redirectURI := fmt.Sprintf("http://%s/oauth/callback", r.Host)
+	authorizeURL, _, err := s.login.startLogin(r.Context(), body.StartURL, body.Region, body.Label, redirectURI)
+	if err != nil {
+		noteError(r.Context(), err.Error())
+		adminError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"authorize_url": authorizeURL})
+}
+
+// handleLoginCallback receives the browser redirect from AWS, exchanges the
+// authorization code for tokens, persists the account, and renders a small
+// HTML page telling the user to return to the admin page.
+func (s *Server) handleLoginCallback(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if e := q.Get("error"); e != "" {
+		desc := q.Get("error_description")
+		renderCallbackPage(w, false, fmt.Sprintf("Authorization failed: %s %s", e, desc))
+		return
+	}
+	state := q.Get("state")
+	code := q.Get("code")
+	if s.accounts == nil || s.login == nil {
+		renderCallbackPage(w, false, "Account store is not configured.")
+		return
+	}
+
+	acct, err := s.login.completeLogin(r.Context(), state, code)
+	if err != nil {
+		noteError(r.Context(), err.Error())
+		renderCallbackPage(w, false, "Sign-in failed: "+err.Error())
+		return
+	}
+	if err := s.accounts.Add(acct); err != nil {
+		noteError(r.Context(), err.Error())
+		renderCallbackPage(w, false, "Signed in but could not save the account: "+err.Error())
+		return
+	}
+	renderCallbackPage(w, true, "Signed in successfully. You can close this window and return to the admin page.")
+}
+
+// handleAccountDelete removes a stored account by id.
+func (s *Server) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
+	if s.accounts == nil {
+		adminError(w, http.StatusServiceUnavailable, "account store is not configured")
+		return
+	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		adminError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if body.ID == "" {
+		adminError(w, http.StatusBadRequest, "id is required")
+		return
+	}
+	if err := s.accounts.Remove(body.ID); err != nil {
+		adminError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// adminError writes an error JSON in the shape the admin page expects.
+func adminError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]any{
+		"type":  "error",
+		"error": map[string]any{"message": msg},
+	})
+}
+
+// renderCallbackPage writes the minimal OAuth callback landing page.
+func renderCallbackPage(w http.ResponseWriter, ok bool, msg string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	status := http.StatusOK
+	if !ok {
+		status = http.StatusBadRequest
+	}
+	w.WriteHeader(status)
+	title := "Sign-in complete"
+	if !ok {
+		title = "Sign-in failed"
+	}
+	fmt.Fprintf(w, `<!doctype html><html><head><meta charset="utf-8"><title>%s</title>
+<style>body{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem;color:#1a1a1a}
+h1{font-size:1.25rem}.ok{color:#0a7d33}.err{color:#b00020}</style></head>
+<body><h1 class="%s">%s</h1><p>%s</p></body></html>`,
+		htmlEscape(title), map[bool]string{true: "ok", false: "err"}[ok], htmlEscape(title), htmlEscape(msg))
+}
+
+// htmlEscape is a tiny escaper for the text we interpolate into the callback page.
+func htmlEscape(s string) string {
+	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&#39;")
+	return r.Replace(s)
 }
 
 // accountView assembles the account/auth panel data from the token store.

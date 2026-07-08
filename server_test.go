@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func testServerWithModels() *Server {
@@ -32,74 +35,56 @@ func TestApplyModelRequestFields(t *testing.T) {
 	// effort unspecified -> default max; max_tokens unspecified -> ceiling.
 	k := reqForModel("claude-opus-4.8")
 	s.applyModelRequestFields(ctx, k, "", 0)
-	if effortOf(k) != "max" {
-		t.Errorf("default effort = %q, want max", effortOf(k))
-	}
-	if k.AdditionalModelRequestFields["max_tokens"] != 128000 {
-		t.Errorf("default max_tokens = %v, want 128000", k.AdditionalModelRequestFields["max_tokens"])
-	}
+	assert.Equal(t, "max", effortOf(k), "default effort")
+	assert.Equal(t, 128000, k.AdditionalModelRequestFields["max_tokens"], "default max_tokens")
 
 	// caller values honored (in range).
 	k = reqForModel("claude-opus-4.8")
 	s.applyModelRequestFields(ctx, k, "low", 5000)
-	if effortOf(k) != "low" || k.AdditionalModelRequestFields["max_tokens"] != 5000 {
-		t.Errorf("honored = %v", k.AdditionalModelRequestFields)
-	}
+	assert.Equal(t, "low", effortOf(k))
+	assert.Equal(t, 5000, k.AdditionalModelRequestFields["max_tokens"])
 
 	// max_tokens below schema minimum clamps up.
 	k = reqForModel("claude-opus-4.8")
 	s.applyModelRequestFields(ctx, k, "", 80)
-	if k.AdditionalModelRequestFields["max_tokens"] != 1024 {
-		t.Errorf("min clamp = %v, want 1024", k.AdditionalModelRequestFields["max_tokens"])
-	}
+	assert.Equal(t, 1024, k.AdditionalModelRequestFields["max_tokens"], "min clamp")
 
 	// max_tokens above ceiling clamps down.
 	k = reqForModel("claude-opus-4.8")
 	s.applyModelRequestFields(ctx, k, "", 999999)
-	if k.AdditionalModelRequestFields["max_tokens"] != 128000 {
-		t.Errorf("max clamp = %v, want 128000", k.AdditionalModelRequestFields["max_tokens"])
-	}
+	assert.Equal(t, 128000, k.AdditionalModelRequestFields["max_tokens"], "max clamp")
 
 	// unsupported effort level clamps to the model's highest.
 	k = reqForModel("claude-opus-4.8")
 	s.applyModelRequestFields(ctx, k, "ultra", 0)
-	if effortOf(k) != "max" {
-		t.Errorf("ultra should clamp to max, got %q", effortOf(k))
-	}
+	assert.Equal(t, "max", effortOf(k), "ultra should clamp to max")
 
 	// model without schema -> untouched.
 	k = reqForModel("claude-sonnet-4.5")
 	s.applyModelRequestFields(ctx, k, "high", 1000)
-	if k.AdditionalModelRequestFields != nil {
-		t.Errorf("sonnet-4.5 should be untouched, got %v", k.AdditionalModelRequestFields)
-	}
+	assert.Nil(t, k.AdditionalModelRequestFields, "sonnet-4.5 should be untouched")
 
 	// "auto" -> untouched.
 	k = reqForModel("auto")
 	s.applyModelRequestFields(ctx, k, "high", 1000)
-	if k.AdditionalModelRequestFields != nil {
-		t.Errorf("auto should be untouched, got %v", k.AdditionalModelRequestFields)
-	}
+	assert.Nil(t, k.AdditionalModelRequestFields, "auto should be untouched")
 }
 
 func TestModelInfoJSON(t *testing.T) {
 	info := modelInfoJSON(testOpusModel(), "2026-01-01T00:00:00Z")
-	if info["type"] != "model" || info["id"] != "claude-opus-4.8" {
-		t.Errorf("base fields = %v", info)
-	}
-	if info["max_input_tokens"] != 1000000 || info["max_tokens"] != 128000 {
-		t.Errorf("limits = %v", info)
-	}
+	assert.Equal(t, "model", info["type"])
+	assert.Equal(t, "claude-opus-4.8", info["id"])
+	assert.Equal(t, 1000000, info["max_input_tokens"])
+	assert.Equal(t, 128000, info["max_tokens"])
+
 	caps := info["capabilities"].(map[string]any)["effort"].(map[string]any)
-	if caps["supported"] != true || caps["max"] != true || caps["xhigh"] != true {
-		t.Errorf("opus effort caps = %v", caps)
-	}
+	assert.Equal(t, true, caps["supported"])
+	assert.Equal(t, true, caps["max"])
+	assert.Equal(t, true, caps["xhigh"])
 
 	// sonnet-4.5: no effort support.
 	caps = modelInfoJSON(testSonnet45Model(), "x")["capabilities"].(map[string]any)["effort"].(map[string]any)
-	if caps["supported"] != false {
-		t.Errorf("sonnet-4.5 effort caps = %v", caps)
-	}
+	assert.Equal(t, false, caps["supported"])
 }
 
 func TestMapUpstreamError(t *testing.T) {
@@ -116,22 +101,20 @@ func TestMapUpstreamError(t *testing.T) {
 	}
 	for _, c := range cases {
 		st, typ := mapUpstreamError(&kiroHTTPError{Status: c.status})
-		if st != c.wantSt || typ != c.wantTyp {
-			t.Errorf("status %d -> %d,%q; want %d,%q", c.status, st, typ, c.wantSt, c.wantTyp)
-		}
+		assert.Equalf(t, c.wantSt, st, "status %d", c.status)
+		assert.Equalf(t, c.wantTyp, typ, "status %d", c.status)
 	}
 	// non-kiroHTTPError -> 502 api_error
-	if st, typ := mapUpstreamError(context.Canceled); st != http.StatusBadGateway || typ != "api_error" {
-		t.Errorf("generic error -> %d,%q", st, typ)
-	}
+	st, typ := mapUpstreamError(context.Canceled)
+	assert.Equal(t, http.StatusBadGateway, st)
+	assert.Equal(t, "api_error", typ)
 }
 
 func TestAuthorized(t *testing.T) {
 	// open (no key) -> always authorized
 	open := &Server{cfg: &Config{}}
-	if !open.authorized(httptest.NewRequest(http.MethodPost, "/v1/messages", nil)) {
-		t.Errorf("open server should authorize")
-	}
+	assert.True(t, open.authorized(httptest.NewRequest(http.MethodPost, "/v1/messages", nil)),
+		"open server should authorize")
 
 	s := &Server{cfg: &Config{APIKey: "secret"}}
 	mk := func(set func(*http.Request)) *http.Request {
@@ -139,18 +122,14 @@ func TestAuthorized(t *testing.T) {
 		set(r)
 		return r
 	}
-	if !s.authorized(mk(func(r *http.Request) { r.Header.Set("x-api-key", "secret") })) {
-		t.Errorf("matching x-api-key should authorize")
-	}
-	if s.authorized(mk(func(r *http.Request) { r.Header.Set("x-api-key", "wrong") })) {
-		t.Errorf("wrong x-api-key should reject")
-	}
-	if !s.authorized(mk(func(r *http.Request) { r.Header.Set("Authorization", "Bearer secret") })) {
-		t.Errorf("matching bearer should authorize")
-	}
-	if s.authorized(mk(func(r *http.Request) {})) {
-		t.Errorf("missing key should reject")
-	}
+	assert.True(t, s.authorized(mk(func(r *http.Request) { r.Header.Set("x-api-key", "secret") })),
+		"matching x-api-key should authorize")
+	assert.False(t, s.authorized(mk(func(r *http.Request) { r.Header.Set("x-api-key", "wrong") })),
+		"wrong x-api-key should reject")
+	assert.True(t, s.authorized(mk(func(r *http.Request) { r.Header.Set("Authorization", "Bearer secret") })),
+		"matching bearer should authorize")
+	assert.False(t, s.authorized(mk(func(r *http.Request) {})),
+		"missing key should reject")
 }
 
 func TestApplyModelRequestFieldsMinimize(t *testing.T) {
@@ -158,9 +137,7 @@ func TestApplyModelRequestFieldsMinimize(t *testing.T) {
 	// thinking disabled -> minimize sentinel -> the model's lowest effort level.
 	k := reqForModel("claude-opus-4.8")
 	s.applyModelRequestFields(context.Background(), k, effortMinimize, 0)
-	if effortOf(k) != "low" {
-		t.Errorf("minimize effort = %q, want low", effortOf(k))
-	}
+	assert.Equal(t, "low", effortOf(k), "minimize effort")
 }
 
 func TestWithReasoningRetry(t *testing.T) {
@@ -191,9 +168,9 @@ func TestWithReasoningRetry(t *testing.T) {
 			calls++
 			return want, nil
 		})
-		if err != nil || got != want || calls != 1 {
-			t.Errorf("success path: got=%p err=%v calls=%d", got, err, calls)
-		}
+		require.NoError(t, err)
+		assert.Same(t, want, got)
+		assert.Equal(t, 1, calls)
 	}
 
 	// 2. signature error + reasoning present -> retry once, history stripped, retry result returned.
@@ -210,12 +187,10 @@ func TestWithReasoningRetry(t *testing.T) {
 			strippedOnRetry = !hasReasoning(kk) // history must be stripped before the retry send
 			return want, nil
 		})
-		if err != nil || got != want || calls != 2 {
-			t.Errorf("retry path: got=%p err=%v calls=%d", got, err, calls)
-		}
-		if !strippedOnRetry {
-			t.Errorf("history should be stripped before retry")
-		}
+		require.NoError(t, err)
+		assert.Same(t, want, got)
+		assert.Equal(t, 2, calls)
+		assert.True(t, strippedOnRetry, "history should be stripped before retry")
 	}
 
 	// 3. signature error but nothing to strip -> no retry, original error surfaces.
@@ -226,9 +201,8 @@ func TestWithReasoningRetry(t *testing.T) {
 			calls++
 			return nil, sigErr
 		})
-		if err != sigErr || calls != 1 {
-			t.Errorf("no-reasoning path: err=%v calls=%d", err, calls)
-		}
+		assert.Same(t, sigErr, err)
+		assert.Equal(t, 1, calls)
 	}
 
 	// 4. unrelated error -> no retry, original error surfaces.
@@ -239,27 +213,21 @@ func TestWithReasoningRetry(t *testing.T) {
 			calls++
 			return nil, other
 		})
-		if err != other || calls != 1 {
-			t.Errorf("unrelated-error path: err=%v calls=%d", err, calls)
-		}
+		assert.Same(t, other, err)
+		assert.Equal(t, 1, calls)
 	}
 }
 
 func TestIsThinkingSignatureError(t *testing.T) {
-	if !isThinkingSignatureError(&kiroHTTPError{Status: 400, Body: `{"message":"bad","reason":"THINKING_SIGNATURE_INVALID"}`}) {
-		t.Errorf("reason code should match")
-	}
+	assert.True(t, isThinkingSignatureError(&kiroHTTPError{Status: 400, Body: `{"message":"bad","reason":"THINKING_SIGNATURE_INVALID"}`}),
+		"reason code should match")
 	// message sniff fallback when no machine reason present
-	if !isThinkingSignatureError(&kiroHTTPError{Status: 400, Body: `The thinking signature is invalid`}) {
-		t.Errorf("message sniff should match")
-	}
-	if isThinkingSignatureError(&kiroHTTPError{Status: 400, Body: `{"reason":"PROMPT_TOO_LONG"}`}) {
-		t.Errorf("unrelated reason should not match")
-	}
-	if isThinkingSignatureError(&kiroHTTPError{Status: 500, Body: `thinking signature`}) {
-		t.Errorf("non-400 should not match")
-	}
-	if isThinkingSignatureError(context.Canceled) {
-		t.Errorf("non-http error should not match")
-	}
+	assert.True(t, isThinkingSignatureError(&kiroHTTPError{Status: 400, Body: `The thinking signature is invalid`}),
+		"message sniff should match")
+	assert.False(t, isThinkingSignatureError(&kiroHTTPError{Status: 400, Body: `{"reason":"PROMPT_TOO_LONG"}`}),
+		"unrelated reason should not match")
+	assert.False(t, isThinkingSignatureError(&kiroHTTPError{Status: 500, Body: `thinking signature`}),
+		"non-400 should not match")
+	assert.False(t, isThinkingSignatureError(context.Canceled),
+		"non-http error should not match")
 }

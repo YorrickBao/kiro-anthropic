@@ -3,6 +3,9 @@ package main
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // --- shared model fixtures (reused by server_test.go) ---
@@ -29,59 +32,49 @@ func testSonnet45Model() kiroModelInfo {
 
 func TestModelEffort(t *testing.T) {
 	ec, ok := testOpusModel().effort()
-	if !ok || ec.SchemaPath != "output_config" {
-		t.Fatalf("opus effort = %+v,%v", ec, ok)
-	}
-	if len(ec.Levels) != 5 || ec.Levels[0] != "low" || ec.max() != "max" {
-		t.Errorf("opus levels = %v", ec.Levels)
-	}
+	require.True(t, ok)
+	assert.Equal(t, "output_config", ec.SchemaPath)
+	require.Len(t, ec.Levels, 5)
+	assert.Equal(t, "low", ec.Levels[0])
+	assert.Equal(t, "max", ec.max())
 
-	if _, ok := testSonnet45Model().effort(); ok {
-		t.Errorf("sonnet-4.5 should not support effort")
-	}
+	_, ok = testSonnet45Model().effort()
+	assert.False(t, ok, "sonnet-4.5 should not support effort")
 
 	// "reasoning" schema path variant
 	m := kiroModelInfo{AdditionalModelRequestFieldsSchema: json.RawMessage(testReasoningSchema)}
 	ec, ok = m.effort()
-	if !ok || ec.SchemaPath != "reasoning" || len(ec.Levels) != 2 {
-		t.Errorf("reasoning effort = %+v,%v", ec, ok)
-	}
+	require.True(t, ok)
+	assert.Equal(t, "reasoning", ec.SchemaPath)
+	assert.Len(t, ec.Levels, 2)
 }
 
 func TestModelMaxTokensRange(t *testing.T) {
 	lo, hi, ok := testOpusModel().maxTokensRange()
-	if !ok || lo != 1024 || hi != 128000 {
-		t.Errorf("opus maxTokensRange = %d,%d,%v", lo, hi, ok)
-	}
-	if _, _, ok := testSonnet45Model().maxTokensRange(); ok {
-		t.Errorf("sonnet-4.5 should have no max_tokens field")
-	}
+	require.True(t, ok)
+	assert.Equal(t, 1024, lo)
+	assert.Equal(t, 128000, hi)
+
+	_, _, ok = testSonnet45Model().maxTokensRange()
+	assert.False(t, ok, "sonnet-4.5 should have no max_tokens field")
+
 	// max_tokens declared without an explicit maximum -> fall back to tokenLimits.
 	m := kiroModelInfo{AdditionalModelRequestFieldsSchema: json.RawMessage(`{"properties":{"max_tokens":{}}}`)}
 	m.TokenLimits.MaxOutputTokens = 8192
 	lo, hi, ok = m.maxTokensRange()
-	if !ok || lo != 1 || hi != 8192 {
-		t.Errorf("fallback maxTokensRange = %d,%d,%v", lo, hi, ok)
-	}
+	require.True(t, ok)
+	assert.Equal(t, 1, lo)
+	assert.Equal(t, 8192, hi)
 }
 
 func TestEffortConfigClamp(t *testing.T) {
 	ec := effortConfig{Levels: []string{"low", "medium", "high", "max"}}
-	if !ec.has("max") || ec.has("xhigh") {
-		t.Errorf("has() wrong")
-	}
-	if ec.max() != "max" {
-		t.Errorf("max() = %q", ec.max())
-	}
-	if ec.clamp("low") != "low" {
-		t.Errorf("clamp(low) should stay low")
-	}
-	if ec.clamp("xhigh") != "max" {
-		t.Errorf("clamp(xhigh) should top out at max, got %q", ec.clamp("xhigh"))
-	}
-	if (effortConfig{}).max() != "" {
-		t.Errorf("empty effortConfig.max() should be empty")
-	}
+	assert.True(t, ec.has("max"))
+	assert.False(t, ec.has("xhigh"))
+	assert.Equal(t, "max", ec.max())
+	assert.Equal(t, "low", ec.clamp("low"), "clamp(low) should stay low")
+	assert.Equal(t, "max", ec.clamp("xhigh"), "clamp(xhigh) should top out at max")
+	assert.Empty(t, (effortConfig{}).max(), "empty effortConfig.max() should be empty")
 }
 
 func TestParseKiroMessage(t *testing.T) {
@@ -89,77 +82,67 @@ func TestParseKiroMessage(t *testing.T) {
 	ev := parseKiroMessage(&eventMessage{
 		headers: map[string]string{":event-type": "assistantResponseEvent"},
 		payload: []byte(`{"content":"hi"}`)})
-	if ev.Kind != evText || ev.Text != "hi" {
-		t.Errorf("assistantResponseEvent = %+v", ev)
-	}
+	assert.Equal(t, evText, ev.Kind)
+	assert.Equal(t, "hi", ev.Text)
 
 	// tool use
 	ev = parseKiroMessage(&eventMessage{
 		headers: map[string]string{":event-type": "toolUseEvent"},
 		payload: []byte(`{"toolUseId":"t1","name":"f","input":"{\"a\":1}","stop":true}`)})
-	if ev.Kind != evToolUse || ev.ToolUseID != "t1" || ev.ToolName != "f" || ev.ToolInput != `{"a":1}` || !ev.ToolStop {
-		t.Errorf("toolUseEvent = %+v", ev)
-	}
+	assert.Equal(t, evToolUse, ev.Kind)
+	assert.Equal(t, "t1", ev.ToolUseID)
+	assert.Equal(t, "f", ev.ToolName)
+	assert.Equal(t, `{"a":1}`, ev.ToolInput)
+	assert.True(t, ev.ToolStop)
 
 	// metadata (terminal frame: authoritative stopReason + conversationId)
 	ev = parseKiroMessage(&eventMessage{
 		headers: map[string]string{":event-type": "metadataEvent"},
 		payload: []byte(`{"stopReason":"TOOL_USE","conversationId":"c1"}`)})
-	if ev.Kind != evMetadata || ev.ConversationID != "c1" || ev.StopReason != "TOOL_USE" {
-		t.Errorf("metadataEvent = %+v", ev)
-	}
+	assert.Equal(t, evMetadata, ev.Kind)
+	assert.Equal(t, "c1", ev.ConversationID)
+	assert.Equal(t, "TOOL_USE", ev.StopReason)
 
 	// exception via message-type header
 	ev = parseKiroMessage(&eventMessage{
 		headers: map[string]string{":message-type": "exception", ":exception-type": "ThrottlingException"},
 		payload: []byte(`{"message":"slow down"}`)})
-	if ev.Kind != evError || ev.ErrKind != "ThrottlingException" || ev.ErrMsg != "slow down" {
-		t.Errorf("exception = %+v", ev)
-	}
+	assert.Equal(t, evError, ev.Kind)
+	assert.Equal(t, "ThrottlingException", ev.ErrKind)
+	assert.Equal(t, "slow down", ev.ErrMsg)
 
 	// unknown event -> other
 	ev = parseKiroMessage(&eventMessage{
 		headers: map[string]string{":event-type": "codeReferenceEvent"}, payload: []byte(`{}`)})
-	if ev.Kind != evOther {
-		t.Errorf("unknown event kind = %v", ev.Kind)
-	}
+	assert.Equal(t, evOther, ev.Kind)
 }
 
 func TestRawToInputString(t *testing.T) {
-	if got := rawToInputString(json.RawMessage(`"abc"`)); got != "abc" {
-		t.Errorf("json string = %q", got)
-	}
-	if got := rawToInputString(json.RawMessage(`{"a":1}`)); got != `{"a":1}` {
-		t.Errorf("raw object = %q", got)
-	}
-	if got := rawToInputString(nil); got != "" {
-		t.Errorf("empty = %q", got)
-	}
+	assert.Equal(t, "abc", rawToInputString(json.RawMessage(`"abc"`)))
+	assert.Equal(t, `{"a":1}`, rawToInputString(json.RawMessage(`{"a":1}`)))
+	assert.Equal(t, "", rawToInputString(nil))
 }
 
 func TestExtractMessageAndReason(t *testing.T) {
-	if got, reason := extractMessageAndReason([]byte(`{"message":"x"}`)); got != "x" || reason != "" {
-		t.Errorf("message = %q reason = %q", got, reason)
-	}
-	if got, _ := extractMessageAndReason([]byte(`{"Message":"y"}`)); got != "y" {
-		t.Errorf("Message = %q", got)
-	}
-	if got, _ := extractMessageAndReason([]byte(`plain`)); got != "plain" {
-		t.Errorf("plain = %q", got)
-	}
-	if got, reason := extractMessageAndReason([]byte(`{"message":"bad sig","reason":"THINKING_SIGNATURE_INVALID"}`)); got != "bad sig" || reason != "THINKING_SIGNATURE_INVALID" {
-		t.Errorf("reason parse = %q,%q", got, reason)
-	}
+	msg, reason := extractMessageAndReason([]byte(`{"message":"x"}`))
+	assert.Equal(t, "x", msg)
+	assert.Empty(t, reason)
+
+	msg, _ = extractMessageAndReason([]byte(`{"Message":"y"}`))
+	assert.Equal(t, "y", msg)
+
+	msg, _ = extractMessageAndReason([]byte(`plain`))
+	assert.Equal(t, "plain", msg)
+
+	msg, reason = extractMessageAndReason([]byte(`{"message":"bad sig","reason":"THINKING_SIGNATURE_INVALID"}`))
+	assert.Equal(t, "bad sig", msg)
+	assert.Equal(t, "THINKING_SIGNATURE_INVALID", reason)
 }
 
 func TestKiroHTTPErrorReason(t *testing.T) {
 	e := &kiroHTTPError{Status: 400, Body: `{"message":"m","reason":"THINKING_SIGNATURE_INVALID"}`}
-	if e.reason() != "THINKING_SIGNATURE_INVALID" {
-		t.Errorf("reason() = %q", e.reason())
-	}
-	if (&kiroHTTPError{Body: "not json"}).reason() != "" {
-		t.Errorf("non-json reason should be empty")
-	}
+	assert.Equal(t, "THINKING_SIGNATURE_INVALID", e.reason())
+	assert.Empty(t, (&kiroHTTPError{Body: "not json"}).reason(), "non-json reason should be empty")
 }
 
 func TestParseReasoningContentEvent(t *testing.T) {
@@ -167,16 +150,17 @@ func TestParseReasoningContentEvent(t *testing.T) {
 	ev := parseKiroMessage(&eventMessage{
 		headers: map[string]string{":event-type": "reasoningContentEvent"},
 		payload: []byte(`{"text":"let me think"}`)})
-	if ev.Kind != evReasoning || ev.ReasoningText != "let me think" || ev.ReasoningSignature != "" {
-		t.Errorf("reasoning text event = %+v", ev)
-	}
+	assert.Equal(t, evReasoning, ev.Kind)
+	assert.Equal(t, "let me think", ev.ReasoningText)
+	assert.Empty(t, ev.ReasoningSignature)
+
 	// signature-only frame
 	ev = parseKiroMessage(&eventMessage{
 		headers: map[string]string{":event-type": "reasoningContentEvent"},
 		payload: []byte(`{"signature":"SIG=="}`)})
-	if ev.Kind != evReasoning || ev.ReasoningText != "" || ev.ReasoningSignature != "SIG==" {
-		t.Errorf("reasoning signature event = %+v", ev)
-	}
+	assert.Equal(t, evReasoning, ev.Kind)
+	assert.Empty(t, ev.ReasoningText)
+	assert.Equal(t, "SIG==", ev.ReasoningSignature)
 }
 
 func TestMapStopReason(t *testing.T) {
@@ -191,8 +175,6 @@ func TestMapStopReason(t *testing.T) {
 		"BOGUS":         "",
 	}
 	for in, want := range cases {
-		if got := mapStopReason(in); got != want {
-			t.Errorf("mapStopReason(%q) = %q, want %q", in, got, want)
-		}
+		assert.Equalf(t, want, mapStopReason(in), "mapStopReason(%q)", in)
 	}
 }

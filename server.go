@@ -332,6 +332,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		info.stream = areq.Stream
 	}
 
+	// Inline any remote (http/https) image URLs as base64 before translation:
+	// Kiro only accepts inline image bytes. Failures degrade gracefully (the
+	// block is left as-is and skipped downstream) rather than aborting.
+	newImageFetcher(s.kiro.client).resolveRemoteImages(r.Context(), &areq)
+
 	kreq, err := buildKiroRequest(s.cfg, &areq)
 	if err != nil {
 		writeAnthropicError(w, r, http.StatusBadRequest, "invalid_request_error", err.Error())

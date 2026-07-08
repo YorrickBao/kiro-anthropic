@@ -19,7 +19,7 @@
 
 - **Anthropic Messages API** `POST /v1/messages`，支持**流式（SSE）**与**非流式**。
 - **工具调用 / 函数调用**：完整的 `tools` → `tool_use` → `tool_result` 多轮闭环。
-- **图片输入**：base64 的 `png` / `jpeg` / `gif` / `webp`（已实测可正常识图）。
+- **图片输入**：`png` / `jpeg` / `gif` / `webp`（已实测可正常识图）。支持 base64，也支持远程 `url`（下载后内联为 base64，带 SSRF 防护、15s 超时与 10MB 上限）。
 - **系统提示词**：`system` 原生透传到 Kiro 的 `systemPrompt`。
 - **推理 effort**：读取请求里的 `output_config.effort` / `reasoning_effort`，**未指定时默认顶格**，并按每个模型的档位自动 clamp。
 - **扩展思考（extended thinking）**：模型的思考过程通过 Anthropic 原生的 `thinking` / `redacted_thinking` 内容块透传（流式下发 `thinking_delta` + `signature_delta`）。多轮对话时思考块连同 `signature` 原样回传给后端；若后端判定签名失效（`THINKING_SIGNATURE_INVALID`），自动剥离推理内容并重试一次。请求侧 `thinking: {type:"disabled"}` 会关闭思考块并把 effort 降到最低档。
@@ -214,8 +214,9 @@ Anthropic Messages API。支持 `stream: true`（SSE：`message_start` / `conten
   - **每个 assistant 轮次仅回传首个思考块**：Kiro 的 `reasoningContent` 是单成员 union，一轮只能携带一个 `reasoningText` 或 `redactedContent`。若某个 assistant 消息里有多个思考块（如交错思考 + 多次工具调用），只回传第一个，其余思考块会被丢弃（其正文 `text` 仍保留）。
 
 ### 图片
-- 支持 user 消息中的 base64 图片：`png` / `jpeg` / `gif` / `webp`。
+- 支持 user 消息中的图片：`png` / `jpeg` / `gif` / `webp`。
 - Anthropic 的 `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}` 会映射为 Kiro 的 `images:[{"format":"png","source":{"bytes":"..."}}]`。
+- **远程 URL 图片**：`{"type":"image","source":{"type":"url","url":"https://..."}}` 会在翻译前被下载并内联成 base64（Kiro 只接受内联字节）。下载走与其他出站请求相同的代理，并有多重护栏：仅允许 `http`/`https`、拒绝解析到环回/内网/链路本地地址的主机（SSRF 防护）、单张 15s 超时、10MB 上限、按响应 `Content-Type` 校验为上述四种图片类型之一。任一护栏不通过时该图片被跳过（下游留 `[unsupported image omitted]` 提示），不会中断整个请求。
 
 ---
 
@@ -246,7 +247,7 @@ export NO_PROXY=127.0.0.1,localhost
 ## 限制
 
 - **网络搜索不支持**：Anthropic 的 `web_search` 是服务端工具，而 Kiro 的 web 搜索是客户端工具、runtime 无对应服务端接口，无法直接映射（客户端会报 “web search not supported”）。
-- **图片仅 base64**：`source.type: "url"` 的图片会被跳过（留 `[unsupported image omitted]` 提示）；`tool_result` 里的图片不转发。
+- **图片**：支持 base64 与远程 `url`（URL 会下载后内联，受 SSRF/超时/大小/类型护栏约束，不通过则跳过并留 `[unsupported image omitted]` 提示）；`tool_result` 里的图片不转发。
 - **采样参数**：`temperature` / `top_p` / `top_k` 不透传（Opus 4.7+ 本身也不支持）。
 - **usage 为估算**：返回的 `input_tokens` / `output_tokens` 是基于字符数的粗略估算（非精确计费值）。Kiro 后端只提供上下文占用百分比与 credit 计费，不提供真实 token 计数，故无法返回精确值。
 - **stop_reason**：取自 Kiro 结束帧（`metadataEvent.stopReason`）的权威值（`END_TURN`/`TOOL_USE`/`MAX_TOKENS` 等），映射为 Anthropic 的 `end_turn`/`tool_use`/`max_tokens`。由于后端不强制 `max_tokens`，`max_tokens` 实际极少出现。

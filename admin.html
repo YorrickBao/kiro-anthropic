@@ -59,6 +59,8 @@
   button:disabled { opacity: .5; cursor: default; }
   button.danger { background: transparent; color: var(--err); border: 1px solid var(--line); padding: 4px 10px; font-weight: 500; }
   button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); padding: 4px 10px; font-weight: 500; margin-right: 6px; }
+  button.copy { background: transparent; color: var(--muted); border: 0; padding: 0 6px; margin-left: 6px; cursor: pointer; font-size: 13px; }
+  button.copy:hover { color: var(--accent); }
 </style>
 </head>
 <body>
@@ -168,7 +170,7 @@ function renderModels(models) {
       effTxt = ["low","medium","high","xhigh","max"].filter(l => eff[l]).join(" / ") || "yes";
     }
     return `<tr>
-      <td><code>${esc(m.id)}</code></td>
+      <td style="white-space:nowrap"><code>${esc(m.id)}</code><button class="copy" data-copy="${esc(m.id)}" type="button" title="复制">⧉</button></td>
       <td>${esc(m.display_name || "")}</td>
       <td class="num">${m.max_input_tokens ? fmtNum(m.max_input_tokens) : "—"}</td>
       <td class="num">${m.max_tokens ? fmtNum(m.max_tokens) : "—"}</td>
@@ -176,6 +178,22 @@ function renderModels(models) {
     </tr>`;
   }).join("");
   el.innerHTML = `<table><thead><tr><th>模型 ID</th><th>名称</th><th class="num">最大输入</th><th class="num">最大输出</th><th>Effort</th></tr></thead><tbody>${rows}</tbody></table>`;
+  el.querySelectorAll("button.copy").forEach(b => b.addEventListener("click", () => copyText(b.dataset.copy, b)));
+}
+
+// copyText copies s to the clipboard and briefly flashes the button as feedback.
+async function copyText(s, btn) {
+  try {
+    await navigator.clipboard.writeText(s);
+  } catch (e) {
+    // Fallback for non-secure contexts where the Clipboard API is unavailable.
+    const ta = document.createElement("textarea");
+    ta.value = s; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); } catch (_) {}
+    document.body.removeChild(ta);
+  }
+  if (btn) { const t = btn.textContent; btn.textContent = "✓"; setTimeout(() => { btn.textContent = t; }, 900); }
 }
 
 function renderAccounts(accounts) {

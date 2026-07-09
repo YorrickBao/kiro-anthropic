@@ -59,6 +59,25 @@ func TestAccountStoreFilePermissions(t *testing.T) {
 	assert.Equal(t, os.FileMode(0o700), di.Mode().Perm(), "accounts dir must be 0700")
 }
 
+func TestAccountStoreUpdateLabel(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	s, err := NewAccountStore(path)
+	require.NoError(t, err)
+	require.NoError(t, s.Add(&StoredAccount{ID: "id", Label: "old", CreatedAt: "1"}))
+
+	require.NoError(t, s.UpdateLabel("id", "new note"))
+	got, _ := s.Get("id")
+	assert.Equal(t, "new note", got.Label)
+
+	// Persisted across reload.
+	s2, err := NewAccountStore(path)
+	require.NoError(t, err)
+	got2, _ := s2.Get("id")
+	assert.Equal(t, "new note", got2.Label)
+
+	assert.Error(t, s.UpdateLabel("missing", "x"))
+}
+
 func TestAccountStoreRemove(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "accounts.json")
 	s, err := NewAccountStore(path)

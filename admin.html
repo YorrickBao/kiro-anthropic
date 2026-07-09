@@ -58,6 +58,7 @@
   }
   button:disabled { opacity: .5; cursor: default; }
   button.danger { background: transparent; color: var(--err); border: 1px solid var(--line); padding: 4px 10px; font-weight: 500; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); padding: 4px 10px; font-weight: 500; margin-right: 6px; }
 </style>
 </head>
 <body>
@@ -188,10 +189,14 @@ function renderAccounts(accounts) {
     <td>${expiryPill(a.expiry_state, a.expires_in_seconds)}</td>
     <td style="max-width:280px"><code>${esc(a.profile_arn || "—")}</code></td>
     <td><code>${esc(a.access_token || "—")}</code></td>
-    <td><button class="danger" data-id="${esc(a.id)}" type="button">删除</button></td>
+    <td style="white-space:nowrap">
+      <button class="ghost" data-edit="${esc(a.id)}" data-label="${esc(a.label || "")}" type="button">改备注</button>
+      <button class="danger" data-id="${esc(a.id)}" type="button">删除</button>
+    </td>
   </tr>`).join("");
   el.innerHTML = `<table><thead><tr><th>邮箱</th><th>备注</th><th>Provider</th><th>Region</th><th>过期</th><th>profileArn</th><th>Access Token</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
   el.querySelectorAll("button.danger").forEach(b => b.addEventListener("click", () => deleteAccount(b.dataset.id)));
+  el.querySelectorAll("button.ghost").forEach(b => b.addEventListener("click", () => editLabel(b.dataset.edit, b.dataset.label)));
 }
 
 async function loadAccounts() {
@@ -214,6 +219,19 @@ async function deleteAccount(id) {
     if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error((d.error && d.error.message) || ("HTTP " + res.status)); }
     loadAccounts();
   } catch (e) { alert("删除失败: " + e.message); }
+}
+
+async function editLabel(id, current) {
+  if (!id) return;
+  const label = prompt("修改备注：", current || "");
+  if (label === null) return; // cancelled
+  try {
+    const res = await fetch("/api/accounts/label", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, label })
+    });
+    if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error((d.error && d.error.message) || ("HTTP " + res.status)); }
+    loadAccounts();
+  } catch (e) { alert("修改失败: " + e.message); }
 }
 
 async function startLogin() {

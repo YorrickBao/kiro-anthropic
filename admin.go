@@ -35,6 +35,7 @@ func (s *Server) AdminHandler() http.Handler {
 	r.Get("/api/accounts.json", s.handleAccountsList)
 	r.Post("/api/login/start", s.handleLoginStart)
 	r.Post("/api/accounts/delete", s.handleAccountDelete)
+	r.Post("/api/accounts/label", s.handleAccountLabel)
 	r.Post("/api/accounts/import", s.handleAccountImport)
 	r.Get("/oauth/callback", s.handleLoginCallback)
 	return r
@@ -232,6 +233,31 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": acct.ID, "already_present": false})
+}
+
+// handleAccountLabel updates the note (label) of a stored account.
+func (s *Server) handleAccountLabel(w http.ResponseWriter, r *http.Request) {
+	if s.accounts == nil {
+		adminError(w, http.StatusServiceUnavailable, "account store is not configured")
+		return
+	}
+	var body struct {
+		ID    string `json:"id"`
+		Label string `json:"label"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		adminError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if body.ID == "" {
+		adminError(w, http.StatusBadRequest, "id is required")
+		return
+	}
+	if err := s.accounts.UpdateLabel(body.ID, strings.TrimSpace(body.Label)); err != nil {
+		adminError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // handleAccountDelete removes a stored account by id.

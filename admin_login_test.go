@@ -89,6 +89,24 @@ func TestAdminLoginFlowEndToEnd(t *testing.T) {
 	assert.Empty(t, s.accounts.List())
 }
 
+func TestAdminAccountLabelUpdate(t *testing.T) {
+	s, h, _ := newAdminTestServer(t)
+	require.NoError(t, s.accounts.Add(&StoredAccount{ID: "acc1", Label: "old", CreatedAt: "1"}))
+
+	rr := doAdmin(h, http.MethodPost, "/api/accounts/label", `{"id":"acc1","label":"prod team"}`)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	got, _ := s.accounts.Get("acc1")
+	assert.Equal(t, "prod team", got.Label)
+
+	// Unknown id -> 404.
+	miss := doAdmin(h, http.MethodPost, "/api/accounts/label", `{"id":"nope","label":"x"}`)
+	assert.Equal(t, http.StatusNotFound, miss.Code)
+
+	// Missing id -> 400.
+	bad := doAdmin(h, http.MethodPost, "/api/accounts/label", `{"label":"x"}`)
+	assert.Equal(t, http.StatusBadRequest, bad.Code)
+}
+
 func TestAdminCallbackStateMismatch(t *testing.T) {
 	_, h, _ := newAdminTestServer(t)
 	cb := doAdmin(h, http.MethodGet, "/oauth/callback?code=x&state=unknown", "")

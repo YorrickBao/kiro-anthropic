@@ -159,6 +159,19 @@ func (s *AccountStore) Add(a *StoredAccount) error {
 	return s.saveLocked()
 }
 
+// UpdateLabel sets the label (note) of an existing account and persists the
+// store. Returns an error if the id is unknown.
+func (s *AccountStore) UpdateLabel(id, label string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.accounts[id]
+	if !ok {
+		return fmt.Errorf("account %s not found", id)
+	}
+	a.Label = label
+	return s.saveLocked()
+}
+
 // UpdateTokens updates the token fields of an existing account and persists the
 // store. It is a no-op error if the id is unknown. Only token/expiry fields are
 // touched; registration and identity fields are left intact.

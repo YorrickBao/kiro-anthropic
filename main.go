@@ -289,6 +289,10 @@ func runServe(cfg *Config) error {
 	fmt.Printf("  admin     : http://%s  (localhost only)\n", adminAddr)
 	fmt.Printf("  outbound  : %s\n", proxyNote)
 	fmt.Printf("  accounts  : %d in pool (%s)\n", len(accounts.List()), cfg.AccountsFile)
+	if len(accounts.List()) == 0 {
+		fmt.Printf("  ! no accounts available — sign in or import one via the admin page:\n")
+		fmt.Printf("    http://%s\n", adminAddr)
+	}
 	if cfg.APIKey == "" {
 		fmt.Printf("  auth      : open (no api key required; bound to %s)\n", cfg.Host)
 	} else {

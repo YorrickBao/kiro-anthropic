@@ -202,9 +202,17 @@ func (s *Server) handleLoginCallback(w http.ResponseWriter, r *http.Request) {
 		renderCallbackPage(w, false, "Sign-in failed: "+err.Error())
 		return
 	}
-	if err := s.accounts.Add(acct); err != nil {
-		noteError(r.Context(), err.Error())
-		renderCallbackPage(w, false, "Signed in but could not save the account: "+err.Error())
+	// If this AWS account is already stored (e.g. previously imported), refresh
+	// its credentials in place instead of adding a duplicate.
+	saveErr := error(nil)
+	if id, ok := s.accounts.FindDuplicate(*acct); ok {
+		saveErr = s.accounts.ReplaceCredentials(id, acct)
+	} else {
+		saveErr = s.accounts.Add(acct)
+	}
+	if saveErr != nil {
+		noteError(r.Context(), saveErr.Error())
+		renderCallbackPage(w, false, "Signed in but could not save the account: "+saveErr.Error())
 		return
 	}
 	renderCallbackPage(w, true, "Signed in successfully. You can close this window and return to the admin page.")
@@ -224,7 +232,13 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		adminError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if id, ok := s.accounts.FindByRefreshToken(acct.ClientID, acct.RefreshToken); ok {
+	if id, ok := s.accounts.FindDuplicate(*acct); ok {
+		// Same account already stored (possibly added via sign-in): refresh its
+		// credentials in place rather than creating a duplicate.
+		if err := s.accounts.ReplaceCredentials(id, acct); err != nil {
+			adminError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id, "already_present": true})
 		return
 	}

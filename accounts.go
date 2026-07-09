@@ -159,6 +159,36 @@ func (s *AccountStore) Add(a *StoredAccount) error {
 	return s.saveLocked()
 }
 
+// ReplaceCredentials refreshes the credential and identity fields of an existing
+// account from a newly obtained one (same AWS account, new sign-in/import),
+// preserving the existing id, label and creation time. Returns an error if id
+// is unknown.
+func (s *AccountStore) ReplaceCredentials(id string, fresh *StoredAccount) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.accounts[id]
+	if !ok {
+		return fmt.Errorf("account %s not found", id)
+	}
+	a.Provider = fresh.Provider
+	a.AuthMethod = fresh.AuthMethod
+	a.Region = fresh.Region
+	a.StartURL = fresh.StartURL
+	a.ClientID = fresh.ClientID
+	a.ClientSecret = fresh.ClientSecret
+	a.ClientSecretExpiresAt = fresh.ClientSecretExpiresAt
+	a.AccessToken = fresh.AccessToken
+	a.RefreshToken = fresh.RefreshToken
+	a.ExpiresAt = fresh.ExpiresAt
+	if fresh.ProfileArn != "" {
+		a.ProfileArn = fresh.ProfileArn
+	}
+	if fresh.Email != "" {
+		a.Email = fresh.Email
+	}
+	return s.saveLocked()
+}
+
 // UpdateLabel sets the label (note) of an existing account and persists the
 // store. Returns an error if the id is unknown.
 func (s *AccountStore) UpdateLabel(id, label string) error {
@@ -213,17 +243,26 @@ func (s *AccountStore) Remove(id string) error {
 	return s.saveLocked()
 }
 
-// FindByRefreshToken returns the id of an account whose clientId and
-// refreshToken both match, if any. Used to avoid importing a duplicate of a
-// credential the store already holds.
-func (s *AccountStore) FindByRefreshToken(clientID, refreshToken string) (string, bool) {
-	if refreshToken == "" {
-		return "", false
-	}
+// FindDuplicate returns the id of an existing account that represents the same
+// AWS account as the candidate, if any. It matches on stable identity rather
+// than credentials, so the same account added via different paths (sign-in vs
+// import) is recognised as one: a login and an import of the same account get
+// distinct clientId/refreshToken pairs, but share profileArn and email.
+//
+// Precedence: profileArn (most reliable for enterprise) > email > the legacy
+// clientId+refreshToken pair (used only when no identity fields are available).
+func (s *AccountStore) FindDuplicate(candidate StoredAccount) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, a := range s.accounts {
-		if a.RefreshToken == refreshToken && a.ClientID == clientID {
+		switch {
+		case candidate.ProfileArn != "" && a.ProfileArn == candidate.ProfileArn:
+			return a.ID, true
+		case candidate.Email != "" && a.Email == candidate.Email:
+			return a.ID, true
+		case candidate.ProfileArn == "" && candidate.Email == "" &&
+			candidate.RefreshToken != "" &&
+			a.RefreshToken == candidate.RefreshToken && a.ClientID == candidate.ClientID:
 			return a.ID, true
 		}
 	}

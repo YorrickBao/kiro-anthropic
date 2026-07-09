@@ -116,21 +116,59 @@ func TestFetchAccountEmailBestEffort(t *testing.T) {
 	assert.Equal(t, "", fetchAccountEmail(context.Background(), client, "us-east-1", "", "tok"))
 }
 
-func TestFindByRefreshTokenDedup(t *testing.T) {
+func TestFindDuplicate(t *testing.T) {
 	s, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
 	require.NoError(t, err)
-	require.NoError(t, s.Add(&StoredAccount{ID: "a", ClientID: "cid", RefreshToken: "ref", CreatedAt: "1"}))
+	require.NoError(t, s.Add(&StoredAccount{
+		ID: "a", ClientID: "cid", RefreshToken: "ref",
+		ProfileArn: "arn:1", Email: "u@x.com", CreatedAt: "1",
+	}))
 
-	id, ok := s.FindByRefreshToken("cid", "ref")
+	// Same account via a different path (new clientId/refreshToken) but same
+	// profileArn -> duplicate.
+	id, ok := s.FindDuplicate(StoredAccount{ClientID: "other", RefreshToken: "other", ProfileArn: "arn:1"})
 	assert.True(t, ok)
 	assert.Equal(t, "a", id)
 
-	_, ok = s.FindByRefreshToken("cid", "other")
+	// Match by email when profileArn differs/absent.
+	id, ok = s.FindDuplicate(StoredAccount{Email: "u@x.com"})
+	assert.True(t, ok)
+	assert.Equal(t, "a", id)
+
+	// Different account -> no match.
+	_, ok = s.FindDuplicate(StoredAccount{ProfileArn: "arn:2", Email: "other@x.com"})
 	assert.False(t, ok)
-	_, ok = s.FindByRefreshToken("other", "ref")
-	assert.False(t, ok, "clientId must also match")
-	_, ok = s.FindByRefreshToken("cid", "")
-	assert.False(t, ok, "empty refresh token never matches")
+
+	// No identity fields: fall back to clientId+refreshToken.
+	id, ok = s.FindDuplicate(StoredAccount{ClientID: "cid", RefreshToken: "ref"})
+	assert.True(t, ok)
+	assert.Equal(t, "a", id)
+	_, ok = s.FindDuplicate(StoredAccount{ClientID: "cid", RefreshToken: "nope"})
+	assert.False(t, ok)
+}
+
+func TestReplaceCredentials(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	s, err := NewAccountStore(path)
+	require.NoError(t, err)
+	require.NoError(t, s.Add(&StoredAccount{
+		ID: "a", Label: "keep me", ProfileArn: "arn:1",
+		AccessToken: "old", RefreshToken: "oldref", CreatedAt: "1",
+	}))
+
+	err = s.ReplaceCredentials("a", &StoredAccount{
+		AccessToken: "new", RefreshToken: "newref", ClientID: "c2", Email: "e@x.com", ProfileArn: "arn:1",
+	})
+	require.NoError(t, err)
+
+	got, _ := s.Get("a")
+	assert.Equal(t, "keep me", got.Label, "label preserved")
+	assert.Equal(t, "1", got.CreatedAt, "createdAt preserved")
+	assert.Equal(t, "new", got.AccessToken)
+	assert.Equal(t, "newref", got.RefreshToken)
+	assert.Equal(t, "e@x.com", got.Email)
+
+	assert.Error(t, s.ReplaceCredentials("missing", &StoredAccount{}))
 }
 
 func TestAdminImportEndpointAndDedup(t *testing.T) {

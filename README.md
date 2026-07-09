@@ -145,8 +145,8 @@ http://127.0.0.1:27890/health      # 健康检查
 页面展示：
 
 - **账号**：provider、authMethod、区域、profileArn、令牌过期倒计时、账号邮箱、打码后的 access token、出站代理、是否需要 api-key。
-- **多账号登录（企业 IdC）**：填入 Identity Center 的 **Start URL** 与 **Region**（可加备注）即可发起登录，见下节。已登录账号以列表展示（备注 / provider / region / profileArn / 过期状态 / 打码 token），可逐个删除。
-- **额度**：账号订阅级别、剩余 / 已用 / 总额度（credits，带进度条）、重置日期、试用额度（若在生效期）、超额封顶 / 单价 / 状态，以及完整原始 `getUsageLimits` 数据。额度来自与模型列表同源的控制面 `management.<region>.kiro.dev/getUsageLimits`，服务端缓存 60s。
+- **多账号登录（企业 IdC）**：填入 Identity Center 的 **Start URL** 与 **Region**（可加备注）即可发起登录，见下节。已登录账号以列表展示（邮箱 / 备注 / provider / region / profileArn / 过期状态 / 打码 token），可逐个删除。邮箱在登录/导入时经 `getUsageLimits` 解析。
+- **额度**：账号订阅级别、剩余 / 已用 / 总额度（credits，带进度条）、重置日期、试用额度（若在生效期）、超额封顶 / 单价 / 状态。额度来自与模型列表同源的控制面 `management.<region>.kiro.dev/getUsageLimits`，服务端缓存 60s。
 - **模型**：账号可用模型的 ID、名称、最大输入 / 输出 tokens、effort 档位（与 `/v1/models` 同源）。
 
 安全说明：

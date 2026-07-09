@@ -154,9 +154,6 @@ function renderUsage(u) {
     if (extra.length) html += `<dl class="kv">${extra.join("")}</dl>`;
   }
 
-  if (u.raw) {
-    html += `<details><summary>完整原始数据 (getUsageLimits)</summary><pre>${esc(JSON.stringify(u.raw, null, 2))}</pre></details>`;
-  }
   el.innerHTML = html;
 }
 
@@ -184,6 +181,7 @@ function renderAccounts(accounts) {
   const el = $("accounts-list");
   if (!accounts || !accounts.length) { el.innerHTML = '<span class="muted">尚无已登录账号。</span>'; return; }
   const rows = accounts.map(a => `<tr>
+    <td>${esc(a.email || "—")}</td>
     <td>${esc(a.label || "—")}</td>
     <td>${esc(a.provider || "—")}</td>
     <td>${esc(a.region || "—")}</td>
@@ -192,7 +190,7 @@ function renderAccounts(accounts) {
     <td><code>${esc(a.access_token || "—")}</code></td>
     <td><button class="danger" data-id="${esc(a.id)}" type="button">删除</button></td>
   </tr>`).join("");
-  el.innerHTML = `<table><thead><tr><th>备注</th><th>Provider</th><th>Region</th><th>过期</th><th>profileArn</th><th>Access Token</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+  el.innerHTML = `<table><thead><tr><th>邮箱</th><th>备注</th><th>Provider</th><th>Region</th><th>过期</th><th>profileArn</th><th>Access Token</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
   el.querySelectorAll("button.danger").forEach(b => b.addEventListener("click", () => deleteAccount(b.dataset.id)));
 }
 

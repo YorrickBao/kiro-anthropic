@@ -111,14 +111,14 @@ curl --noproxy '*' http://127.0.0.1:17890/v1/messages \
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `--host` | `127.0.0.1` | 监听地址 |
+| `--host` | `127.0.0.1` | 监听地址。**绑非回环地址（如 `0.0.0.0`）时必须同时设 `--api-key`，否则拒绝启动**（避免账号池裸奔到公网） |
 | `--port` | `17890` | 监听端口（被占用时自动 +1 重试） |
 | `--admin-port` | `27890` | 管理页端口，**仅限本机访问**（被占用时自动 +1 重试） |
 | `--proxy` | `http://127.0.0.1:7890` | 出站代理；优先级：本参数 > `http(s)_proxy` 环境变量 > 内置默认；`none` 表示直连 |
 | `--token-file` | `~/.aws/sso/cache/kiro-auth-token.json` | 启动自动导入的来源：Kiro 桌面端令牌文件路径（也是管理页「导入本机凭据」按钮读取的路径） |
 | `--accounts-file` | `~/.kiro-anthropic/accounts.json` | 账号池凭据的持久化存储路径 |
 | `--no-import-local` | `false` | 加此参数则启动时**不**自动导入本地 `--token-file` 凭据；默认（不加）会自动导入到账号池 |
-| `--api-key` | 空（开放） | 设置后客户端须用 `x-api-key` 或 `Authorization: Bearer` 携带 |
+| `--api-key` | 空（开放） | 设置后客户端须用 `x-api-key` 或 `Authorization: Bearer` 携带。绑非回环 `--host` 时为**必填** |
 | `--agent-mode` | `vibe` | Kiro agent 模式 |
 | `--log` | `false` | 开启请求访问日志（输出到 stdout/当前窗口）；默认关闭 |
 | `--log-file` | 空 | 把访问日志写到指定文件（隐含 `--log`）；特殊值 `stdout`/`stderr`/`none` |
@@ -189,6 +189,65 @@ http://127.0.0.1:27890/health      # 健康检查
 - `KIRO_DEBUG_STREAM=1`：把 Kiro 返回的每一帧事件（`:event-type` 与原始 payload）打到 stderr，便于排查思考/工具流。
 
 ---
+
+## 服务器部署（EC2 等）
+
+在公网服务器（如 AWS EC2）上常驻运行，核心原则：**API 默认只绑回环，admin 页永远只绑回环且无鉴权**。别把这两个端口直接暴露到公网。
+
+### 安全模型（务必先读）
+
+- 管理页（`--admin-port`，默认 27890）**始终绑 `127.0.0.1`**，且按真实 TCP 对端 IP 拒绝非回环访问，无鉴权。服务器上只能通过 SSH 隧道访问。
+- API（`--port`，默认 17890）默认绑 `127.0.0.1`。若为远程访问改绑非回环地址（如 `0.0.0.0`），**必须同时设 `--api-key`，否则服务拒绝启动**——否则等于把账号池额度送给全网。
+
+### 方案 A：全回环 + SSH 隧道（自用，最安全）
+
+服务用默认配置（全绑 127.0.0.1），安全组只放 22 端口：
+
+```bash
+# 服务器上（推荐用下面的一键脚本或 systemd 常驻）
+kiro-anthropic serve --proxy none
+
+# 工作站上：转发 API 与 admin 两个端口
+ssh -L 17890:localhost:17890 -L 27890:localhost:27890 <user>@<server>
+# 然后本地浏览器开 http://localhost:27890 登录/管理；客户端指向 http://localhost:17890
+```
+
+首次登录也走这条隧道：在本地浏览器完成 IdC 授权，回跳地址是 `localhost:27890`，隧道保证回调落到服务器同一进程。
+
+### 方案 B：API 对可信来源开放 + 强制 api-key（团队共享）
+
+```bash
+kiro-anthropic serve --host 0.0.0.0 --api-key "$(openssl rand -hex 32)" --proxy none
+```
+
+- 安全组**只放 17890 给可信来源 IP**，绝不 `0.0.0.0/0`；建议前置 TLS 反代（Caddy/Nginx）。
+- admin（27890）仍只走 SSH 隧道，绝不对外。
+- 客户端携带 `x-api-key: <key>` 或 `Authorization: Bearer <key>`。
+
+### 一键安装脚本（Linux + systemd）
+
+`install.sh` 会下载最新 release、校验 SHA-256、装到 `/usr/local/bin`、创建专用系统用户、写入并启动 systemd unit（默认绑回环）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/YorrickBao/kiro-anthropic/main/install.sh -o install.sh
+sudo bash install.sh                      # 默认 127.0.0.1，配合 SSH 隧道
+sudo bash install.sh --host 0.0.0.0 --api-key <key>   # 对外开放（强制 key）
+sudo bash install.sh --uninstall          # 卸载
+```
+
+脚本涉及的文件/目录（便于审计与清理）：
+
+| 路径 | 用途 |
+|---|---|
+| `/usr/local/bin/kiro-anthropic` | 二进制 |
+| `/etc/systemd/system/kiro-anthropic.service` | systemd unit |
+| 系统用户/组 `kiro` | 运行服务的非特权账户 |
+| `/var/lib/kiro-anthropic/` | 服务 HOME |
+| `/var/lib/kiro-anthropic/.kiro-anthropic/accounts.json` | 账号池（含长期凭据） |
+
+`--uninstall` 会停服并删除 unit 与二进制，但**保留** `/var/lib/kiro-anthropic`（含凭据）；脚本结尾会打印彻底清除（`userdel` + `rm -rf`）的命令。
+
+更详细的运维指南（日志、升级、故障排查、手写 systemd unit）见[服务器部署指南](https://github.com/YorrickBao/kiro-anthropic/wiki/Server-Deployment)（源文档：[`docs/wiki/Server-Deployment.md`](docs/wiki/Server-Deployment.md)）。
 
 ## 升级
 
@@ -341,6 +400,7 @@ refresher.go     后台定期刷新账号池令牌
 listen.go        监听辅助：端口被占用时自动 +1 重试
 upgrade.go       从 GitHub Release 自更新（minio/selfupdate + semver）
 build.sh         跨平台构建脚本
+install.sh       Linux/systemd 一键安装脚本（下载 release + 建服务）
 ```
 
 ---

@@ -51,8 +51,16 @@ func (c *accountCreds) profileArn(ctx context.Context) (string, error) {
 		return c.acct.ProfileArn, nil
 	}
 	// Resolve best-effort onto this request's account copy (accounts normally
-	// already carry a ProfileArn, so this is a rare fallback path).
-	arn, err := resolveProfileArn(ctx, c.client, c.apiRegion(), c.acct.AccessToken)
+	// already carry a ProfileArn, so this is a rare fallback path). Use a fresh
+	// token via accessToken() rather than the possibly-stale stored one, so an
+	// account with an empty profileArn but a valid refreshToken self-heals
+	// instead of failing ListAvailableProfiles with a 401. (accessToken() does
+	// not call profileArn(), so there is no recursion.)
+	tok, err := c.accessToken(ctx)
+	if err != nil {
+		return "", fmt.Errorf("resolve profileArn for account %s: %w", c.id, err)
+	}
+	arn, err := resolveProfileArn(ctx, c.client, c.apiRegion(), tok)
 	if err != nil {
 		return "", fmt.Errorf("resolve profileArn for account %s: %w", c.id, err)
 	}
@@ -134,6 +142,9 @@ func (s *accountSelector) pick(tried map[string]bool) (*accountCreds, bool) {
 		if tried[a.ID] {
 			continue
 		}
+		if !accountUsable(a) {
+			continue // dead account: no profileArn and no way to obtain one
+		}
 		if until, ok := s.cooldown[a.ID]; ok && now.Before(until) {
 			// Track the candidate whose cooldown ends soonest as a fallback.
 			if soonest == nil || until.Before(soonestAt) {
@@ -158,6 +169,18 @@ func (s *accountSelector) credsFor(a StoredAccount) *accountCreds {
 	return &accountCreds{store: s.store, client: s.client, id: a.ID, acct: a}
 }
 
+// accountUsable reports whether an account can serve a request at all: it must
+// either already carry a profileArn, or hold a full client registration plus
+// refresh token so accessToken()/profileArn() can refresh and resolve one. An
+// account with neither (e.g. an import whose profileArn lookup failed and that
+// lacks credentials to recover) is dead weight and is skipped during selection.
+func accountUsable(a StoredAccount) bool {
+	if a.ProfileArn != "" {
+		return true
+	}
+	return a.RefreshToken != "" && a.ClientID != "" && a.ClientSecret != ""
+}
+
 // pruneCooldownLocked drops cooldown entries for accounts no longer in the
 // store, so removed accounts do not leak entries. Caller must hold s.mu.
 func (s *accountSelector) pruneCooldownLocked(list []StoredAccount) {
@@ -179,8 +202,8 @@ func (s *accountSelector) pruneCooldownLocked(list []StoredAccount) {
 // (model schema lookup) that is not tied to a specific request. Unlike pick it
 // does NOT advance the round-robin cursor, so schema lookups do not perturb
 // request dispatch fairness (which matters especially with few accounts). It
-// prefers an account not in cooldown, falling back to the first stored account.
-// ok is false only when the store is empty.
+// skips unusable accounts and prefers one not in cooldown, falling back to the
+// first usable account. ok is false when no usable account exists.
 func (s *accountSelector) peekAny() (*accountCreds, bool) {
 	list := s.store.List()
 	if len(list) == 0 {
@@ -189,14 +212,26 @@ func (s *accountSelector) peekAny() (*accountCreds, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
-	for _, a := range list {
+	var firstUsable *StoredAccount
+	for i := range list {
+		a := list[i]
+		if !accountUsable(a) {
+			continue
+		}
+		if firstUsable == nil {
+			firstUsable = &list[i]
+		}
 		if until, ok := s.cooldown[a.ID]; ok && now.Before(until) {
 			continue
 		}
 		return s.credsFor(a), true
 	}
-	// All cooling down: any account will do for a (cached) schema lookup.
-	return s.credsFor(list[0]), true
+	// All usable accounts are cooling down: any of them serves a (cached)
+	// schema lookup. If none are usable at all, report no account.
+	if firstUsable != nil {
+		return s.credsFor(*firstUsable), true
+	}
+	return nil, false
 }
 
 // listAll returns credentials for every stored account, for per-account

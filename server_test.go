@@ -21,7 +21,7 @@ func testServerWithModels() *Server {
 	if err != nil {
 		panic(err)
 	}
-	_ = store.Add(&StoredAccount{ID: "acc", Region: "us-east-1", CreatedAt: "1"})
+	_ = store.Add(&StoredAccount{ID: "acc", Region: "us-east-1", ProfileArn: "arn:test", CreatedAt: "1"})
 	s := &Server{
 		cfg:         &Config{},
 		selector:    newAccountSelector(store, &http.Client{}),

@@ -136,6 +136,49 @@ func TestSelectorCooldownPrunedForRemovedAccount(t *testing.T) {
 	assert.False(t, aStale, "cooldown entry for a removed account must be pruned")
 }
 
+func TestSelectorSkipsUnusableAccount(t *testing.T) {
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	// "dead": no profileArn and no credentials to obtain one -> unusable.
+	require.NoError(t, store.Add(&StoredAccount{ID: "dead", CreatedAt: "0"}))
+	// "good": has a refresh token + client registration -> usable.
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "good", ClientID: "c", ClientSecret: "s", RefreshToken: "r", CreatedAt: "1",
+	}))
+	s := newAccountSelector(store, &http.Client{})
+
+	for i := 0; i < 5; i++ {
+		creds, ok := s.pick(map[string]bool{})
+		require.True(t, ok)
+		assert.Equal(t, "good", creds.id, "unusable account must never be selected")
+		s.recordSuccess(creds.id)
+	}
+
+	// An account carrying only a profileArn (no creds) is still usable.
+	require.NoError(t, store.Add(&StoredAccount{ID: "arn-only", ProfileArn: "arn:x", CreatedAt: "2"}))
+	seen := map[string]bool{}
+	for i := 0; i < 6; i++ {
+		creds, _ := s.pick(map[string]bool{})
+		seen[creds.id] = true
+		s.recordSuccess(creds.id)
+	}
+	assert.True(t, seen["arn-only"], "profileArn-only account is usable")
+	assert.False(t, seen["dead"], "dead account still skipped")
+}
+
+func TestSelectorAllUnusableReturnsFalse(t *testing.T) {
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, store.Add(&StoredAccount{ID: "d1", CreatedAt: "0"}))
+	require.NoError(t, store.Add(&StoredAccount{ID: "d2", RefreshToken: "r", CreatedAt: "1"})) // missing clientId/secret
+	s := newAccountSelector(store, &http.Client{})
+
+	_, ok := s.pick(map[string]bool{})
+	assert.False(t, ok, "no usable account -> pick fails (maps to 503)")
+	_, ok = s.peekAny()
+	assert.False(t, ok, "no usable account -> peekAny fails")
+}
+
 func TestSelectorConcurrentPick(t *testing.T) {
 	s := newTestSelector(t, "a", "b", "c", "d")
 	var wg sync.WaitGroup

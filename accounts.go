@@ -292,8 +292,13 @@ func (s *AccountStore) Remove(id string) error {
 // import) is recognised as one: a login and an import of the same account get
 // distinct clientId/refreshToken pairs, but share profileArn and email.
 //
-// Precedence: profileArn (most reliable for enterprise) > email > the legacy
-// clientId+refreshToken pair (used only when no identity fields are available).
+// Precedence: profileArn (most reliable for enterprise) > email > clientId
+// (used only when no identity fields are available). The clientId fallback
+// matches on the OIDC client registration alone, not refreshToken: a single
+// machine re-imports the same account across restarts, but the refreshToken
+// rotates on every refresh, so matching refreshToken would miss the duplicate.
+// Different machines register distinct clients and fall through to no match,
+// which is correct — cross-machine dedup relies on profileArn/email.
 func (s *AccountStore) FindDuplicate(candidate StoredAccount) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -304,8 +309,7 @@ func (s *AccountStore) FindDuplicate(candidate StoredAccount) (string, bool) {
 		case candidate.Email != "" && a.Email == candidate.Email:
 			return a.ID, true
 		case candidate.ProfileArn == "" && candidate.Email == "" &&
-			candidate.RefreshToken != "" &&
-			a.RefreshToken == candidate.RefreshToken && a.ClientID == candidate.ClientID:
+			candidate.ClientID != "" && a.ClientID == candidate.ClientID:
 			return a.ID, true
 		}
 	}

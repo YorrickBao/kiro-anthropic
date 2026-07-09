@@ -139,12 +139,33 @@ func TestFindDuplicate(t *testing.T) {
 	_, ok = s.FindDuplicate(StoredAccount{ProfileArn: "arn:2", Email: "other@x.com"})
 	assert.False(t, ok)
 
-	// No identity fields: fall back to clientId+refreshToken.
+	// No identity fields on the candidate: fall back to clientId alone. The
+	// refreshToken rotates across re-imports, so it must NOT be part of the key.
 	id, ok = s.FindDuplicate(StoredAccount{ClientID: "cid", RefreshToken: "ref"})
 	assert.True(t, ok)
 	assert.Equal(t, "a", id)
-	_, ok = s.FindDuplicate(StoredAccount{ClientID: "cid", RefreshToken: "nope"})
+	id, ok = s.FindDuplicate(StoredAccount{ClientID: "cid", RefreshToken: "rotated-different"})
+	assert.True(t, ok, "same clientId, rotated refreshToken -> still a duplicate")
+	assert.Equal(t, "a", id)
+	// Different clientId (e.g. another machine) -> no match via this fallback.
+	_, ok = s.FindDuplicate(StoredAccount{ClientID: "other-cid", RefreshToken: "ref"})
 	assert.False(t, ok)
+}
+
+func TestFindDuplicateByClientIDWhenProfileArnEmpty(t *testing.T) {
+	// Reproduces the bug: an import whose profileArn/email lookup failed (e.g.
+	// --proxy none) stores neither, and its refreshToken rotates between
+	// restarts. Dedup must still recognise it by clientId alone.
+	s, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, s.Add(&StoredAccount{
+		ID: "first", ClientID: "C1", ClientSecret: "s", RefreshToken: "OLD",
+		CreatedAt: "1",
+	}))
+
+	id, ok := s.FindDuplicate(StoredAccount{ClientID: "C1", ClientSecret: "s", RefreshToken: "NEW"})
+	assert.True(t, ok, "same machine re-import must dedup despite rotated refreshToken")
+	assert.Equal(t, "first", id)
 }
 
 func TestReplaceCredentials(t *testing.T) {

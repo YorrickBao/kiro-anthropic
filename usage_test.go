@@ -41,8 +41,8 @@ func TestParseKiroUsage(t *testing.T) {
 	if u.SubscriptionTitle != "KIRO PRO+" {
 		t.Errorf("subscription title = %q", u.SubscriptionTitle)
 	}
-	if u.SubscriptionType != "Q_DEVELOPER_STANDALONE_PRO_PLUS" {
-		t.Errorf("subscription type = %q", u.SubscriptionType)
+	if u.SubscriptionType != "Pro+" {
+		t.Errorf("subscription type = %q (want friendly Pro+)", u.SubscriptionType)
 	}
 	if u.Email != "user@example.com" {
 		t.Errorf("email = %q", u.Email)
@@ -66,7 +66,7 @@ func TestParseKiroUsage(t *testing.T) {
 	if got := c.Remaining; got < 115.72 || got > 115.74 {
 		t.Errorf("remaining = %v, want ~115.73", got)
 	}
-	if c.Unit != "INVOCATIONS" || c.Currency != "USD" {
+	if c.Unit != "次调用" || c.Currency != "USD" {
 		t.Errorf("unit/currency = %q/%q", c.Unit, c.Currency)
 	}
 	if len(u.Raw) == 0 {
@@ -102,5 +102,37 @@ func TestParseKiroUsageFreeTrialMerged(t *testing.T) {
 	// Base 50 + trial 100 = 150 limit; base 10 + trial 5 = 15 used.
 	if c.Limit != 150 || c.Used != 15 || c.Remaining != 135 {
 		t.Errorf("merged totals: used=%v limit=%v remaining=%v; want 15/150/135", c.Used, c.Limit, c.Remaining)
+	}
+}
+
+func TestFriendlySubscriptionType(t *testing.T) {
+	cases := map[string]string{
+		"Q_DEVELOPER_STANDALONE_PRO_PLUS": "Pro+",
+		"Q_DEVELOPER_STANDALONE_PRO":      "Pro",
+		"Q_DEVELOPER_STANDALONE_FREE":     "Free",
+		"Q_DEVELOPER_POWER":               "Power",
+		"ENTERPRISE":                      "Enterprise",
+		"":                                "",
+		"SOME_NEW_TIER":                   "Some New Tier", // fallback
+	}
+	for in, want := range cases {
+		if got := friendlySubscriptionType(in); got != want {
+			t.Errorf("friendlySubscriptionType(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestFriendlyUnit(t *testing.T) {
+	cases := map[string]string{
+		"INVOCATIONS": "次调用",
+		"CREDIT":      "credits",
+		"TOKENS":      "tokens",
+		"":            "",
+		"WEIRD_UNIT":  "Weird Unit", // fallback
+	}
+	for in, want := range cases {
+		if got := friendlyUnit(in); got != want {
+			t.Errorf("friendlyUnit(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

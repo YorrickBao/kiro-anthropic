@@ -142,7 +142,7 @@ function usageHtml(u) {
   if (u.error) return `<div class="err-box" style="font-size:12px">额度获取失败: ${esc(u.error)}</div>`;
   let html = "";
   if (u.subscription_title || u.subscription_type)
-    html += `<div style="margin:8px 0"><span class="pill ok">${esc(u.subscription_title || "")}</span> <span class="muted">${esc(u.subscription_type || "")}</span></div>`;
+    html += `<div style="margin:8px 0"><span class="pill ok">${esc(u.subscription_title || u.subscription_type)}</span></div>`;
   const c = u.credit;
   if (c) {
     const pct = c.limit > 0 ? Math.min(100, (c.used / c.limit) * 100) : 0;

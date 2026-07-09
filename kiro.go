@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -602,6 +603,62 @@ type usageLimitsWire struct {
 	} `json:"usageBreakdownList"`
 }
 
+// friendlySubscriptionType turns a raw subscription enum such as
+// "Q_DEVELOPER_STANDALONE_PRO_PLUS" into a human label like "Pro+". Unknown
+// values fall back to a title-cased form of the tier suffix.
+func friendlySubscriptionType(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	s := strings.ToUpper(strings.TrimSpace(raw))
+	// Drop the common product prefixes, leaving the tier (FREE / PRO / PRO_PLUS / POWER).
+	for _, p := range []string{"Q_DEVELOPER_STANDALONE_", "Q_DEVELOPER_", "QDEVELOPER_"} {
+		s = strings.TrimPrefix(s, p)
+	}
+	switch s {
+	case "FREE":
+		return "Free"
+	case "PRO":
+		return "Pro"
+	case "PRO_PLUS", "PROPLUS":
+		return "Pro+"
+	case "POWER":
+		return "Power"
+	case "ENTERPRISE":
+		return "Enterprise"
+	}
+	// Fallback: "SOME_TIER" -> "Some Tier".
+	return titleCaseWords(strings.ReplaceAll(s, "_", " "))
+}
+
+// friendlyUnit turns a raw usage unit enum into a readable label.
+func friendlyUnit(raw string) string {
+	switch strings.ToUpper(strings.TrimSpace(raw)) {
+	case "":
+		return ""
+	case "INVOCATIONS", "INVOCATION":
+		return "次调用"
+	case "CREDIT", "CREDITS":
+		return "credits"
+	case "TOKENS", "TOKEN":
+		return "tokens"
+	default:
+		return titleCaseWords(strings.ToLower(strings.ReplaceAll(raw, "_", " ")))
+	}
+}
+
+// titleCaseWords upper-cases the first letter of each space-separated word.
+func titleCaseWords(s string) string {
+	parts := strings.Fields(s)
+	for i, p := range parts {
+		if p == "" {
+			continue
+		}
+		parts[i] = strings.ToUpper(p[:1]) + strings.ToLower(p[1:])
+	}
+	return strings.Join(parts, " ")
+}
+
 // pick returns the precise value when present, else the integer fallback.
 func pick(precise, fallback float64) float64 {
 	if precise != 0 {
@@ -621,7 +678,7 @@ func parseKiroUsage(raw []byte) (*kiroUsage, error) {
 
 	u := &kiroUsage{
 		SubscriptionTitle: w.SubscriptionInfo.SubscriptionTitle,
-		SubscriptionType:  w.SubscriptionInfo.Type,
+		SubscriptionType:  friendlySubscriptionType(w.SubscriptionInfo.Type),
 		Email:             w.UserInfo.Email,
 		UserID:            w.UserInfo.UserID,
 		NextDateReset:     w.NextDateReset,
@@ -638,7 +695,7 @@ func parseKiroUsage(raw []byte) (*kiroUsage, error) {
 		}
 		c := &kiroCreditUsage{
 			DisplayName: b.DisplayName,
-			Unit:        b.Unit,
+			Unit:        friendlyUnit(b.Unit),
 			Currency:    b.Currency,
 			Used:        pick(b.CurrentUsageWithPrecision, b.CurrentUsage),
 			Limit:       pick(b.UsageLimitWithPrecision, b.UsageLimit),

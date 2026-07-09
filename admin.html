@@ -291,7 +291,9 @@ async function tick() {
     const res = await fetch("/api/status.json", { cache: "no-store" });
     if (!res.ok) throw new Error("HTTP " + res.status);
     const d = await res.json();
-    $("ver").textContent = d.version ? "v" + d.version : "";
+    $("ver").textContent = d.version
+      ? (d.version.startsWith("v") ? d.version : "v" + d.version)
+      : "";
     latestModels = d.models || [];
     renderAccounts(d.accounts);
     $("updated").textContent = "更新于 " + new Date().toLocaleTimeString();

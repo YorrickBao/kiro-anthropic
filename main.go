@@ -143,6 +143,21 @@ func newVersionCmd() *cobra.Command {
 //	--proxy flag  >  http(s)_proxy env  >  built-in default (defaultProxyURL)
 //
 // The special values none/off/direct disable proxying (direct connection).
+// validateBindSecurity rejects an insecure exposure: binding the API to a
+// non-loopback address without an api-key would serve the Anthropic endpoint,
+// and thus the account pool quota, to anyone who can reach the port. A loopback
+// bind (the default 127.0.0.1) is unaffected. The admin port is always
+// loopback-only and is not considered here.
+func validateBindSecurity(cfg *Config) error {
+	if isLoopbackHost(cfg.Host) {
+		return nil
+	}
+	if strings.TrimSpace(cfg.APIKey) == "" {
+		return fmt.Errorf("--host %q is non-loopback; --api-key is required to avoid exposing the account pool to the network (keep the default 127.0.0.1 and use an SSH tunnel, or set --api-key)", cfg.Host)
+	}
+	return nil
+}
+
 func configureProxy(cfg *Config) error {
 	switch strings.ToLower(strings.TrimSpace(cfg.ProxyURL)) {
 	case "none", "off", "direct", "false", "no":
@@ -202,6 +217,10 @@ func setupRequestLog(enable bool, file string) (*slog.Logger, func(), string, er
 
 func runServe(cfg *Config) error {
 	if err := configureProxy(cfg); err != nil {
+		return err
+	}
+
+	if err := validateBindSecurity(cfg); err != nil {
 		return err
 	}
 

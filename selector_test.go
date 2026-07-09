@@ -37,6 +37,28 @@ func TestSelectorRoundRobin(t *testing.T) {
 	assert.Equal(t, []string{"a", "b", "c", "a", "b", "c"}, got)
 }
 
+func TestSelectorPeekAnyDoesNotAdvance(t *testing.T) {
+	s := newTestSelector(t, "a", "b")
+
+	// Repeated peeks must not move the cursor...
+	for i := 0; i < 5; i++ {
+		creds, ok := s.peekAny()
+		require.True(t, ok)
+		assert.Equal(t, "a", creds.id, "peek is stable and non-advancing")
+	}
+	// ...so the next pick still returns the head, then rotation proceeds.
+	c1, _ := s.pick(map[string]bool{})
+	c2, _ := s.pick(map[string]bool{})
+	assert.Equal(t, "a", c1.id)
+	assert.Equal(t, "b", c2.id)
+}
+
+func TestSelectorPeekAnyEmpty(t *testing.T) {
+	s := newTestSelector(t)
+	_, ok := s.peekAny()
+	assert.False(t, ok)
+}
+
 func TestSelectorEmpty(t *testing.T) {
 	s := newTestSelector(t)
 	_, ok := s.pick(map[string]bool{})

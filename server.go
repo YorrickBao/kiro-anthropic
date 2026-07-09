@@ -265,7 +265,7 @@ func (s *Server) anyModels(ctx context.Context) []kiroModelInfo {
 	if s.selector == nil {
 		return nil
 	}
-	creds, ok := s.selector.pickAny()
+	creds, ok := s.selector.peekAny()
 	if !ok {
 		return nil
 	}

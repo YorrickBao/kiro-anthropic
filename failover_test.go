@@ -95,6 +95,25 @@ func TestOpenStreamAllAccountsFail(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, he.Status)
 }
 
+// TestDispatchFairnessTwoAccounts verifies that with 2 healthy accounts,
+// consecutive dispatches alternate evenly (round-robin actually rotates).
+func TestDispatchFairnessTwoAccounts(t *testing.T) {
+	rt := newFakeRuntime(t) // both accounts healthy
+	s := serverWithPool(t, rt, "a", "b")
+
+	for i := 0; i < 6; i++ {
+		stream, err := s.openStream(context.Background(), &kiroRequest{})
+		require.NoError(t, err)
+		stream.Close()
+	}
+	served := map[string]int{}
+	for _, tok := range rt.seen {
+		served[tok]++
+	}
+	assert.Equal(t, 3, served["Bearer a"], "got %v", served)
+	assert.Equal(t, 3, served["Bearer b"], "got %v", served)
+}
+
 func TestOpenStreamEmptyPool(t *testing.T) {
 	rt := newFakeRuntime(t)
 	s := serverWithPool(t, rt) // no accounts

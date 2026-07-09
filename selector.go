@@ -161,11 +161,28 @@ func (s *accountSelector) credsFor(a StoredAccount) *accountCreds {
 	return &accountCreds{store: s.store, client: s.client, id: a.ID, acct: a}
 }
 
-// pickAny returns credentials for one eligible account for a control-plane call
-// (models/usage) that is not tied to a specific request. It advances the
-// round-robin cursor like pick. ok is false when the store is empty.
-func (s *accountSelector) pickAny() (*accountCreds, bool) {
-	return s.pick(map[string]bool{})
+// peekAny returns credentials for one eligible account for a control-plane call
+// (model schema lookup) that is not tied to a specific request. Unlike pick it
+// does NOT advance the round-robin cursor, so schema lookups do not perturb
+// request dispatch fairness (which matters especially with few accounts). It
+// prefers an account not in cooldown, falling back to the first stored account.
+// ok is false only when the store is empty.
+func (s *accountSelector) peekAny() (*accountCreds, bool) {
+	list := s.store.List()
+	if len(list) == 0 {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for _, a := range list {
+		if until, ok := s.cooldown[a.ID]; ok && now.Before(until) {
+			continue
+		}
+		return s.credsFor(a), true
+	}
+	// All cooling down: any account will do for a (cached) schema lookup.
+	return s.credsFor(list[0]), true
 }
 
 // listAll returns credentials for every stored account, for per-account

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,45 +17,61 @@ import (
 	"github.com/google/uuid"
 )
 
-// Server wires the Anthropic-facing HTTP API to the Kiro backend.
+// Server wires the Anthropic-facing HTTP API to the Kiro backend. All requests
+// and control-plane calls are served from the multi-account store; there is no
+// single primary account.
 type Server struct {
 	cfg      *Config
-	store    *TokenStore
 	kiro     *KiroClient
-	accounts *AccountStore    // multi-account credential store (admin sign-in)
+	accounts *AccountStore    // multi-account credential store (the only account source)
 	login    *loginManager    // IdC sign-in flow driver
 	selector *accountSelector // round-robin picker over the account store
 	logger   *slog.Logger     // per-request access log; nil disables it
 
 	modelsMu    sync.Mutex
-	modelsCache []kiroModelInfo
+	modelsCache map[string]modelsCacheEntry // per-account model list cache
 
-	usageMu      sync.Mutex
-	usageCache   *kiroUsage
-	usageFetched time.Time
+	usageMu    sync.Mutex
+	usageCache map[string]usageCacheEntry // per-account usage cache
+}
+
+// modelsCacheEntry caches one account's model list.
+type modelsCacheEntry struct {
+	models  []kiroModelInfo
+	fetched time.Time
+}
+
+// usageCacheEntry caches one account's usage.
+type usageCacheEntry struct {
+	usage   *kiroUsage
+	fetched time.Time
 }
 
 // usageCacheTTL is how long a GetUsageLimits result is reused before refetching,
 // so the auto-refreshing admin page does not hammer the control plane.
 const usageCacheTTL = 60 * time.Second
 
-// fallbackModels is used for /v1/models if the live ListAvailableModels call fails.
+// modelsCacheTTL is how long a per-account model list is reused.
+const modelsCacheTTL = 5 * time.Minute
+
+// fallbackModels is used for /v1/models when no account can list live models.
 var fallbackModels = []string{
 	"auto", "claude-sonnet-5", "claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6",
 	"claude-sonnet-4.6", "claude-opus-4.5", "claude-sonnet-4.5", "claude-sonnet-4", "claude-haiku-4.5",
 }
 
-func NewServer(cfg *Config, store *TokenStore, client *http.Client) *Server {
+func NewServer(cfg *Config, client *http.Client) *Server {
 	return &Server{
-		cfg:   cfg,
-		store: store,
-		kiro:  NewKiroClient(cfg, store, client),
-		login: newLoginManager(client),
+		cfg:         cfg,
+		kiro:        NewKiroClient(cfg, client),
+		login:       newLoginManager(client),
+		modelsCache: map[string]modelsCacheEntry{},
+		usageCache:  map[string]usageCacheEntry{},
 	}
 }
 
 // setAccounts attaches the multi-account store and builds the round-robin
-// selector used to dispatch /v1/messages across stored accounts.
+// selector used to dispatch requests and control-plane calls across accounts.
 func (s *Server) setAccounts(accounts *AccountStore, client *http.Client) {
 	s.accounts = accounts
 	s.selector = newAccountSelector(accounts, client)
@@ -164,12 +181,13 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC().Format(time.RFC3339)
 
 	data := make([]map[string]any, 0)
-	if models := s.ensureModels(r.Context()); len(models) > 0 {
+	if models := s.anyModels(r.Context()); len(models) > 0 {
 		for _, m := range models {
 			data = append(data, modelInfoJSON(m, now))
 		}
 	} else {
-		// Fallback when the control plane is unreachable: ids only.
+		// Fallback when no account can list models (empty pool or control plane
+		// unreachable): ids only.
 		for _, id := range fallbackModels {
 			data = append(data, map[string]any{
 				"type": "model", "id": id, "display_name": id, "created_at": now,
@@ -220,68 +238,65 @@ func modelInfoJSON(m kiroModelInfo, now string) map[string]any {
 	return info
 }
 
-// ensureModels fetches the account's models once and caches them.
-func (s *Server) ensureModels(ctx context.Context) []kiroModelInfo {
+// ensureModels fetches one account's model list, caching it per-account for
+// modelsCacheTTL. A failed fetch is not cached (it retries next call).
+func (s *Server) ensureModels(ctx context.Context, creds *accountCreds) []kiroModelInfo {
 	s.modelsMu.Lock()
-	cached := s.modelsCache
+	if e, ok := s.modelsCache[creds.id]; ok && time.Since(e.fetched) < modelsCacheTTL {
+		s.modelsMu.Unlock()
+		return e.models
+	}
 	s.modelsMu.Unlock()
-	if cached != nil {
-		return cached
-	}
-	models, err := s.kiro.ListModels(ctx)
+
+	models, err := s.kiro.ListModels(ctx, creds)
 	if err != nil || len(models) == 0 {
-		return nil // don't cache a failure; retry next time
+		return nil
 	}
 	s.modelsMu.Lock()
-	s.modelsCache = models
+	s.modelsCache[creds.id] = modelsCacheEntry{models: models, fetched: time.Now()}
 	s.modelsMu.Unlock()
 	return models
 }
 
-// ensureUsage returns the account usage, fetching it at most once per
-// usageCacheTTL. A failed fetch is not cached (it retries next call) and is
-// surfaced to the caller.
-func (s *Server) ensureUsage(ctx context.Context) (*kiroUsage, error) {
+// anyModels returns the model list from any one account (model schemas are the
+// same across accounts on the same backend). Returns nil when the pool is empty
+// or no account can list models.
+func (s *Server) anyModels(ctx context.Context) []kiroModelInfo {
+	if s.selector == nil {
+		return nil
+	}
+	creds, ok := s.selector.pickAny()
+	if !ok {
+		return nil
+	}
+	return s.ensureModels(ctx, creds)
+}
+
+// ensureUsage returns one account's usage, fetching it at most once per
+// usageCacheTTL. A failed fetch is not cached and is surfaced to the caller.
+func (s *Server) ensureUsage(ctx context.Context, creds *accountCreds) (*kiroUsage, error) {
 	s.usageMu.Lock()
-	if s.usageCache != nil && time.Since(s.usageFetched) < usageCacheTTL {
-		u := s.usageCache
+	if e, ok := s.usageCache[creds.id]; ok && time.Since(e.fetched) < usageCacheTTL {
+		u := e.usage
 		s.usageMu.Unlock()
 		return u, nil
 	}
 	s.usageMu.Unlock()
 
-	u, err := s.kiro.GetUsage(ctx)
+	u, err := s.kiro.GetUsage(ctx, creds)
 	if err != nil {
 		return nil, err
 	}
 	s.usageMu.Lock()
-	s.usageCache = u
-	s.usageFetched = time.Now()
+	s.usageCache[creds.id] = usageCacheEntry{usage: u, fetched: time.Now()}
 	s.usageMu.Unlock()
 	return u, nil
 }
 
-// availableModelIDs returns the account's model IDs (static fallback on error).
-func (s *Server) availableModelIDs(r *http.Request) []string {
-	models := s.ensureModels(r.Context())
-	if len(models) == 0 {
-		return fallbackModels
-	}
-	ids := make([]string, 0, len(models))
-	for _, m := range models {
-		if m.ModelID != "" {
-			ids = append(ids, m.ModelID)
-		}
-	}
-	if len(ids) == 0 {
-		return fallbackModels
-	}
-	return ids
-}
-
-// modelInfo returns the cached info for a model id.
+// modelInfo returns the cached info for a model id from any account. Used to
+// clamp effort/max_tokens on outgoing requests.
 func (s *Server) modelInfo(ctx context.Context, modelID string) (kiroModelInfo, bool) {
-	for _, m := range s.ensureModels(ctx) {
+	for _, m := range s.anyModels(ctx) {
 		if m.ModelID == modelID {
 			return m, true
 		}
@@ -393,6 +408,10 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// failover. Once streaming begins (headers sent) no further retry is possible.
 	stream, err := s.openStream(r.Context(), kreq)
 	if err != nil {
+		if errors.Is(err, errNoAccount) {
+			writeAnthropicError(w, r, http.StatusServiceUnavailable, "api_error", err.Error())
+			return
+		}
 		status, errType := mapUpstreamError(err)
 		writeAnthropicError(w, r, status, errType, err.Error())
 		return
@@ -415,24 +434,20 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 // giving up, bounding worst-case latency when many accounts are unhealthy.
 const maxAccountAttempts = 8
 
+// errNoAccount is returned when the account pool is empty. It maps to a 503 so
+// the caller knows to sign in or import an account via the admin page.
+var errNoAccount = fmt.Errorf("no account available; sign in or import one via the admin page")
+
 // openStream opens the upstream stream, dispatching across stored accounts with
-// pre-stream failover. When the account store is empty it falls back to the
-// primary TokenStore (the original single-account behaviour, unchanged). The
-// per-account profileArn is set on kreq before each attempt.
+// pre-stream failover. The per-account profileArn is set on kreq before each
+// attempt. An empty pool returns errNoAccount (mapped to 503).
 //
 // Failover happens only before streaming begins: an account failure (auth,
 // quota, 5xx, transport) moves on to the next account, while a request-level
 // error (e.g. a 400 that is not a thinking-signature issue) surfaces at once.
 func (s *Server) openStream(ctx context.Context, kreq *kiroRequest) (*kiroStream, error) {
-	// Empty pool (or no store): use the primary account, once.
 	if s.selector == nil || len(s.accounts.List()) == 0 {
-		creds := storeCreds{store: s.store}
-		arn, err := creds.profileArn(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("could not resolve profileArn: %w", err)
-		}
-		kreq.ProfileArn = arn
-		return s.sendWithReasoningRetry(ctx, creds, kreq)
+		return nil, errNoAccount
 	}
 
 	tried := map[string]bool{}
@@ -465,7 +480,7 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest) (*kiroStream
 		s.selector.recordFailure(creds.id)
 	}
 	if lastErr == nil {
-		lastErr = fmt.Errorf("no account available to serve the request")
+		lastErr = errNoAccount
 	}
 	return nil, lastErr
 }

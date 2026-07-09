@@ -155,20 +155,20 @@ type kiroEvent struct {
 // ---------------------------------------------------------------------------
 
 // KiroClient sends GenerateAssistantResponse calls to the Kiro runtime and
-// exposes the response as a stream of parsed events.
+// exposes the response as a stream of parsed events. It is account-agnostic:
+// every call takes a kiroCredentials for the account it should act as.
 type KiroClient struct {
 	cfg    *Config
-	store  *TokenStore
 	client *http.Client
 }
 
-func NewKiroClient(cfg *Config, store *TokenStore, client *http.Client) *KiroClient {
-	return &KiroClient{cfg: cfg, store: store, client: client}
+func NewKiroClient(cfg *Config, client *http.Client) *KiroClient {
+	return &KiroClient{cfg: cfg, client: client}
 }
 
 func (c *KiroClient) runtimeEndpoint(region string) string {
 	if region == "" {
-		region = c.store.apiRegion()
+		region = "us-east-1"
 	}
 	return fmt.Sprintf("https://runtime.%s.kiro.dev/", region)
 }
@@ -664,14 +664,14 @@ func parseKiroUsage(raw []byte) (*kiroUsage, error) {
 
 // GetUsage fetches the account's usage/limits from the control plane. On a
 // 401/403 the token is force-refreshed and the request retried once.
-func (c *KiroClient) GetUsage(ctx context.Context) (*kiroUsage, error) {
-	raw, status, err := c.getUsageOnce(ctx)
+func (c *KiroClient) GetUsage(ctx context.Context, creds kiroCredentials) (*kiroUsage, error) {
+	raw, status, err := c.getUsageOnce(ctx, creds)
 	if err != nil {
 		return nil, err
 	}
 	if status == http.StatusUnauthorized || status == http.StatusForbidden {
-		if rerr := c.store.ForceRefresh(ctx); rerr == nil {
-			raw, status, err = c.getUsageOnce(ctx)
+		if rerr := creds.refresh(ctx); rerr == nil {
+			raw, status, err = c.getUsageOnce(ctx, creds)
 			if err != nil {
 				return nil, err
 			}
@@ -685,14 +685,14 @@ func (c *KiroClient) GetUsage(ctx context.Context) (*kiroUsage, error) {
 
 // getUsageOnce performs a single GET /getUsageLimits attempt, returning the body
 // and HTTP status.
-func (c *KiroClient) getUsageOnce(ctx context.Context) ([]byte, int, error) {
-	token, err := c.store.AccessToken(ctx)
+func (c *KiroClient) getUsageOnce(ctx context.Context, creds kiroCredentials) ([]byte, int, error) {
+	token, err := creds.accessToken(ctx)
 	if err != nil {
 		return nil, 0, err
 	}
-	arn, _ := c.store.ProfileArn(ctx) // best effort; some tiers don't need it
+	arn, _ := creds.profileArn(ctx) // best effort; some tiers don't need it
 
-	endpoint := fmt.Sprintf("https://management.%s.kiro.dev/getUsageLimits", c.store.apiRegion())
+	endpoint := fmt.Sprintf("https://management.%s.kiro.dev/getUsageLimits", creds.apiRegion())
 	q := url.Values{
 		"origin":          {"AI_EDITOR"},
 		"resourceType":    {"AGENTIC_REQUEST"},
@@ -725,12 +725,12 @@ func (c *KiroClient) getUsageOnce(ctx context.Context) ([]byte, int, error) {
 
 // ListModels queries the Kiro control plane for the model IDs available to this
 // account (KiroControlPlaneBearerService.ListAvailableModels).
-func (c *KiroClient) ListModels(ctx context.Context) ([]kiroModelInfo, error) {
-	token, err := c.store.AccessToken(ctx)
+func (c *KiroClient) ListModels(ctx context.Context, creds kiroCredentials) ([]kiroModelInfo, error) {
+	token, err := creds.accessToken(ctx)
 	if err != nil {
 		return nil, err
 	}
-	arn, _ := c.store.ProfileArn(ctx) // best effort; some tiers don't need it
+	arn, _ := creds.profileArn(ctx) // best effort; some tiers don't need it
 
 	reqBody := map[string]any{"origin": "AI_EDITOR"}
 	if arn != "" {
@@ -738,7 +738,7 @@ func (c *KiroClient) ListModels(ctx context.Context) ([]kiroModelInfo, error) {
 	}
 	payload, _ := json.Marshal(reqBody)
 
-	endpoint := fmt.Sprintf("https://management.%s.kiro.dev/", c.store.apiRegion())
+	endpoint := fmt.Sprintf("https://management.%s.kiro.dev/", creds.apiRegion())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err

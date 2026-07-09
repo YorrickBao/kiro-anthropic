@@ -13,10 +13,10 @@ import (
 // ---------------------------------------------------------------------------
 // Multi-account credential store.
 //
-// This is the persistence layer for accounts signed in through the admin page
-// (see login.go). It is deliberately independent of TokenStore, which owns the
-// single active account loaded from Kiro's own cache: this store is where
-// self-managed logins live until a later step wires them into request serving.
+// This is the persistence layer for the account pool, the sole source of
+// accounts used to serve requests and control-plane calls. Accounts arrive via
+// startup import of the local Kiro cache, admin-page sign-in, or the import
+// button (see login.go).
 //
 // Credentials are long-lived secrets (refreshToken, clientSecret). The file is
 // written 0600 in a 0700 directory; callers should treat it as sensitive.

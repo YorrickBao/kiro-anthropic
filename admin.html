@@ -25,22 +25,21 @@
   .wrap { padding: 20px 24px; max-width: 1100px; margin: 0 auto; display: grid; gap: 18px; }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
   .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 14px; }
-  .kv { display: grid; grid-template-columns: 180px 1fr; gap: 6px 14px; }
+  .kv { display: grid; grid-template-columns: 150px 1fr; gap: 6px 14px; }
   .kv dt { color: var(--muted); }
   .kv dd { margin: 0; word-break: break-all; }
   .pill { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); }
   .pill.ok { color: var(--ok); border-color: #234; } .pill.warn { color: var(--warn); } .pill.err { color: var(--err); }
   .bar { height: 10px; border-radius: 6px; background: #222836; overflow: hidden; margin-top: 6px; }
   .bar > span { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), #a78bfa); }
-  .big { font-size: 22px; font-weight: 600; }
-  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; }
-  .stat { background: #12151c; border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  .big { font-size: 20px; font-weight: 600; }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .stat { background: #12151c; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
   .stat .lbl { color: var(--muted); font-size: 12px; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
   th { color: var(--muted); font-weight: 500; }
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
-  details { margin-top: 12px; } summary { cursor: pointer; color: var(--muted); }
   pre { background: #0b0d11; border: 1px solid var(--line); border-radius: 8px; padding: 12px; overflow: auto; font-size: 12px; }
   .err-box { color: var(--err); }
   a { color: var(--accent); }
@@ -58,9 +57,23 @@
   }
   button:disabled { opacity: .5; cursor: default; }
   button.danger { background: transparent; color: var(--err); border: 1px solid var(--line); padding: 4px 10px; font-weight: 500; }
-  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); padding: 4px 10px; font-weight: 500; margin-right: 6px; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); padding: 4px 10px; font-weight: 500; }
   button.copy { background: transparent; color: var(--muted); border: 0; padding: 0 6px; margin-left: 6px; cursor: pointer; font-size: 13px; }
   button.copy:hover { color: var(--accent); }
+  /* account cards */
+  .accounts { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
+  .acct { background: #12151c; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .acct .top { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .acct .email { font-weight: 600; word-break: break-all; }
+  .acct .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
+  .acct .meta { display: grid; grid-template-columns: 88px 1fr; gap: 4px 10px; font-size: 12.5px; }
+  .acct .meta dt { color: var(--muted); }
+  .acct .meta dd { margin: 0; word-break: break-all; }
+  /* popover */
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; align-items: center; justify-content: center; z-index: 10; }
+  .modal-backdrop.open { display: flex; }
+  .modal { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; max-width: 820px; width: calc(100% - 40px); max-height: 80vh; overflow: auto; }
+  .modal .close { float: right; }
 </style>
 </head>
 <body>
@@ -71,8 +84,7 @@
   <span class="updated" id="updated">加载中…</span>
 </header>
 <div class="wrap">
-  <section class="card" id="account-card"><h2>账号信息</h2><dl class="kv" id="account"></dl></section>
-  <section class="card" id="accounts-card">
+  <section class="card">
     <h2>多账号登录（企业 IdC）</h2>
     <div class="login-form">
       <div class="field"><label for="login-starturl">Start URL</label>
@@ -85,27 +97,37 @@
       <button id="import-btn" type="button" style="background:transparent;color:var(--accent);border:1px solid var(--line)">导入本机凭据</button>
       <span id="login-msg" class="muted"></span>
     </div>
-    <div id="accounts-list" style="margin-top:14px"></div>
     <p class="muted" style="font-size:12px;margin-top:10px">
       登录会在浏览器打开 AWS 授权页，完成后凭据保存在服务端。远程部署请通过 SSH 隧道访问本页
-      (<code>ssh -L 27890:localhost:27890 &lt;server&gt;</code>)，以便授权回跳到本机。
+      (<code>ssh -L 27890:localhost:27890 &lt;server&gt;</code>)，以便授权回跳到本机。所有账号参与请求负载均衡。
     </p>
   </section>
-  <section class="card" id="usage-card"><h2>额度信息</h2><div id="usage"></div></section>
-  <section class="card" id="models-card"><h2>模型信息</h2><div id="models"></div></section>
+  <section class="card">
+    <h2>账号（<span id="acct-count">0</span>）</h2>
+    <div class="accounts" id="accounts"></div>
+  </section>
 </div>
+
+<div class="modal-backdrop" id="models-modal">
+  <div class="modal">
+    <button class="ghost close" id="models-close" type="button">关闭</button>
+    <h2 style="text-transform:none;font-size:15px;color:var(--fg);margin-top:0">可用模型</h2>
+    <div id="models-body"></div>
+  </div>
+</div>
+
 <script>
-const REFRESH_MS = 10000;
+const REFRESH_MS = 15000;
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmtNum = (n) => (n == null) ? "—" : Number(n).toLocaleString(undefined, {maximumFractionDigits: 2});
+const fmtDate = (s) => { if (!s) return "—"; const d = new Date(s); return isNaN(d) ? esc(s) : d.toLocaleString(); };
 
-function row(k, v) { return `<dt>${esc(k)}</dt><dd>${v}</dd>`; }
-function fmtNum(n) { return (n == null) ? "—" : Number(n).toLocaleString(undefined, {maximumFractionDigits: 2}); }
-function fmtDate(s) { if (!s) return "—"; const d = new Date(s); return isNaN(d) ? esc(s) : d.toLocaleString(); }
+let latestModels = [];
 
 function expiryPill(state, secs) {
   const cls = state === "valid" ? "ok" : (state === "expiring soon" ? "warn" : (state === "unknown" ? "" : "err"));
-  let txt = state;
+  let txt = state || "—";
   if (typeof secs === "number") {
     const s = Math.max(0, secs), h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
     txt += ` · ${h>0? h+"h ":""}${m}m`;
@@ -113,80 +135,84 @@ function expiryPill(state, secs) {
   return `<span class="pill ${cls}">${esc(txt)}</span>`;
 }
 
-function renderAccount(a) {
-  const el = $("account");
-  if (!a) { el.innerHTML = ""; return; }
-  const rows = [];
-  rows.push(row("邮箱", esc(a.email || "—")));
-  rows.push(row("Provider", esc(a.provider || "—")));
-  rows.push(row("Auth Method", esc(a.auth_method || "—")));
-  rows.push(row("Region", esc(a.region || "—")));
-  rows.push(row("过期状态", expiryPill(a.expiry_state, a.expires_in_seconds)));
-  rows.push(row("过期时间", esc(a.expires_at || "—")));
-  rows.push(row("profileArn", a.profile_arn_error ? `<span class="err-box">解析失败: ${esc(a.profile_arn_error)}</span>` : esc(a.profile_arn || "—")));
-  rows.push(row("Access Token", `<code>${esc(a.access_token_masked || "—")}</code>`));
-  rows.push(row("Token 文件", esc(a.token_file || "—")));
-  rows.push(row("出站代理", esc(a.outbound_proxy || "—")));
-  rows.push(row("本地鉴权", a.api_key_required ? '<span class="pill warn">需要 api-key</span>' : '<span class="pill">开放</span>'));
-  el.innerHTML = rows.join("");
-}
-
-function renderUsage(u) {
-  const el = $("usage");
-  if (!u) { el.innerHTML = '<span class="muted">—</span>'; return; }
-  if (u.error) { el.innerHTML = `<div class="err-box">获取额度失败: ${esc(u.error)}</div>`; return; }
-
+function usageHtml(u) {
+  if (!u) return '<span class="muted">额度：—</span>';
+  if (u.error) return `<div class="err-box" style="font-size:12px">额度获取失败: ${esc(u.error)}</div>`;
   let html = "";
-  const sub = u.subscription_title || u.subscription_type;
-  if (sub) html += `<div style="margin-bottom:14px"><span class="pill ok">${esc(u.subscription_title || "")}</span> <span class="muted">${esc(u.subscription_type || "")}</span></div>`;
-
+  if (u.subscription_title || u.subscription_type)
+    html += `<div style="margin:8px 0"><span class="pill ok">${esc(u.subscription_title || "")}</span> <span class="muted">${esc(u.subscription_type || "")}</span></div>`;
   const c = u.credit;
   if (c) {
     const pct = c.limit > 0 ? Math.min(100, (c.used / c.limit) * 100) : 0;
-    html += `<div class="grid2" style="margin-bottom:12px">
-      <div class="stat"><div class="lbl">剩余额度</div><div class="big">${fmtNum(c.remaining)}</div><div class="muted">${esc(c.unit||"")} ${esc(c.currency||"")}</div></div>
-      <div class="stat"><div class="lbl">已用 / 总额度</div><div class="big">${fmtNum(c.used)} <span class="muted">/ ${fmtNum(c.limit)}</span></div>
+    html += `<div class="grid2">
+      <div class="stat"><div class="lbl">剩余</div><div class="big">${fmtNum(c.remaining)}</div><div class="muted">${esc(c.unit||"")} ${esc(c.currency||"")}</div></div>
+      <div class="stat"><div class="lbl">已用 / 总</div><div class="big">${fmtNum(c.used)} <span class="muted">/ ${fmtNum(c.limit)}</span></div>
         <div class="bar"><span style="width:${pct.toFixed(1)}%"></span></div></div>
-      <div class="stat"><div class="lbl">重置日期</div><div class="big" style="font-size:16px">${fmtDate(u.reset_at)}</div></div>
-    </div>`;
-    const extra = [];
-    if (c.free_trial_active) extra.push(row("试用额度", `${fmtNum(c.free_trial_used)} / ${fmtNum(c.free_trial_limit)} <span class="pill ok">ACTIVE</span>`));
-    if (c.overage_cap) extra.push(row("超额封顶", `${fmtNum(c.overage_cap)} ${esc(c.unit||"")}`));
-    if (c.overage_rate) extra.push(row("超额单价", `${fmtNum(c.overage_rate)} ${esc(c.currency||"")}`));
-    if (u.overage_status) extra.push(row("超额状态", esc(u.overage_status)));
-    if (extra.length) html += `<dl class="kv">${extra.join("")}</dl>`;
+    </div>
+    <div class="muted" style="font-size:12px;margin-top:6px">重置：${fmtDate(u.reset_at)}${c.free_trial_active ? " · 试用生效中" : ""}</div>`;
   }
-
-  el.innerHTML = html;
+  return html;
 }
 
-function renderModels(models) {
-  const el = $("models");
-  if (!models || !models.length) { el.innerHTML = '<span class="muted">—</span>'; return; }
-  const rows = models.map(m => {
-    const eff = m.capabilities && m.capabilities.effort;
-    let effTxt = "—";
-    if (eff && eff.supported) {
-      effTxt = ["low","medium","high","xhigh","max"].filter(l => eff[l]).join(" / ") || "yes";
-    }
-    return `<tr>
-      <td style="white-space:nowrap"><code>${esc(m.id)}</code><button class="copy" data-copy="${esc(m.id)}" type="button" title="复制">⧉</button></td>
-      <td>${esc(m.display_name || "")}</td>
-      <td class="num">${m.max_input_tokens ? fmtNum(m.max_input_tokens) : "—"}</td>
-      <td class="num">${m.max_tokens ? fmtNum(m.max_tokens) : "—"}</td>
-      <td>${esc(effTxt)}</td>
-    </tr>`;
-  }).join("");
-  el.innerHTML = `<table><thead><tr><th>模型 ID</th><th>名称</th><th class="num">最大输入</th><th class="num">最大输出</th><th>Effort</th></tr></thead><tbody>${rows}</tbody></table>`;
-  el.querySelectorAll("button.copy").forEach(b => b.addEventListener("click", () => copyText(b.dataset.copy, b)));
+function renderAccounts(accounts) {
+  const el = $("accounts");
+  $("acct-count").textContent = accounts ? accounts.length : 0;
+  if (!accounts || !accounts.length) {
+    el.innerHTML = '<span class="muted">尚无账号。请在上方登录或导入本机凭据。</span>';
+    return;
+  }
+  el.innerHTML = accounts.map(a => `<div class="acct">
+    <div class="top">
+      <span class="email">${esc(a.email || "(无邮箱)")}</span>
+      <span class="spacer" style="flex:1"></span>
+      ${expiryPill(a.expiry_state, a.expires_in_seconds)}
+    </div>
+    <dl class="meta">
+      <dt>备注</dt><dd>${esc(a.label || "—")}</dd>
+      <dt>Provider</dt><dd>${esc(a.provider || "—")} <span class="muted">${esc(a.auth_method || "")}</span></dd>
+      <dt>Region</dt><dd>${esc(a.region || "—")}</dd>
+      <dt>profileArn</dt><dd style="font-size:12px">${esc(a.profile_arn || "—")}</dd>
+      <dt>Token</dt><dd><code>${esc(a.access_token || "—")}</code></dd>
+    </dl>
+    ${usageHtml(a.usage)}
+    <div class="actions">
+      <button class="ghost" data-models type="button">模型</button>
+      <button class="ghost" data-edit="${esc(a.id)}" data-label="${esc(a.label || "")}" type="button">改备注</button>
+      <button class="danger" data-del="${esc(a.id)}" type="button">删除</button>
+    </div>
+  </div>`).join("");
+  el.querySelectorAll("button[data-del]").forEach(b => b.addEventListener("click", () => deleteAccount(b.dataset.del)));
+  el.querySelectorAll("button[data-edit]").forEach(b => b.addEventListener("click", () => editLabel(b.dataset.edit, b.dataset.label)));
+  el.querySelectorAll("button[data-models]").forEach(b => b.addEventListener("click", openModels));
 }
 
-// copyText copies s to the clipboard and briefly flashes the button as feedback.
+function openModels() {
+  const body = $("models-body");
+  if (!latestModels || !latestModels.length) {
+    body.innerHTML = '<span class="muted">无模型信息。</span>';
+  } else {
+    const rows = latestModels.map(m => {
+      const eff = m.capabilities && m.capabilities.effort;
+      let effTxt = "—";
+      if (eff && eff.supported) effTxt = ["low","medium","high","xhigh","max"].filter(l => eff[l]).join(" / ") || "yes";
+      return `<tr>
+        <td style="white-space:nowrap"><code>${esc(m.id)}</code><button class="copy" data-copy="${esc(m.id)}" type="button" title="复制">⧉</button></td>
+        <td>${esc(m.display_name || "")}</td>
+        <td class="num">${m.max_input_tokens ? fmtNum(m.max_input_tokens) : "—"}</td>
+        <td class="num">${m.max_tokens ? fmtNum(m.max_tokens) : "—"}</td>
+        <td>${esc(effTxt)}</td>
+      </tr>`;
+    }).join("");
+    body.innerHTML = `<table><thead><tr><th>模型 ID</th><th>名称</th><th class="num">最大输入</th><th class="num">最大输出</th><th>Effort</th></tr></thead><tbody>${rows}</tbody></table>`;
+    body.querySelectorAll("button.copy").forEach(b => b.addEventListener("click", () => copyText(b.dataset.copy, b)));
+  }
+  $("models-modal").classList.add("open");
+}
+
 async function copyText(s, btn) {
   try {
     await navigator.clipboard.writeText(s);
   } catch (e) {
-    // Fallback for non-secure contexts where the Clipboard API is unavailable.
     const ta = document.createElement("textarea");
     ta.value = s; ta.style.position = "fixed"; ta.style.opacity = "0";
     document.body.appendChild(ta); ta.select();
@@ -196,38 +222,6 @@ async function copyText(s, btn) {
   if (btn) { const t = btn.textContent; btn.textContent = "✓"; setTimeout(() => { btn.textContent = t; }, 900); }
 }
 
-function renderAccounts(accounts) {
-  const el = $("accounts-list");
-  if (!accounts || !accounts.length) { el.innerHTML = '<span class="muted">尚无已登录账号。</span>'; return; }
-  const rows = accounts.map(a => `<tr>
-    <td>${esc(a.email || "—")}</td>
-    <td>${esc(a.label || "—")}</td>
-    <td>${esc(a.provider || "—")}</td>
-    <td>${esc(a.region || "—")}</td>
-    <td>${expiryPill(a.expiry_state, a.expires_in_seconds)}</td>
-    <td style="max-width:280px"><code>${esc(a.profile_arn || "—")}</code></td>
-    <td><code>${esc(a.access_token || "—")}</code></td>
-    <td style="white-space:nowrap">
-      <button class="ghost" data-edit="${esc(a.id)}" data-label="${esc(a.label || "")}" type="button">改备注</button>
-      <button class="danger" data-id="${esc(a.id)}" type="button">删除</button>
-    </td>
-  </tr>`).join("");
-  el.innerHTML = `<table><thead><tr><th>邮箱</th><th>备注</th><th>Provider</th><th>Region</th><th>过期</th><th>profileArn</th><th>Access Token</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
-  el.querySelectorAll("button.danger").forEach(b => b.addEventListener("click", () => deleteAccount(b.dataset.id)));
-  el.querySelectorAll("button.ghost").forEach(b => b.addEventListener("click", () => editLabel(b.dataset.edit, b.dataset.label)));
-}
-
-async function loadAccounts() {
-  try {
-    const res = await fetch("/api/accounts.json", { cache: "no-store" });
-    if (!res.ok) throw new Error("HTTP " + res.status);
-    const d = await res.json();
-    renderAccounts(d.accounts);
-  } catch (e) {
-    $("accounts-list").innerHTML = `<span class="err-box">加载账号失败: ${esc(e.message)}</span>`;
-  }
-}
-
 async function deleteAccount(id) {
   if (!id || !confirm("确定删除该账号凭据？")) return;
   try {
@@ -235,20 +229,20 @@ async function deleteAccount(id) {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id })
     });
     if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error((d.error && d.error.message) || ("HTTP " + res.status)); }
-    loadAccounts();
+    tick();
   } catch (e) { alert("删除失败: " + e.message); }
 }
 
 async function editLabel(id, current) {
   if (!id) return;
   const label = prompt("修改备注：", current || "");
-  if (label === null) return; // cancelled
+  if (label === null) return;
   try {
     const res = await fetch("/api/accounts/label", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, label })
     });
     if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error((d.error && d.error.message) || ("HTTP " + res.status)); }
-    loadAccounts();
+    tick();
   } catch (e) { alert("修改失败: " + e.message); }
 }
 
@@ -266,10 +260,26 @@ async function startLogin() {
     });
     const d = await res.json();
     if (!res.ok) throw new Error((d.error && d.error.message) || ("HTTP " + res.status));
-    msg.innerHTML = '已在新窗口打开授权页，完成后返回本页刷新账号列表。';
+    msg.innerHTML = '已在新窗口打开授权页，完成后返回本页会自动刷新。';
     window.open(d.authorize_url, "_blank", "noopener");
   } catch (e) {
     msg.innerHTML = `<span class="err-box">登录失败: ${esc(e.message)}</span>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function importLocal() {
+  const btn = $("import-btn"), msg = $("login-msg");
+  btn.disabled = true; msg.textContent = "正在读取本机凭据…";
+  try {
+    const res = await fetch("/api/accounts/import", { method: "POST" });
+    const d = await res.json();
+    if (!res.ok) throw new Error((d.error && d.error.message) || ("HTTP " + res.status));
+    msg.textContent = d.already_present ? "该凭据已在账号列表中（已刷新）。" : "已导入本机凭据。";
+    tick();
+  } catch (e) {
+    msg.innerHTML = `<span class="err-box">导入失败: ${esc(e.message)}</span>`;
   } finally {
     btn.disabled = false;
   }
@@ -281,37 +291,20 @@ async function tick() {
     if (!res.ok) throw new Error("HTTP " + res.status);
     const d = await res.json();
     $("ver").textContent = d.version ? "v" + d.version : "";
-    renderAccount(d.account);
-    renderUsage(d.usage);
-    renderModels(d.models);
+    latestModels = d.models || [];
+    renderAccounts(d.accounts);
     $("updated").textContent = "更新于 " + new Date().toLocaleTimeString();
   } catch (e) {
     $("updated").innerHTML = `<span class="err-box">刷新失败: ${esc(e.message)}</span>`;
   }
 }
 
-async function importLocal() {
-  const btn = $("import-btn"), msg = $("login-msg");
-  btn.disabled = true; msg.textContent = "正在读取本机凭据…";
-  try {
-    const res = await fetch("/api/accounts/import", { method: "POST" });
-    const d = await res.json();
-    if (!res.ok) throw new Error((d.error && d.error.message) || ("HTTP " + res.status));
-    msg.textContent = d.already_present ? "该凭据已在账号列表中。" : "已导入本机凭据。";
-    loadAccounts();
-  } catch (e) {
-    msg.innerHTML = `<span class="err-box">导入失败: ${esc(e.message)}</span>`;
-  } finally {
-    btn.disabled = false;
-  }
-}
-
 $("login-btn").addEventListener("click", startLogin);
 $("import-btn").addEventListener("click", importLocal);
+$("models-close").addEventListener("click", () => $("models-modal").classList.remove("open"));
+$("models-modal").addEventListener("click", (e) => { if (e.target === $("models-modal")) $("models-modal").classList.remove("open"); });
 tick();
-loadAccounts();
 setInterval(tick, REFRESH_MS);
-setInterval(loadAccounts, REFRESH_MS);
 </script>
 </body>
 </html>

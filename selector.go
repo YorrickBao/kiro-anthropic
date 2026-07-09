@@ -11,14 +11,13 @@ import (
 // ---------------------------------------------------------------------------
 // Per-request credentials and multi-account selection.
 //
-// KiroClient.Send is written against the kiroCredentials interface so a request
-// can be served either by the single primary account loaded from Kiro's cache
-// (storeCreds, the original behaviour) or by one of the self-managed accounts in
-// the multi-account store (accountCreds), chosen round-robin by accountSelector.
+// KiroClient.Send and the control-plane calls are written against the
+// kiroCredentials interface so they act as a specific account (accountCreds),
+// chosen round-robin by accountSelector.
 // ---------------------------------------------------------------------------
 
 // kiroCredentials supplies the bearer token, region and profileArn for one
-// GenerateAssistantResponse attempt, and can refresh its token on a 401/403.
+// Kiro call, and can refresh its token on a 401/403.
 type kiroCredentials interface {
 	// accessToken returns a currently-valid bearer token, refreshing if needed.
 	accessToken(ctx context.Context) (string, error)
@@ -29,17 +28,6 @@ type kiroCredentials interface {
 	// refresh unconditionally refreshes the token (used to recover from 401/403).
 	refresh(ctx context.Context) error
 }
-
-// storeCreds adapts the primary TokenStore to kiroCredentials. This is the
-// original single-account path; behaviour is unchanged.
-type storeCreds struct {
-	store *TokenStore
-}
-
-func (c storeCreds) accessToken(ctx context.Context) (string, error) { return c.store.AccessToken(ctx) }
-func (c storeCreds) apiRegion() string                               { return c.store.apiRegion() }
-func (c storeCreds) profileArn(ctx context.Context) (string, error)  { return c.store.ProfileArn(ctx) }
-func (c storeCreds) refresh(ctx context.Context) error               { return c.store.ForceRefresh(ctx) }
 
 // accountCreds serves a request from one stored (self-managed) account. Token
 // refresh uses the account's own client registration and is written back to the
@@ -171,6 +159,24 @@ func (s *accountSelector) pick(tried map[string]bool) (*accountCreds, bool) {
 // credsFor builds accountCreds for the given account snapshot.
 func (s *accountSelector) credsFor(a StoredAccount) *accountCreds {
 	return &accountCreds{store: s.store, client: s.client, id: a.ID, acct: a}
+}
+
+// pickAny returns credentials for one eligible account for a control-plane call
+// (models/usage) that is not tied to a specific request. It advances the
+// round-robin cursor like pick. ok is false when the store is empty.
+func (s *accountSelector) pickAny() (*accountCreds, bool) {
+	return s.pick(map[string]bool{})
+}
+
+// listAll returns credentials for every stored account, for per-account
+// control-plane calls (e.g. rendering usage for each account on the admin page).
+func (s *accountSelector) listAll() []*accountCreds {
+	list := s.store.List()
+	out := make([]*accountCreds, 0, len(list))
+	for _, a := range list {
+		out = append(out, s.credsFor(a))
+	}
+	return out
 }
 
 // recordSuccess clears any cooldown on the account.

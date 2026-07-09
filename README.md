@@ -25,8 +25,9 @@
 - **扩展思考（extended thinking）**：模型的思考过程通过 Anthropic 原生的 `thinking` / `redacted_thinking` 内容块透传（流式下发 `thinking_delta` + `signature_delta`）。多轮对话时思考块连同 `signature` 原样回传给后端；若后端判定签名失效（`THINKING_SIGNATURE_INVALID`），自动剥离推理内容并重试一次。请求侧 `thinking: {type:"disabled"}` 会关闭思考块并把 effort 降到最低档。
 - **最大输出 tokens**：按模型 schema 把调用方的 `max_tokens` 下发给 Kiro。**注意：实测 Kiro 后端不强制执行该上限**，实际输出长度由模型/effort 决定，`stop_reason` 基本不会是 `max_tokens`。该字段仅为协议兼容而发送。
 - **模型能力发现** `GET /v1/models`：返回 `max_input_tokens`、`max_tokens`、`capabilities.effort`（上下文窗口、effort 档位）。
-- **令牌自动刷新**：读取 Kiro 的登录缓存，快过期时用 SSO-OIDC 自动续期并写回。
-- **profileArn 自动解析**：企业/IdC 账号走 `ListAvailableProfiles`，免费/社交登录用内置固定 ARN。
+- **账号池**：无主账号，所有请求走账号池轮询。账号来自启动自动导入本地凭据、管理页 IdC 登录、管理页「导入本机凭据」，三者进同一个池；后台自动刷新令牌保活。池为空时 `/v1/messages` 返回 503。
+- **令牌自动刷新**：池里每个账号快过期时都用 SSO-OIDC 自动续期并写回。
+- **profileArn 自动解析**：企业/IdC 账号走 `ListAvailableProfiles`，免费/社交登录用内置固定 ARN；结果随账号存储。
 - **出站代理**：所有到 AWS / Kiro 的请求都走代理，默认 `http://127.0.0.1:7890`，可覆盖或关闭。
 - **可选本地鉴权**：`--api-key` 要求客户端携带 key。
 
@@ -39,15 +40,17 @@ Anthropic 客户端 ──/v1/messages──►  kiro-anthropic  ──GenerateA
    (Claude Code)                    (本地 :17890)      (AWS 事件流, 走出站代理)
 ```
 
-- 鉴权：读取 `~/.aws/sso/cache/kiro-auth-token.json` 及其客户端注册文件；过期时调用 SSO-OIDC `CreateToken` 刷新。
-- 推理：向 `https://runtime.<region>.kiro.dev` 发送 `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`，解析其 `vnd.amazon.eventstream` 响应，再翻译回 Anthropic 的 SSE / JSON。
+- 鉴权：所有请求都从**账号池**取账号；池由三种来源填充——启动时自动导入本地凭据、管理页 IdC 登录、管理页「导入本机凭据」按钮。每个账号自带 `region` / `profileArn`，后台自动用 SSO-OIDC `CreateToken` 刷新保活。池为空时 `/v1/messages` 返回 **503**（提示去管理页登录/导入）。
+- 推理：向 `https://runtime.<region>.kiro.dev` 发送 `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`，解析其 `vnd.amazon.eventstream` 响应，再翻译回 Anthropic 的 SSE / JSON；`<region>` 取自被选中账号自身的记录。
 - 模型与 profile：通过 `https://management.<region>.kiro.dev` 的 `ListAvailableModels` / `ListAvailableProfiles` 获取。
 
 ---
 
 ## 前置条件
 
-1. 本机已安装 **Kiro** 桌面端并**完成登录**（本工具复用它的令牌缓存 `~/.aws/sso/cache/`）。
+1. 至少一个可用账号。两种方式任选其一（可并存）：
+   - **可选**：本机已安装 **Kiro** 桌面端并完成登录——启动时会自动导入其令牌缓存（`~/.aws/sso/cache/kiro-auth-token.json`），开箱即用；
+   - 或在**管理页**登录企业 IdC 账号 / 点「导入本机凭据」把账号纳入池。
 2. 能访问 AWS / `*.kiro.dev`（国内一般需要代理，见下文）。
 3. 仅自行构建时需要 **Go 1.26+**。
 
@@ -73,13 +76,8 @@ VERSION=1.0.0 ./build.sh   # 打版本号进二进制
 
 ```bash
 # 启动（默认 :17890，出站默认走 http://127.0.0.1:7890）
+# 启动时会自动导入本地 Kiro 凭据到账号池（如存在）；账号 / 额度 / 模型都在管理页查看
 ./kiro-anthropic serve
-
-# 查看登录/令牌/profileArn 状态
-./kiro-anthropic status
-
-# 列出账号可用模型（含上下文窗口与 effort 档位）
-./kiro-anthropic models
 
 # 检查并升级到 GitHub 最新 release（见下文“升级”一节）
 ./kiro-anthropic upgrade --check
@@ -105,8 +103,6 @@ curl --noproxy '*' http://127.0.0.1:17890/v1/messages \
 | 命令 | 说明 |
 |---|---|
 | `serve` | 启动 Anthropic 兼容服务（默认端口 17890） |
-| `status` | 显示当前令牌、区域、过期时间、profileArn、出站代理 |
-| `models` | 列出账号可用模型 ID，含上下文窗口与 effort 档位 |
 | `upgrade` | 从 GitHub Release 下载并原地替换当前二进制 |
 | `version` | 打印版本 |
 | `help` | 帮助 |
@@ -119,13 +115,11 @@ curl --noproxy '*' http://127.0.0.1:17890/v1/messages \
 | `--port` | `17890` | 监听端口（被占用时自动 +1 重试） |
 | `--admin-port` | `27890` | 管理页端口，**仅限本机访问**（被占用时自动 +1 重试） |
 | `--proxy` | `http://127.0.0.1:7890` | 出站代理；优先级：本参数 > `http(s)_proxy` 环境变量 > 内置默认；`none` 表示直连 |
-| `--token-file` | `~/.aws/sso/cache/kiro-auth-token.json` | Kiro 令牌文件路径 |
-| `--accounts-file` | `~/.kiro-anthropic/accounts.json` | 管理页自助登录的多账号凭据存储路径 |
-| `--profile-arn` | 自动解析 | 显式指定 CodeWhisperer profileArn |
+| `--token-file` | `~/.aws/sso/cache/kiro-auth-token.json` | 启动自动导入的来源：Kiro 桌面端令牌文件路径（也是管理页「导入本机凭据」按钮读取的路径） |
+| `--accounts-file` | `~/.kiro-anthropic/accounts.json` | 账号池凭据的持久化存储路径 |
+| `--no-import-local` | `false` | 加此参数则启动时**不**自动导入本地 `--token-file` 凭据；默认（不加）会自动导入到账号池 |
 | `--api-key` | 空（开放） | 设置后客户端须用 `x-api-key` 或 `Authorization: Bearer` 携带 |
 | `--agent-mode` | `vibe` | Kiro agent 模式 |
-| `--region` | 取自令牌 | 覆盖 **SSO 区域**（用于 OIDC 令牌刷新 `oidc.<region>.amazonaws.com`） |
-| `--api-region` | 取自 `--region` | 覆盖 **Kiro API 区域**（`runtime` / `management.<region>.kiro.dev`）。仅当 Q/Kiro API 与你的 IdC 不在同一区域时才需要设置（如 IdC 在 `us-east-1`，API 在 `eu-central-1`） |
 | `--log` | `false` | 开启请求访问日志（输出到 stdout/当前窗口）；默认关闭 |
 | `--log-file` | 空 | 把访问日志写到指定文件（隐含 `--log`）；特殊值 `stdout`/`stderr`/`none` |
 
@@ -133,38 +127,43 @@ curl --noproxy '*' http://127.0.0.1:17890/v1/messages \
 
 ### 管理页（`--admin-port`）
 
-`serve` 会在 API 端口之外，额外起一个**只监听 `127.0.0.1`** 的管理端口（默认 `27890`），提供账号状态页面，并支持自助登录企业账号：
+`serve` 会在 API 端口之外，额外起一个**只监听 `127.0.0.1`** 的管理端口（默认 `27890`），以**账号卡片**的形式管理整个账号池，并支持自助登录企业账号：
 
 ```
 http://127.0.0.1:27890/            # 管理页（HTML，每 10s 自动刷新）
-http://127.0.0.1:27890/api/status.json     # 页面数据源（账号 / 额度 / 模型）
-http://127.0.0.1:27890/api/accounts.json   # 已登录的多账号列表（脱敏）
+http://127.0.0.1:27890/api/status.json     # 页面数据源（accounts 数组 + models）
+http://127.0.0.1:27890/api/accounts.json   # 账号池列表（脱敏）
 http://127.0.0.1:27890/health      # 健康检查
 ```
 
-页面展示：
+页面以**账号卡片（Card）**为核心，池里每个账号一张卡：
 
-- **账号**：provider、authMethod、区域、profileArn、令牌过期倒计时、账号邮箱、打码后的 access token、出站代理、是否需要 api-key。
-- **多账号登录（企业 IdC）**：填入 Identity Center 的 **Start URL** 与 **Region**（可加备注）即可发起登录，见下节。已登录账号以列表展示（邮箱 / 备注 / provider / region / profileArn / 过期状态 / 打码 token），可逐个删除。邮箱在登录/导入时经 `getUsageLimits` 解析。
-- **额度**：账号订阅级别、剩余 / 已用 / 总额度（credits，带进度条）、重置日期、试用额度（若在生效期）、超额封顶 / 单价 / 状态。额度来自与模型列表同源的控制面 `management.<region>.kiro.dev/getUsageLimits`，服务端缓存 60s。
-- **模型**：账号可用模型的 ID、名称、最大输入 / 输出 tokens、effort 档位（与 `/v1/models` 同源）。
+- **账号信息**：账号邮箱、备注、provider、authMethod、该账号的 region / profileArn、令牌过期状态与倒计时、打码后的 access token。邮箱在登录/导入时经 `getUsageLimits` 解析。每张卡片可逐个删除对应账号。
+- **额度信息**：卡片上展示该账号的订阅级别、剩余 / 已用 / 总额度（credits，带进度条）、重置日期、试用额度（若在生效期）、超额封顶 / 单价 / 状态。额度来自控制面 `management.<region>.kiro.dev/getUsageLimits`，**每账号**缓存 60s。
+- **模型信息**：卡片上的「模型」按钮，点击后弹出 popover 显示该账号可用模型的 ID、名称、最大输入 / 输出 tokens、effort 档位（与 `/v1/models` 同源）。
+- **添加账号（企业 IdC）**：填入 Identity Center 的 **Start URL** 与 **Region**（可加备注）即可发起登录，见下节；也可点「导入本机凭据」把当前 Kiro 桌面端账号纳入池。
+- 页面全局信息：出站代理、是否需要 api-key。
+
+数据源统一为 `/api/status.json`，返回一个 `accounts` 数组（每个元素含账号信息 + 该账号额度）与全局 `models`。
 
 安全说明：
 
 - 管理端口**强制绑定 `127.0.0.1`**，且每个请求都经两道校验——按真实 TCP 对端 IP 限定回环（不信任 `X-Forwarded-For`），并校验 `Host` 头必须是 `localhost` / 回环地址（防 DNS 重绑定与跨站请求）。
-- access token 只以打码形式展示，不渲染完整值。多账号存储里的 `refreshToken` / `clientSecret` **不会**通过任何 API 返回。
+- access token 只以打码形式展示，不渲染完整值。账号池存储里的 `refreshToken` / `clientSecret` **不会**通过任何 API 返回。
 - **端口自增**：`--port` 与 `--admin-port` 若被占用，会自动 +1 逐个重试直到找到空闲端口（上限 65535）。启动横幅会打印两个端口的**实际**监听地址——若发生自增，请以横幅为准。
 
-#### 多账号登录与凭据存储
+#### 账号来源与凭据存储
 
-管理页可直接登录**企业 IdC（IAM Identity Center）账号**，凭据由本服务自行保存，不依赖 Kiro 桌面端：
+账号池由三种来源填充，都进**同一个池**，不区分主次：
 
-1. 在「多账号登录」填入 IdC 的 Start URL（形如 `https://your-org.awsapps.com/start`）与 Region，点「开始登录」。
-2. 服务向 `oidc.<region>.amazonaws.com` 注册一个公共客户端，浏览器新窗口打开 AWS 授权页（**authorization_code + PKCE** 流程）。
-3. 你在浏览器批准后，AWS 回跳到管理页的 `/oauth/callback`，服务用授权码换取 `accessToken` / `refreshToken`，自动解析 `profileArn`，并写入多账号存储。
+1. **启动自动导入**：`serve` 启动时读取本地 `--token-file`（默认 `~/.aws/sso/cache/kiro-auth-token.json`）把 Kiro 桌面端账号导入池（加 `--no-import-local` 可关闭）。
+2. **管理页 IdC 登录**：填入 IdC 的 Start URL（形如 `https://your-org.awsapps.com/start`）与 Region，点「开始登录」；服务向 `oidc.<region>.amazonaws.com` 注册公共客户端，浏览器新窗口打开 AWS 授权页（**authorization_code + PKCE** 流程），批准后 AWS 回跳到 `/oauth/callback`，服务用授权码换取 `accessToken` / `refreshToken`，自动解析 `profileArn`，写入池。
+3. **管理页「导入本机凭据」按钮**：读取 `--token-file` 及其客户端注册文件（`<clientIdHash>.json`，找不到时扫描同目录），把当前 Kiro 桌面端账号一键纳入池。
 
+- **去重**：新账号按身份去重（优先级 `profileArn` > `email` > `clientId + refreshToken`）；命中已有账号时**原地刷新**其凭据，不新增记录。
+- **每账号自带 region / profileArn**：登录/导入时确定并存进该账号自身记录，没有全局 region 覆盖。
 - **存储位置**：默认 `~/.kiro-anthropic/accounts.json`（可用 `--accounts-file` 覆盖）。目录 `0700`、文件 `0600`、原子写。文件含长期凭据（`refreshToken` / `clientSecret`），请妥善保管。
-- **自动续期**：`serve` 期间后台每 60s 扫描存储，对已过期或距过期不足 5 分钟的账号，用其自带的 `clientId` / `clientSecret` / `refreshToken` 经 SSO-OIDC 自动刷新并写回；失败仅记日志、下轮重试。
+- **自动续期（保活）**：`serve` 期间后台每 60s 扫描池，对已过期或距过期不足 5 分钟的账号，用其自带的 `clientId` / `clientSecret` / `refreshToken` 经 SSO-OIDC 自动刷新并写回；失败仅记日志、下轮重试。
 - **回跳与远程部署**：回调地址取自管理页请求的 Host（受回环校验保证是本机）。若服务部署在远程主机，请通过 SSH 端口转发访问管理页，使浏览器的 `localhost` 与服务端回环一致：
 
   ```bash
@@ -172,12 +171,11 @@ http://127.0.0.1:27890/health      # 健康检查
   # 然后在本地浏览器打开 http://localhost:27890
   ```
 
-- **导入本机现有凭据**：管理页的「导入本机凭据」按钮会读取 `--token-file`（默认 `~/.aws/sso/cache/kiro-auth-token.json`）及其客户端注册文件（`<clientIdHash>.json`，找不到时扫描同目录），把当前 Kiro 桌面端已登录的账号一键纳入多账号存储；同一凭据（clientId + refreshToken）已存在时不重复导入。
-#### 多账号请求分发
+#### 账号池请求分发
 
-`/v1/messages` 会在已存账号间做**轮询（round-robin）**负载均衡：
+`/v1/messages` **始终**在账号池里做**轮询（round-robin）**负载均衡，没有主账号概念：
 
-- **回退规则**：账号存储为空时，`/v1/messages` 走 Kiro 桌面端缓存的单账号（`--token-file`），**行为与之前完全一致**；一旦存储里有账号，请求即改为在这些账号间轮询。管理页、`/v1/models`、额度展示始终基于 `--token-file` 的主账号，不受影响。
+- **池空返回 503**：账号池为空时，`/v1/messages` 直接返回 **503**，提示去管理页登录或导入账号。一旦池里有账号，请求即在这些账号间轮询。
 - **流前故障转移**：某账号请求失败（鉴权失效、配额/限流、上游 5xx、网络错误）时，自动切换到下一个账号重试；请求本身的问题（如 400 参数错误）则立即返回，不会白白消耗其他账号。**注意**：故障转移只发生在流开始前——一旦 SSE 开始下发数据（响应头已发出），中途的上游错误只能如实透传，无法再切换账号。
 - **轻量冷却**：失败的账号会被短暂冷却（默认 60s）跳过；全部账号都在冷却时，选用最快恢复的那个。成功一次即清除冷却。
 - **保活**：无论账号是否正被分发使用，后台都会按前述规则自动刷新其令牌。
@@ -226,7 +224,7 @@ http://127.0.0.1:27890/health      # 健康检查
 Anthropic Messages API。支持 `stream: true`（SSE：`message_start` / `content_block_start` / `content_block_delta` / `content_block_stop` / `message_delta` / `message_stop`；`content_block_delta` 涵盖 `text_delta` / `thinking_delta` / `signature_delta` / `input_json_delta`）与非流式聚合响应。支持 `system`、`messages`、`tools`、`tool_result`、`image`、`thinking`、`output_config.effort` / `reasoning_effort`，以及历史消息中的 `thinking` / `redacted_thinking` 块回传。
 
 ### `GET /v1/models`
-返回账号可用模型，每项包含：`id`、`type`、`display_name`、`created_at`、`max_input_tokens`、`max_tokens`、`capabilities.effort`（`supported` 及 `low/medium/high/xhigh/max`）。
+返回账号可用模型，每项包含：`id`、`type`、`display_name`、`created_at`、`max_input_tokens`、`max_tokens`、`capabilities.effort`（`supported` 及 `low/medium/high/xhigh/max`）。用池里任一账号查询；**账号池为空时不报错，返回内置的 fallback 静态模型列表**。
 
 ### `GET /health`
 健康检查。
@@ -235,7 +233,7 @@ Anthropic Messages API。支持 `stream: true`（SSE：`message_start` / `conten
 
 ## 模型与能力
 
-用 `./kiro-anthropic models` 查看你账号实际可用的模型。示例（取决于账号/套餐）：
+在**管理页**（账号卡片上的「模型」按钮）查看你账号实际可用的模型。示例（取决于账号/套餐）：
 
 | 模型 | 上下文（输入） | 最大输出 | effort |
 |---|---|---|---|
@@ -303,18 +301,12 @@ export NO_PROXY=127.0.0.1,localhost
 
 ## 区域说明
 
-本工具区分两个区域，默认相等、绝大多数账号无需关心：
+没有全局区域参数。**每个账号的 region 在登录 / 导入时确定，随账号一起存储**，请求该账号时用它拼出 `oidc.<region>.amazonaws.com`（OIDC 令牌刷新）以及 `runtime.<region>.kiro.dev`（推理）/ `management.<region>.kiro.dev`（模型/profile/额度）。
 
-- **SSO 区域**（`--region`）：用于 OIDC 令牌刷新 `oidc.<region>.amazonaws.com`。默认取自令牌里的 `region`。
-- **API 区域**（`--api-region`）：用于 Kiro 的 `runtime.<region>.kiro.dev`（推理）与 `management.<region>.kiro.dev`（模型/profile/额度）。默认跟随 `--region`。
+- 启动自动导入与「导入本机凭据」：region 取自本地令牌里的 `region`。
+- 管理页 IdC 登录：region 就是你在「添加账号」时填入的 Region。
 
-只有**企业 IdC 账号的 Identity Center 与 Q/Kiro API 不在同一区域**时才需要分别设置——例如 IdC 在 `us-east-1`，而 API 只在 `eu-central-1` 提供：
-
-```bash
-./kiro-anthropic serve --region us-east-1 --api-region eu-central-1
-```
-
-此时 `status` 会额外打印一行 `api region`。不设 `--api-region` 时行为与旧版完全一致。
+因此不同账号可以位于不同区域，互不影响。
 
 ---
 
@@ -334,16 +326,17 @@ export NO_PROXY=127.0.0.1,localhost
 ```
 main.go          CLI 入口（cobra）、参数、代理解析、启动
 httpclient.go    出站 HTTP 客户端（代理感知）
-token.go         令牌加载/刷新（SSO-OIDC）、profileArn 解析
+token.go         令牌文件类型/解析（供导入用）
+selector.go      账号选择/轮询（round-robin + 冷却）、凭据抽象
 eventstream.go   AWS vnd.amazon.eventstream 解码（基于 smithy-go）
 kiro.go          Kiro 运行时客户端、请求/响应类型、模型列表、账号额度（getUsageLimits）
 anthropic.go     Anthropic 类型、模型映射、请求翻译、SSE 组装
 server.go        HTTP 服务与各端点、结构化访问日志（slog）
-admin.go         管理页（仅本机）：路由、回环 + Host 校验、账号/额度/模型聚合 JSON、登录/账号端点
+admin.go         管理页（仅本机）：路由、回环 + Host 校验、账号卡片/额度/模型聚合 JSON、登录/账号端点
 admin.html       管理页前端（内嵌，go:embed）
 login.go         企业 IdC 登录（authorization_code + PKCE）、账号令牌刷新
-accounts.go      多账号凭据存储（JSON 持久化、原子写、脱敏视图）
-refresher.go     后台定期刷新已存账号的令牌
+accounts.go      账号池凭据存储（JSON 持久化、原子写、脱敏视图）
+refresher.go     后台定期刷新账号池令牌
 listen.go        监听辅助：端口被占用时自动 +1 重试
 upgrade.go       从 GitHub Release 自更新（minio/selfupdate + semver）
 build.sh         跨平台构建脚本

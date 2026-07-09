@@ -26,7 +26,12 @@ func newAdminTestServer(t *testing.T) (*Server, http.Handler, *fakeOIDC) {
 	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
 	require.NoError(t, err)
 
-	s := &Server{cfg: &Config{}, accounts: store, login: newLoginManager(client)}
+	s := &Server{
+		cfg: &Config{}, accounts: store, login: newLoginManager(client),
+		selector:    newAccountSelector(store, client),
+		modelsCache: map[string]modelsCacheEntry{},
+		usageCache:  map[string]usageCacheEntry{},
+	}
 	return s, s.AdminHandler(), fake
 }
 
@@ -105,6 +110,29 @@ func TestAdminAccountLabelUpdate(t *testing.T) {
 	// Missing id -> 400.
 	bad := doAdmin(h, http.MethodPost, "/api/accounts/label", `{"label":"x"}`)
 	assert.Equal(t, http.StatusBadRequest, bad.Code)
+}
+
+func TestAdminStatusPerAccount(t *testing.T) {
+	s, h, _ := newAdminTestServer(t)
+	require.NoError(t, s.accounts.Add(&StoredAccount{
+		ID: "a1", Email: "a@x.com", Label: "team", Provider: "Enterprise",
+		Region: "us-east-1", CreatedAt: "1",
+	}))
+
+	rr := doAdmin(h, http.MethodGet, "/api/status.json", "")
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var resp struct {
+		Accounts []map[string]any `json:"accounts"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	require.Len(t, resp.Accounts, 1)
+	assert.Equal(t, "a@x.com", resp.Accounts[0]["email"])
+	assert.Equal(t, "team", resp.Accounts[0]["label"])
+	// Usage present as an inline object (error is fine; the fake has no usage endpoint).
+	assert.Contains(t, resp.Accounts[0], "usage")
+	// Secrets never leak.
+	assert.NotContains(t, rr.Body.String(), "client_secret")
+	assert.NotContains(t, rr.Body.String(), "refresh_token")
 }
 
 func TestAdminCallbackStateMismatch(t *testing.T) {

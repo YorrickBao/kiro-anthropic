@@ -290,9 +290,9 @@ func (m *loginManager) completeLogin(ctx context.Context, state, code string) (*
 	return acct, nil
 }
 
-// importLocalCredentials builds a StoredAccount from an existing Kiro auth cache
-// (the same files TokenStore reads): the token file plus its client
-// registration companion. It resolves the profileArn best-effort. The returned
+// importLocalCredentials builds a StoredAccount from an existing Kiro auth
+// cache: the token file plus its client registration companion. It resolves the
+// profileArn best-effort. The returned
 // account has a fresh id; the caller is responsible for dedup and persistence.
 func importLocalCredentials(ctx context.Context, client *http.Client, tokenFile string) (*StoredAccount, error) {
 	tok, _, err := loadToken(tokenFile)
@@ -332,6 +332,24 @@ func importLocalCredentials(ctx context.Context, client *http.Client, tokenFile 
 		acct.Email = fetchAccountEmail(ctx, client, region, acct.ProfileArn, tok.AccessToken)
 	}
 	return acct, nil
+}
+
+// importLocalIntoStore imports the local Kiro credentials into the account
+// store, deduping against existing accounts (refreshing in place on a match).
+// Returns 1 if an account was added, 0 if it was already present (refreshed) or
+// there was nothing to import. An error means the local cache was unreadable.
+func importLocalIntoStore(ctx context.Context, store *AccountStore, client *http.Client, tokenFile string) (int, error) {
+	acct, err := importLocalCredentials(ctx, client, tokenFile)
+	if err != nil {
+		return 0, err
+	}
+	if id, ok := store.FindDuplicate(*acct); ok {
+		return 0, store.ReplaceCredentials(id, acct)
+	}
+	if err := store.Add(acct); err != nil {
+		return 0, err
+	}
+	return 1, nil
 }
 
 // findClientRegistration locates the clientId/clientSecret for an imported
@@ -377,8 +395,7 @@ func readClientRegistration(path string) (clientRegistration, error) {
 // refreshAccountToken performs an SSO-OIDC refresh_token grant for a stored IdC
 // account, using the account's own clientId/clientSecret/refreshToken. It
 // returns the new access token, refresh token (may be unchanged) and RFC3339
-// expiry. It mirrors TokenStore.refreshLocked but operates on a StoredAccount
-// and does not touch Kiro's on-disk cache.
+// expiry. It operates on a StoredAccount and does not touch Kiro's on-disk cache.
 func refreshAccountToken(ctx context.Context, client *http.Client, a StoredAccount) (accessToken, refreshToken, expiresAt string, err error) {
 	if a.RefreshToken == "" {
 		return "", "", "", fmt.Errorf("account has no refreshToken")

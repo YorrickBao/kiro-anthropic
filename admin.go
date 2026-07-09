@@ -107,33 +107,51 @@ func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(adminHTML)
 }
 
-// handleAdminStatus returns the account, usage and model information rendered by
-// the admin page.
+// handleAdminStatus returns the per-account identity, usage and model
+// information rendered by the admin page. Every stored account is included;
+// usage is fetched per-account (cached) and surfaced inline so one account's
+// failure does not hide the rest.
 func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	now := time.Now()
 
+	proxy := s.cfg.ProxyURL
+	if proxy == "" {
+		proxy = "direct (no proxy)"
+	}
+
 	resp := map[string]any{
-		"service": "kiro-anthropic",
-		"version": version,
-		"now":     now.UTC().Format(time.RFC3339),
-		"account": s.accountView(ctx),
-		"models":  s.modelsView(ctx, now),
+		"service":          "kiro-anthropic",
+		"version":          version,
+		"now":              now.UTC().Format(time.RFC3339),
+		"outbound_proxy":   proxy,
+		"api_key_required": s.cfg.APIKey != "",
+		"accounts":         s.accountsStatus(ctx, now),
+		"models":           s.modelsView(ctx, now),
 	}
-
-	// Usage is a live control-plane call (cached); surface failures inline so the
-	// rest of the page still renders.
-	if u, err := s.ensureUsage(ctx); err != nil {
-		resp["usage"] = map[string]any{"error": err.Error()}
-	} else {
-		resp["usage"] = u
-		// Fill the account email from usage when available.
-		if acct, ok := resp["account"].(map[string]any); ok && u.Email != "" {
-			acct["email"] = u.Email
-		}
-	}
-
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// accountsStatus assembles the per-account panel data: identity (redacted) plus
+// live usage (cached per account). Failures are surfaced inline per account.
+func (s *Server) accountsStatus(ctx context.Context, now time.Time) []map[string]any {
+	out := make([]map[string]any, 0)
+	if s.selector == nil {
+		return out
+	}
+	for _, creds := range s.selector.listAll() {
+		v := creds.acct.view()
+		if u, err := s.ensureUsage(ctx, creds); err != nil {
+			v["usage"] = map[string]any{"error": err.Error()}
+		} else {
+			v["usage"] = u
+			if u.Email != "" && (v["email"] == nil || v["email"] == "") {
+				v["email"] = u.Email
+			}
+		}
+		out = append(out, v)
+	}
+	return out
 }
 
 // handleAccountsList returns the stored (self-managed) accounts, redacted.
@@ -331,58 +349,12 @@ func htmlEscape(s string) string {
 	return r.Replace(s)
 }
 
-// accountView assembles the account/auth panel data from the token store.
-func (s *Server) accountView(ctx context.Context) map[string]any {
-	tok := s.store.snapshot()
-
-	proxy := s.cfg.ProxyURL
-	if proxy == "" {
-		proxy = "direct (no proxy)"
-	}
-
-	acct := map[string]any{
-		"provider":            tok.Provider,
-		"auth_method":         tok.AuthMethod,
-		"region":              s.store.region(),
-		"token_file":          s.cfg.TokenFile,
-		"access_token_masked": masked(tok.AccessToken),
-		"outbound_proxy":      proxy,
-		"api_key_required":    s.cfg.APIKey != "",
-		"expires_at":          tok.ExpiresAt,
-	}
-
-	exp := tok.expiry()
-	switch {
-	case exp.IsZero():
-		acct["expiry_state"] = "unknown"
-	default:
-		d := time.Until(exp).Round(time.Second)
-		state := "valid"
-		switch {
-		case d <= 0:
-			state = "expired"
-		case d < tokenRefreshBuffer:
-			state = "expiring soon"
-		}
-		acct["expiry_state"] = state
-		acct["expires_in_seconds"] = int(d.Seconds())
-	}
-
-	// profileArn may need a network resolve for Enterprise; keep failures soft.
-	if arn, err := s.store.ProfileArn(ctx); err != nil {
-		acct["profile_arn_error"] = err.Error()
-	} else {
-		acct["profile_arn"] = arn
-	}
-	return acct
-}
-
-// modelsView renders the account's models as Anthropic ModelInfo objects, or an
-// id-only fallback when the control plane is unreachable.
+// modelsView renders the available models (from any account) as Anthropic
+// ModelInfo objects, or an id-only fallback when no account can list models.
 func (s *Server) modelsView(ctx context.Context, now time.Time) []map[string]any {
 	ts := now.UTC().Format(time.RFC3339)
 	out := make([]map[string]any, 0)
-	if models := s.ensureModels(ctx); len(models) > 0 {
+	if models := s.anyModels(ctx); len(models) > 0 {
 		for _, m := range models {
 			out = append(out, modelInfoJSON(m, ts))
 		}

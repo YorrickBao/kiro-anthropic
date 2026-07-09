@@ -63,7 +63,7 @@ func serverWithPool(t *testing.T, rt *fakeRuntime, accessTokens ...string) *Serv
 	}
 
 	cfg := &Config{}
-	s := &Server{cfg: cfg, kiro: NewKiroClient(cfg, nil, client)}
+	s := &Server{cfg: cfg, kiro: NewKiroClient(cfg, client)}
 	s.setAccounts(store, client)
 	return s
 }
@@ -93,6 +93,13 @@ func TestOpenStreamAllAccountsFail(t *testing.T) {
 	he, ok := err.(*kiroHTTPError)
 	require.True(t, ok)
 	assert.Equal(t, http.StatusInternalServerError, he.Status)
+}
+
+func TestOpenStreamEmptyPool(t *testing.T) {
+	rt := newFakeRuntime(t)
+	s := serverWithPool(t, rt) // no accounts
+	_, err := s.openStream(context.Background(), &kiroRequest{})
+	require.ErrorIs(t, err, errNoAccount)
 }
 
 func TestOpenStreamRequestErrorDoesNotBurnAccounts(t *testing.T) {

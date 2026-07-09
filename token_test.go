@@ -26,36 +26,6 @@ func TestTokenExpiry(t *testing.T) {
 	assert.True(t, (Token{ExpiresAt: "not-a-date"}).expiry().IsZero(), "garbage expiresAt should be zero")
 }
 
-func TestRegionResolution(t *testing.T) {
-	// region(): --region override > token region > us-east-1 default.
-	assert.Equal(t, "eu-west-1",
-		(&TokenStore{cfg: &Config{Region: "eu-west-1"}, tok: Token{Region: "ap-south-1"}}).region(),
-		"--region should win over token region")
-	assert.Equal(t, "ap-south-1",
-		(&TokenStore{cfg: &Config{}, tok: Token{Region: "ap-south-1"}}).region(),
-		"token region should be used when no override")
-	assert.Equal(t, "us-east-1",
-		(&TokenStore{cfg: &Config{}, tok: Token{}}).region(),
-		"should default to us-east-1")
-}
-
-func TestApiRegionResolution(t *testing.T) {
-	// apiRegion(): --api-region override > region() (which itself falls back).
-	assert.Equal(t, "eu-central-1",
-		(&TokenStore{cfg: &Config{APIRegion: "eu-central-1"}, tok: Token{Region: "us-east-1"}}).apiRegion(),
-		"--api-region should override the SSO region for API endpoints")
-
-	// Without --api-region, apiRegion tracks region() exactly.
-	s := &TokenStore{cfg: &Config{Region: "us-east-1"}, tok: Token{Region: "ap-south-1"}}
-	assert.Equal(t, s.region(), s.apiRegion(),
-		"api region should default to the SSO region when not overridden")
-
-	// --api-region does not affect the SSO region used for OIDC refresh.
-	split := &TokenStore{cfg: &Config{Region: "us-east-1", APIRegion: "eu-central-1"}}
-	assert.Equal(t, "us-east-1", split.region(), "SSO region stays put")
-	assert.Equal(t, "eu-central-1", split.apiRegion(), "API region diverges")
-}
-
 func TestTokenValid(t *testing.T) {
 	now := time.Date(2026, 7, 6, 9, 0, 0, 0, time.UTC)
 

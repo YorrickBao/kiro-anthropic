@@ -4,14 +4,36 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+// testServerWithModels builds a Server whose model lookups resolve from a
+// pre-seeded per-account cache (no network), with one account in the pool so
+// anyModels can pick it.
 func testServerWithModels() *Server {
-	return &Server{cfg: &Config{}, modelsCache: []kiroModelInfo{testOpusModel(), testSonnet45Model()}}
+	store, err := NewAccountStore(filepath.Join(os.TempDir(), "sfm-"+time.Now().Format("150405.000000")+".json"))
+	if err != nil {
+		panic(err)
+	}
+	_ = store.Add(&StoredAccount{ID: "acc", Region: "us-east-1", CreatedAt: "1"})
+	s := &Server{
+		cfg:         &Config{},
+		selector:    newAccountSelector(store, &http.Client{}),
+		accounts:    store,
+		modelsCache: map[string]modelsCacheEntry{},
+		usageCache:  map[string]usageCacheEntry{},
+	}
+	s.modelsCache["acc"] = modelsCacheEntry{
+		models:  []kiroModelInfo{testOpusModel(), testSonnet45Model()},
+		fetched: time.Now(),
+	}
+	return s
 }
 
 func reqForModel(model string) *kiroRequest {

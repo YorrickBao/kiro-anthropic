@@ -12,8 +12,8 @@ const accountRefreshInterval = 60 * time.Second
 
 // accountRefresher periodically refreshes stored accounts whose access token is
 // at or near expiry, using each account's own SSO-OIDC client registration and
-// refresh token. It is independent of TokenStore (which owns the single active
-// Kiro-cache account) and only touches the multi-account store.
+// refresh token. It operates only on the multi-account store, which is the sole
+// source of accounts.
 type accountRefresher struct {
 	store    *AccountStore
 	client   *http.Client

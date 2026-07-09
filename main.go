@@ -37,19 +37,17 @@ const defaultProxyURL = "http://127.0.0.1:7890"
 
 // Config holds everything the server needs to run.
 type Config struct {
-	Host         string
-	Port         int
-	AdminPort    int    // loopback-only management port (default 27890)
-	ProxyURL     string // outbound proxy for calls to AWS / kiro.dev (e.g. http://127.0.0.1:7890)
-	TokenFile    string // path to kiro-auth-token.json
-	AccountsFile string // path to the self-managed multi-account credential store
-	ProfileArn   string // optional explicit profileArn override
-	APIKey       string // optional key clients must send (x-api-key / Authorization)
-	AgentMode    string // Kiro agent mode, e.g. "vibe"
-	Region       string // optional SSO region override (defaults to the token's region); drives OIDC token refresh
-	APIRegion    string // optional Kiro API region override (defaults to Region); drives runtime/management.<region>.kiro.dev
-	Log          bool   // enable request logging (off by default); logs to stdout unless LogFile is set
-	LogFile      string // if set, write the request log here instead of stdout ("none"/"off" disables)
+	Host          string
+	Port          int
+	AdminPort     int    // loopback-only management port (default 27890)
+	ProxyURL      string // outbound proxy for calls to AWS / kiro.dev (e.g. http://127.0.0.1:7890)
+	TokenFile     string // path to kiro-auth-token.json (source for startup import)
+	AccountsFile  string // path to the multi-account credential store
+	NoImportLocal bool   // if set, do not auto-import local Kiro credentials on startup
+	APIKey        string // optional key clients must send (x-api-key / Authorization)
+	AgentMode     string // Kiro agent mode, e.g. "vibe"
+	Log           bool   // enable request logging (off by default); logs to stdout unless LogFile is set
+	LogFile       string // if set, write the request log here instead of stdout ("none"/"off" disables)
 }
 
 func defaultTokenFile() string {
@@ -84,8 +82,6 @@ func newRootCmd() *cobra.Command {
 	root.SetVersionTemplate(versionString())
 	root.AddCommand(
 		newServeCmd(),
-		newStatusCmd(),
-		newModelsCmd(),
 		newVersionCmd(),
 		newUpgradeCmd(),
 	)
@@ -105,9 +101,7 @@ func versionString() string {
 	return s
 }
 
-// addServerFlags registers the flags shared by serve/status/models. status and
-// models only read a subset (proxy, token, region, profile-arn) but accept the
-// rest for symmetry.
+// addServerFlags registers the flags for the serve command.
 func addServerFlags(cmd *cobra.Command, cfg *Config) {
 	f := cmd.Flags()
 	f.StringVar(&cfg.Host, "host", "127.0.0.1", "host/interface to bind")
@@ -115,12 +109,10 @@ func addServerFlags(cmd *cobra.Command, cfg *Config) {
 	f.IntVar(&cfg.AdminPort, "admin-port", 27890, "loopback-only management port (auto-increments if in use)")
 	f.StringVar(&cfg.ProxyURL, "proxy", "", "outbound HTTP proxy for AWS/Kiro calls; precedence: this flag > http(s)_proxy env > default "+defaultProxyURL+"; use 'none' to connect directly")
 	f.StringVar(&cfg.TokenFile, "token-file", defaultTokenFile(), "path to Kiro auth token JSON")
-	f.StringVar(&cfg.AccountsFile, "accounts-file", defaultAccountsFile(), "path to the self-managed multi-account credential store")
-	f.StringVar(&cfg.ProfileArn, "profile-arn", "", "explicit CodeWhisperer profileArn (auto-resolved if empty)")
+	f.StringVar(&cfg.AccountsFile, "accounts-file", defaultAccountsFile(), "path to the multi-account credential store")
+	f.BoolVar(&cfg.NoImportLocal, "no-import-local", false, "do not auto-import the local Kiro credentials (--token-file) into the account pool on startup")
 	f.StringVar(&cfg.APIKey, "api-key", "", "if set, clients must present this key via x-api-key or Authorization: Bearer")
 	f.StringVar(&cfg.AgentMode, "agent-mode", "vibe", "Kiro agent mode")
-	f.StringVar(&cfg.Region, "region", "", "SSO region override for OIDC token refresh (defaults to the token's region)")
-	f.StringVar(&cfg.APIRegion, "api-region", "", "Kiro API region for runtime/management.<region>.kiro.dev (defaults to --region; set only when the Q/Kiro API is served from a different region than your IdC)")
 	f.BoolVar(&cfg.Log, "log", false, "enable request logging to stdout (the window); off by default")
 	f.StringVar(&cfg.LogFile, "log-file", "", "write the request log to this file instead of stdout (implies --log); 'none' disables")
 }
@@ -132,30 +124,6 @@ func newServeCmd() *cobra.Command {
 		Short: "Start the Anthropic-compatible HTTP server (default port 17890)",
 		Args:  cobra.NoArgs,
 		RunE:  func(_ *cobra.Command, _ []string) error { return runServe(cfg) },
-	}
-	addServerFlags(cmd, cfg)
-	return cmd
-}
-
-func newStatusCmd() *cobra.Command {
-	cfg := &Config{}
-	cmd := &cobra.Command{
-		Use:   "status",
-		Short: "Show the current Kiro auth/token status",
-		Args:  cobra.NoArgs,
-		RunE:  func(_ *cobra.Command, _ []string) error { return runStatus(cfg) },
-	}
-	addServerFlags(cmd, cfg)
-	return cmd
-}
-
-func newModelsCmd() *cobra.Command {
-	cfg := &Config{}
-	cmd := &cobra.Command{
-		Use:   "models",
-		Short: "List the model IDs available to this Kiro account",
-		Args:  cobra.NoArgs,
-		RunE:  func(_ *cobra.Command, _ []string) error { return runModels(cfg) },
 	}
 	addServerFlags(cmd, cfg)
 	return cmd
@@ -239,19 +207,24 @@ func runServe(cfg *Config) error {
 
 	client := newHTTPClient(cfg.ProxyURL)
 
-	store, err := NewTokenStore(cfg, client)
+	srv := NewServer(cfg, client)
+
+	accounts, err := NewAccountStore(cfg.AccountsFile)
 	if err != nil {
-		return fmt.Errorf("auth init failed: %w", err)
+		return fmt.Errorf("account store init failed: %w", err)
 	}
+	srv.setAccounts(accounts, client)
 
-	srv := NewServer(cfg, store, client)
-
-	if cfg.AccountsFile != "" {
-		accounts, err := NewAccountStore(cfg.AccountsFile)
-		if err != nil {
-			return fmt.Errorf("account store init failed: %w", err)
+	// Unless disabled, adopt the local Kiro desktop credentials into the pool on
+	// startup so an existing sign-in works out of the box. Best-effort: a missing
+	// or unreadable cache is not fatal (the pool can still be filled via the
+	// admin page), keeping zero-account startup possible.
+	if !cfg.NoImportLocal {
+		if n, err := importLocalIntoStore(context.Background(), accounts, client, cfg.TokenFile); err != nil {
+			fmt.Fprintf(os.Stderr, "note: could not import local credentials (%v); pool starts with %d account(s)\n", err, len(accounts.List()))
+		} else if n > 0 {
+			fmt.Printf("  imported local Kiro credentials into the account pool\n")
 		}
-		srv.setAccounts(accounts, client)
 	}
 
 	logger, closeLog, logNote, err := setupRequestLog(cfg.Log, cfg.LogFile)
@@ -290,11 +263,9 @@ func runServe(cfg *Config) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Periodically refresh stored (self-managed) accounts before their tokens
-	// expire. Stops when ctx is cancelled.
-	if srv.accounts != nil {
-		go newAccountRefresher(srv.accounts, client, logger).Run(ctx)
-	}
+	// Periodically refresh stored accounts before their tokens expire. Stops
+	// when ctx is cancelled.
+	go newAccountRefresher(srv.accounts, client, logger).Run(ctx)
 
 	serveErr := make(chan error, 2)
 	go func() {
@@ -317,7 +288,7 @@ func runServe(cfg *Config) error {
 	fmt.Printf("  endpoint  : POST http://%s/v1/messages\n", addr)
 	fmt.Printf("  admin     : http://%s  (localhost only)\n", adminAddr)
 	fmt.Printf("  outbound  : %s\n", proxyNote)
-	fmt.Printf("  token     : %s\n", cfg.TokenFile)
+	fmt.Printf("  accounts  : %d in pool (%s)\n", len(accounts.List()), cfg.AccountsFile)
 	if cfg.APIKey == "" {
 		fmt.Printf("  auth      : open (no api key required; bound to %s)\n", cfg.Host)
 	} else {
@@ -341,104 +312,6 @@ func runServe(cfg *Config) error {
 	return nil
 }
 
-func runStatus(cfg *Config) error {
-	if err := configureProxy(cfg); err != nil {
-		return err
-	}
-	client := newHTTPClient(cfg.ProxyURL)
-
-	store, err := NewTokenStore(cfg, client)
-	if err != nil {
-		return fmt.Errorf("auth init failed: %w", err)
-	}
-
-	tok := store.snapshot()
-	proxyNote := cfg.ProxyURL
-	if proxyNote == "" {
-		proxyNote = "direct (no proxy)"
-	}
-	fmt.Printf("outbound   : %s\n", proxyNote)
-	fmt.Printf("token file : %s\n", cfg.TokenFile)
-	fmt.Printf("provider   : %s\n", orNone(tok.Provider))
-	fmt.Printf("authMethod : %s\n", orNone(tok.AuthMethod))
-	fmt.Printf("region     : %s (SSO/OIDC)\n", orNone(store.region()))
-	if store.apiRegion() != store.region() {
-		fmt.Printf("api region : %s (runtime/management.kiro.dev)\n", orNone(store.apiRegion()))
-	}
-	fmt.Printf("expiresAt  : %s\n", orNone(tok.ExpiresAt))
-	if tok.expiry().IsZero() {
-		fmt.Printf("expiry     : unknown\n")
-	} else {
-		d := time.Until(tok.expiry()).Round(time.Second)
-		state := "valid"
-		if d <= 0 {
-			state = "EXPIRED"
-		} else if d < tokenRefreshBuffer {
-			state = "expiring soon"
-		}
-		fmt.Printf("expiry     : %s (%s)\n", state, d)
-	}
-
-	fmt.Printf("access tok : %s\n", masked(tok.AccessToken))
-
-	// Try to resolve the profileArn (may require a network call for Enterprise).
-	arn, err := store.ProfileArn(context.Background())
-	if err != nil {
-		fmt.Printf("profileArn : (resolve failed: %v)\n", err)
-	} else {
-		fmt.Printf("profileArn : %s\n", orNone(arn))
-	}
-	return nil
-}
-
-func runModels(cfg *Config) error {
-	if err := configureProxy(cfg); err != nil {
-		return err
-	}
-	client := newHTTPClient(cfg.ProxyURL)
-
-	store, err := NewTokenStore(cfg, client)
-	if err != nil {
-		return fmt.Errorf("auth init failed: %w", err)
-	}
-
-	kc := NewKiroClient(cfg, store, client)
-	models, err := kc.ListModels(context.Background())
-	if err != nil {
-		return fmt.Errorf("list models failed: %w", err)
-	}
-	if len(models) == 0 {
-		fmt.Println("(no models returned)")
-		return nil
-	}
-	fmt.Printf("%d models available to this account:\n", len(models))
-	for _, m := range models {
-		def := ""
-		if m.Default || m.IsDefault {
-			def = "  (default)"
-		}
-		name := m.ModelName
-		if name != "" && name != m.ModelID {
-			name = "  " + name
-		} else {
-			name = ""
-		}
-		lim := ""
-		if m.TokenLimits.MaxInputTokens > 0 || m.TokenLimits.MaxOutputTokens > 0 {
-			lim = fmt.Sprintf("  [ctx %s in / %s out]",
-				humanTokens(m.TokenLimits.MaxInputTokens), humanTokens(m.TokenLimits.MaxOutputTokens))
-		}
-		eff := ""
-		if ec, ok := m.effort(); ok {
-			eff = fmt.Sprintf("  [effort %s]", strings.Join(ec.Levels, "/"))
-		}
-		fmt.Printf("  %s%s%s%s%s\n", m.ModelID, name, lim, eff, def)
-	}
-	fmt.Println("\nUse any of these IDs as the Anthropic \"model\", or aliases like")
-	fmt.Println("\"claude-opus-...\"/\"...sonnet...\" (mapped automatically), or \"auto\".")
-	return nil
-}
-
 // firstNonEmptyEnv returns the first non-empty environment variable value.
 func firstNonEmptyEnv(keys ...string) string {
 	for _, k := range keys {
@@ -447,31 +320,6 @@ func firstNonEmptyEnv(keys ...string) string {
 		}
 	}
 	return ""
-}
-
-// humanTokens formats a token count compactly, e.g. 1000000 -> "1M", 128000 -> "128K".
-func humanTokens(n int) string {
-	switch {
-	case n <= 0:
-		return "?"
-	case n%1_000_000 == 0:
-		return fmt.Sprintf("%dM", n/1_000_000)
-	case n >= 1_000_000:
-		return fmt.Sprintf("%.1fM", float64(n)/1e6)
-	case n%1000 == 0:
-		return fmt.Sprintf("%dK", n/1000)
-	case n >= 1000:
-		return fmt.Sprintf("%.1fK", float64(n)/1e3)
-	default:
-		return fmt.Sprintf("%d", n)
-	}
-}
-
-func orNone(s string) string {
-	if s == "" {
-		return "(none)"
-	}
-	return s
 }
 
 func masked(s string) string {

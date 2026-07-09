@@ -127,6 +127,7 @@ func (s *accountSelector) pick(tried map[string]bool) (*accountCreds, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
+	s.pruneCooldownLocked(list)
 
 	// Round-robin scan for an account that is neither tried nor cooling down.
 	var soonest *StoredAccount
@@ -159,6 +160,23 @@ func (s *accountSelector) pick(tried map[string]bool) (*accountCreds, bool) {
 // credsFor builds accountCreds for the given account snapshot.
 func (s *accountSelector) credsFor(a StoredAccount) *accountCreds {
 	return &accountCreds{store: s.store, client: s.client, id: a.ID, acct: a}
+}
+
+// pruneCooldownLocked drops cooldown entries for accounts no longer in the
+// store, so removed accounts do not leak entries. Caller must hold s.mu.
+func (s *accountSelector) pruneCooldownLocked(list []StoredAccount) {
+	if len(s.cooldown) == 0 {
+		return
+	}
+	live := make(map[string]bool, len(list))
+	for _, a := range list {
+		live[a.ID] = true
+	}
+	for id := range s.cooldown {
+		if !live[id] {
+			delete(s.cooldown, id)
+		}
+	}
 }
 
 // peekAny returns credentials for one eligible account for a control-plane call

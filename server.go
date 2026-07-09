@@ -698,7 +698,11 @@ func (s *Server) authorized(r *http.Request) bool {
 		return k == s.cfg.APIKey
 	}
 	if a := r.Header.Get("Authorization"); a != "" {
-		return strings.TrimPrefix(a, "Bearer ") == s.cfg.APIKey
+		// The scheme is case-insensitive per RFC 7235; accept "Bearer", "bearer", etc.
+		if len(a) >= 7 && strings.EqualFold(a[:7], "Bearer ") {
+			a = a[7:]
+		}
+		return a == s.cfg.APIKey
 	}
 	return false
 }

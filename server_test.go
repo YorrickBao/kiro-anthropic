@@ -150,6 +150,10 @@ func TestAuthorized(t *testing.T) {
 		"wrong x-api-key should reject")
 	assert.True(t, s.authorized(mk(func(r *http.Request) { r.Header.Set("Authorization", "Bearer secret") })),
 		"matching bearer should authorize")
+	assert.True(t, s.authorized(mk(func(r *http.Request) { r.Header.Set("Authorization", "bearer secret") })),
+		"scheme is case-insensitive")
+	assert.False(t, s.authorized(mk(func(r *http.Request) { r.Header.Set("Authorization", "Bearer wrong") })),
+		"wrong bearer should reject")
 	assert.False(t, s.authorized(mk(func(r *http.Request) {})),
 		"missing key should reject")
 }

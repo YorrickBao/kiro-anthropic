@@ -118,6 +118,24 @@ func TestSelectorSuccessClearsCooldown(t *testing.T) {
 	assert.False(t, stillCooling)
 }
 
+func TestSelectorCooldownPrunedForRemovedAccount(t *testing.T) {
+	s := newTestSelector(t, "a", "b")
+	s.recordFailure("a")
+	s.recordFailure("b")
+	s.mu.Lock()
+	require.Len(t, s.cooldown, 2)
+	s.mu.Unlock()
+
+	// Remove "a" from the store; the next pick should prune its cooldown entry.
+	require.NoError(t, s.store.Remove("a"))
+	_, _ = s.pick(map[string]bool{})
+
+	s.mu.Lock()
+	_, aStale := s.cooldown["a"]
+	s.mu.Unlock()
+	assert.False(t, aStale, "cooldown entry for a removed account must be pruned")
+}
+
 func TestSelectorConcurrentPick(t *testing.T) {
 	s := newTestSelector(t, "a", "b", "c", "d")
 	var wg sync.WaitGroup

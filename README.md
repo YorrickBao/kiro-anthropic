@@ -26,7 +26,7 @@
 - **最大输出 tokens**：按模型 schema 把调用方的 `max_tokens` 下发给 Kiro。**注意：实测 Kiro 后端不强制执行该上限**，实际输出长度由模型/effort 决定，`stop_reason` 基本不会是 `max_tokens`。该字段仅为协议兼容而发送。
 - **模型能力发现** `GET /v1/models`：返回 `max_input_tokens`、`max_tokens`、`capabilities.effort`（上下文窗口、effort 档位）。
 - **账号池**：无主账号，所有请求走账号池轮询。账号来自启动自动导入本地凭据、管理页 IdC 登录、管理页「导入本机凭据」，三者进同一个池；后台自动刷新令牌保活。池为空时 `/v1/messages` 返回 503。
-- **令牌自动刷新**：池里每个账号快过期时都用 SSO-OIDC 自动续期并写回。
+- **令牌自动刷新**：池里每个账号快过期时都用 SSO-OIDC 自动续期并写回；刷新经 singleflight 去重，请求路径与后台保活不会对同一账号重复发起 `CreateToken`。
 - **profileArn 自动解析**：企业/IdC 账号走 `ListAvailableProfiles`，免费/社交登录用内置固定 ARN；结果随账号存储。
 - **出站代理**：所有到 AWS / Kiro 的请求都走代理，默认 `http://127.0.0.1:7890`，可覆盖或关闭。
 - **可选本地鉴权**：`--api-key` 要求客户端携带 key。
@@ -130,7 +130,7 @@ curl --noproxy '*' http://127.0.0.1:17890/v1/messages \
 `serve` 会在 API 端口之外，额外起一个**只监听 `127.0.0.1`** 的管理端口（默认 `27890`），以**账号卡片**的形式管理整个账号池，并支持自助登录企业账号：
 
 ```
-http://127.0.0.1:27890/            # 管理页（HTML，每 10s 自动刷新）
+http://127.0.0.1:27890/            # 管理页（HTML，每 15s 自动刷新）
 http://127.0.0.1:27890/api/status.json     # 页面数据源（accounts 数组 + models）
 http://127.0.0.1:27890/api/accounts.json   # 账号池列表（脱敏）
 http://127.0.0.1:27890/health      # 健康检查
@@ -141,6 +141,7 @@ http://127.0.0.1:27890/health      # 健康检查
 - **账号信息**：账号邮箱、备注、provider、authMethod、该账号的 region / profileArn、令牌过期状态与倒计时、打码后的 access token。邮箱在登录/导入时经 `getUsageLimits` 解析。每张卡片可逐个删除对应账号。
 - **额度信息**：卡片上展示该账号的订阅级别、剩余 / 已用 / 总额度（credits，带进度条）、重置日期、试用额度（若在生效期）、超额封顶 / 单价 / 状态。额度来自控制面 `management.<region>.kiro.dev/getUsageLimits`，**每账号**缓存 60s。
 - **模型信息**：卡片上的「模型」按钮，点击后弹出 popover 显示该账号可用模型的 ID、名称、最大输入 / 输出 tokens、effort 档位（与 `/v1/models` 同源）。
+- **手动刷新令牌**：每张卡片有「刷新令牌」按钮，可单独强制刷新该账号的 SSO-OIDC 令牌；账号区标题处另有「刷新全部令牌」按钮，一次刷新池内全部账号。两者都走与自动保活相同的 singleflight 协调路径，刷新成功后立即拉取该账号最新额度。
 - **添加账号（企业 IdC）**：填入 Identity Center 的 **Start URL** 与 **Region**（可加备注）即可发起登录，见下节；也可点「导入本机凭据」把当前 Kiro 桌面端账号纳入池。
 - 页面全局信息：出站代理、是否需要 api-key。
 
@@ -163,7 +164,7 @@ http://127.0.0.1:27890/health      # 健康检查
 - **去重**：新账号按身份去重（优先级 `profileArn` > `email` > `clientId + refreshToken`）；命中已有账号时**原地刷新**其凭据，不新增记录。
 - **每账号自带 region / profileArn**：登录/导入时确定并存进该账号自身记录，没有全局 region 覆盖。
 - **存储位置**：默认 `~/.kiro-anthropic/accounts.json`（可用 `--accounts-file` 覆盖）。目录 `0700`、文件 `0600`、原子写。文件含长期凭据（`refreshToken` / `clientSecret`），请妥善保管。
-- **自动续期（保活）**：`serve` 期间后台每 60s 扫描池，对已过期或距过期不足 5 分钟的账号，用其自带的 `clientId` / `clientSecret` / `refreshToken` 经 SSO-OIDC 自动刷新并写回；失败仅记日志、下轮重试。
+- **自动续期（保活）**：`serve` 期间后台每 60s 扫描池，对已过期或距过期不足 5 分钟的账号，用其自带的 `clientId` / `clientSecret` / `refreshToken` 经 SSO-OIDC 自动刷新并写回；失败仅记日志、下轮重试。刷新经 singleflight 去重，与请求路径、管理页手动刷新共用同一协调，不会对同一账号并发发起多次 `CreateToken`。
 - **回跳与远程部署**：回调地址取自管理页请求的 Host（受回环校验保证是本机）。若服务部署在远程主机，请通过 SSH 端口转发访问管理页，使浏览器的 `localhost` 与服务端回环一致：
 
   ```bash

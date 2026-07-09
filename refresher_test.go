@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -137,6 +139,55 @@ func TestRefresherScanUpdatesStore(t *testing.T) {
 	assert.Equal(t, "refreshed-access", stale.AccessToken, "expired account refreshed")
 	fresh, _ := store.Get("fresh")
 	assert.Equal(t, "keep", fresh.AccessToken, "fresh account untouched")
+}
+
+func TestStoreRefreshTokenDedupsConcurrent(t *testing.T) {
+	// A fake CreateToken that counts hits and blocks briefly so concurrent
+	// callers overlap inside the singleflight window.
+	var hits int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		time.Sleep(50 * time.Millisecond)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"accessToken": "shared-access", "refreshToken": "shared-refresh",
+			"tokenType": "Bearer", "expiresIn": 3600,
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	target, _ := url.Parse(srv.URL)
+	client := &http.Client{Transport: &rewriteTransport{host: target.Host, scheme: target.Scheme}}
+
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "acct", ClientID: "c", ClientSecret: "s", RefreshToken: "r", Region: "us-east-1", CreatedAt: "1",
+	}))
+
+	const n = 20
+	var wg sync.WaitGroup
+	results := make([]StoredAccount, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], errs[i] = store.RefreshToken(context.Background(), client, "acct")
+		}(i)
+	}
+	wg.Wait()
+
+	// Exactly one upstream CreateToken despite n concurrent callers.
+	assert.Equal(t, int32(1), atomic.LoadInt32(&hits), "concurrent refreshes must collapse to one CreateToken")
+	for i := 0; i < n; i++ {
+		require.NoError(t, errs[i])
+		assert.Equal(t, "shared-access", results[i].AccessToken)
+		assert.Equal(t, "shared-refresh", results[i].RefreshToken)
+	}
+	// Persisted.
+	got, _ := store.Get("acct")
+	assert.Equal(t, "shared-access", got.AccessToken)
 }
 
 func TestRefresherRunStopsOnContext(t *testing.T) {

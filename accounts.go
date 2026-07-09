@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // ---------------------------------------------------------------------------
@@ -66,6 +70,14 @@ type AccountStore struct {
 
 	mu       sync.Mutex
 	accounts map[string]*StoredAccount
+
+	// refreshGroup collapses concurrent token refreshes of the same account (by
+	// id) into a single SSO-OIDC CreateToken call. AWS rotates refresh tokens on
+	// every refresh, so two independent refreshers racing on one account would
+	// each spend the (now stale) refresh token and one would fail with
+	// invalid_grant, or fork the token chain. Both the request path
+	// (accountCreds) and the background refresher route through RefreshToken.
+	refreshGroup singleflight.Group
 }
 
 // accountsFile mirrors the on-disk layout.
@@ -218,6 +230,37 @@ func (s *AccountStore) UpdateTokens(id, accessToken, refreshToken, expiresAt str
 	}
 	a.ExpiresAt = expiresAt
 	return s.saveLocked()
+}
+
+// RefreshToken refreshes the account's SSO-OIDC token exactly once even under
+// concurrent callers, returning the refreshed account snapshot. Concurrent
+// calls for the same id share a single CreateToken call and all receive the
+// same result; this prevents racing refreshers from each spending the rotated
+// refresh token. The fresh tokens are persisted best-effort before returning,
+// so the returned snapshot is usable even if the write fails.
+func (s *AccountStore) RefreshToken(ctx context.Context, client *http.Client, id string) (StoredAccount, error) {
+	v, err, _ := s.refreshGroup.Do(id, func() (any, error) {
+		cur, ok := s.Get(id)
+		if !ok {
+			return StoredAccount{}, fmt.Errorf("account %s not found", id)
+		}
+		access, refresh, expiresAt, err := refreshAccountToken(ctx, client, cur)
+		if err != nil {
+			return StoredAccount{}, err
+		}
+		// Persist best-effort; the returned snapshot still carries the new token.
+		_ = s.UpdateTokens(id, access, refresh, expiresAt)
+		cur.AccessToken = access
+		if refresh != "" {
+			cur.RefreshToken = refresh
+		}
+		cur.ExpiresAt = expiresAt
+		return cur, nil
+	})
+	if err != nil {
+		return StoredAccount{}, err
+	}
+	return v.(StoredAccount), nil
 }
 
 // Get returns a copy of the account with the given id.

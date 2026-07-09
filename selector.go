@@ -79,17 +79,13 @@ func (c *accountCreds) accessToken(ctx context.Context) (string, error) {
 }
 
 func (c *accountCreds) refresh(ctx context.Context) error {
-	access, refresh, expiresAt, err := refreshAccountToken(ctx, c.client, c.acct)
+	// Route through the store so concurrent refreshes of this account (across
+	// requests and the background refresher) collapse into one CreateToken call.
+	fresh, err := c.store.RefreshToken(ctx, c.client, c.id)
 	if err != nil {
 		return err
 	}
-	c.acct.AccessToken = access
-	if refresh != "" {
-		c.acct.RefreshToken = refresh
-	}
-	c.acct.ExpiresAt = expiresAt
-	// Persist best-effort; an in-memory token still serves this request.
-	_ = c.store.UpdateTokens(c.id, c.acct.AccessToken, c.acct.RefreshToken, c.acct.ExpiresAt)
+	c.acct = fresh
 	return nil
 }
 

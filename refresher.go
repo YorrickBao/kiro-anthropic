@@ -59,18 +59,17 @@ func (r *accountRefresher) scan(ctx context.Context) {
 	}
 }
 
-// refreshOne refreshes a single account and persists the new tokens.
+// refreshOne refreshes a single account and persists the new tokens. It routes
+// through the store so a background refresh and a request-path refresh of the
+// same account collapse into one CreateToken call (RefreshToken persists on
+// success).
 func (r *accountRefresher) refreshOne(ctx context.Context, a StoredAccount) {
-	access, refresh, expiresAt, err := refreshAccountToken(ctx, r.client, a)
+	fresh, err := r.store.RefreshToken(ctx, r.client, a.ID)
 	if err != nil {
 		r.logf(slog.LevelWarn, "account token refresh failed", "id", a.ID, "label", a.Label, "error", err.Error())
 		return
 	}
-	if err := r.store.UpdateTokens(a.ID, access, refresh, expiresAt); err != nil {
-		r.logf(slog.LevelWarn, "account token refreshed but not persisted", "id", a.ID, "error", err.Error())
-		return
-	}
-	r.logf(slog.LevelInfo, "account token refreshed", "id", a.ID, "label", a.Label, "expires_at", expiresAt)
+	r.logf(slog.LevelInfo, "account token refreshed", "id", a.ID, "label", a.Label, "expires_at", fresh.ExpiresAt)
 }
 
 // accountNeedsRefresh reports whether an account should be refreshed now: it has

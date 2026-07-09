@@ -50,6 +50,8 @@ commit_parsers = [
     { message = "^style", group = "<!-- 6 -->🎨 Styling" },
     { message = "^chore\\(release\\): prepare for", skip = true },
     { message = "^chore\\(deps.*\\)", skip = true },
+    # 仓库维护噪声（gitignore、编辑器配置等）不进面向用户的 release notes。
+    { message = "^chore\\(repo\\)", skip = true },
     { message = "^chore|^ci|^build", group = "<!-- 7 -->⚙️ Miscellaneous Tasks" },
     { body = ".*security", group = "<!-- 8 -->🛡️ Security" },
     { message = "^revert", group = "<!-- 9 -->◀️ Revert" },

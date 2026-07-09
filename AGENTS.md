@@ -55,6 +55,7 @@ GitHub Actions（`.github/workflows/release.yml`）会：跑 `build.sh` → 用 
 - **subject**：祈使句、现在时、小写开头、结尾不加句号，尽量 ≤ 50 字符
 - **破坏性变更**：type 后加 `!`（如 `feat!:`），或在页脚写 `BREAKING CHANGE: 说明`
 - 一次 commit 只做一件事，粒度别太大
+- **仓库维护噪声用 `chore(repo):`**：纯仓库管理/工具配置类提交（`.gitignore`、编辑器配置、本地脚手架等）用 `chore(repo)` scope。`cliff.toml` 配置了 `^chore\(repo\)` 被 `skip`，不进 release notes；其余 `chore` 仍会出现在 changelog 的"杂项"分组里。
 
 示例：
 

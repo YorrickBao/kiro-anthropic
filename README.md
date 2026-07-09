@@ -15,6 +15,36 @@
 
 ---
 
+## 目录
+
+- [功能特性](#功能特性)
+- [前置条件](#前置条件)
+- [快速开始](#快速开始)
+- [与 Claude Code 集成](#与-claude-code-集成)
+- [命令](#命令)
+  - [`serve` 参数](#serve-参数)
+  - [管理页（`--admin-port`）](#管理页--admin-port)
+  - [环境变量](#环境变量)
+- [模型与能力](#模型与能力)
+  - [effort（推理强度）](#effort推理强度)
+  - [最大输出 tokens](#最大输出-tokens)
+  - [扩展思考（extended thinking / reasoning）](#扩展思考extended-thinking--reasoning)
+  - [图片](#图片)
+- [API 端点](#api-端点)
+  - [`POST /v1/messages`](#post-v1messages)
+  - [`GET /v1/models`](#get-v1models)
+  - [`GET /health`](#get-health)
+- [服务器部署（EC2 等）](#服务器部署ec2-等)
+- [升级](#升级)
+- [代理说明](#代理说明)
+- [区域说明](#区域说明)
+- [限制](#限制)
+- [工作原理](#工作原理)
+- [构建](#构建)
+- [目录结构](#目录结构)
+
+---
+
 ## 功能特性
 
 - **Anthropic Messages API** `POST /v1/messages`，支持**流式（SSE）**与**非流式**。
@@ -33,19 +63,6 @@
 
 ---
 
-## 工作原理
-
-```
-Anthropic 客户端 ──/v1/messages──►  kiro-anthropic  ──GenerateAssistantResponse──►  runtime.<region>.kiro.dev
-   (Claude Code)                    (本地 :17890)      (AWS 事件流, 走出站代理)
-```
-
-- 鉴权：所有请求都从**账号池**取账号；池由三种来源填充——启动时自动导入本地凭据、管理页 IdC 登录、管理页「导入本机凭据」按钮。每个账号自带 `region` / `profileArn`，后台自动用 SSO-OIDC `CreateToken` 刷新保活。池为空时 `/v1/messages` 返回 **503**（提示去管理页登录/导入）。
-- 推理：向 `https://runtime.<region>.kiro.dev` 发送 `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`，解析其 `vnd.amazon.eventstream` 响应，再翻译回 Anthropic 的 SSE / JSON；`<region>` 取自被选中账号自身的记录。
-- 模型与 profile：通过 `https://management.<region>.kiro.dev` 的 `ListAvailableModels` / `ListAvailableProfiles` 获取。
-
----
-
 ## 前置条件
 
 1. 至少一个可用账号。两种方式任选其一（可并存）：
@@ -53,22 +70,6 @@ Anthropic 客户端 ──/v1/messages──►  kiro-anthropic  ──GenerateA
    - 或在**管理页**登录企业 IdC 账号 / 点「导入本机凭据」把账号纳入池。
 2. 能访问 AWS / `*.kiro.dev`（国内一般需要代理，见下文）。
 3. 仅自行构建时需要 **Go 1.26+**。
-
----
-
-## 构建
-
-```bash
-# 本机构建
-go build -o kiro-anthropic .
-
-# 跨平台打包（产物 + 校验和输出到 dist/）
-./build.sh
-./build.sh --help          # 查看用法、平台矩阵、环境变量
-VERSION=1.0.0 ./build.sh   # 打版本号进二进制
-```
-
-默认平台矩阵：`darwin/amd64`、`darwin/arm64`、`linux/amd64`、`linux/arm64`、`linux/386`、`windows/amd64`、`windows/arm64`。
 
 ---
 
@@ -98,6 +99,21 @@ curl --noproxy '*' http://127.0.0.1:17890/v1/messages \
 
 ---
 
+## 与 Claude Code 集成
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:17890
+export ANTHROPIC_API_KEY=dummy                     # 服务默认开放，但 Claude Code 需要有个 key
+export ANTHROPIC_MODEL=claude-opus-4.8             # 主模型
+export ANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4.5 # 后台/小任务模型
+export no_proxy=127.0.0.1,localhost                # 关键：让本地请求绕开代理
+export NO_PROXY=127.0.0.1,localhost
+```
+
+设置了 `--api-key` 时，把 `ANTHROPIC_API_KEY` 设成同一个值即可。
+
+---
+
 ## 命令
 
 | 命令 | 说明 |
@@ -111,14 +127,14 @@ curl --noproxy '*' http://127.0.0.1:17890/v1/messages \
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `--host` | `127.0.0.1` | 监听地址 |
+| `--host` | `127.0.0.1` | 监听地址。**绑非回环地址（如 `0.0.0.0`）时必须同时设 `--api-key`，否则拒绝启动**（避免账号池裸奔到公网） |
 | `--port` | `17890` | 监听端口（被占用时自动 +1 重试） |
 | `--admin-port` | `27890` | 管理页端口，**仅限本机访问**（被占用时自动 +1 重试） |
 | `--proxy` | `http://127.0.0.1:7890` | 出站代理；优先级：本参数 > `http(s)_proxy` 环境变量 > 内置默认；`none` 表示直连 |
 | `--token-file` | `~/.aws/sso/cache/kiro-auth-token.json` | 启动自动导入的来源：Kiro 桌面端令牌文件路径（也是管理页「导入本机凭据」按钮读取的路径） |
 | `--accounts-file` | `~/.kiro-anthropic/accounts.json` | 账号池凭据的持久化存储路径 |
 | `--no-import-local` | `false` | 加此参数则启动时**不**自动导入本地 `--token-file` 凭据；默认（不加）会自动导入到账号池 |
-| `--api-key` | 空（开放） | 设置后客户端须用 `x-api-key` 或 `Authorization: Bearer` 携带 |
+| `--api-key` | 空（开放） | 设置后客户端须用 `x-api-key` 或 `Authorization: Bearer` 携带。绑非回环 `--host` 时为**必填** |
 | `--agent-mode` | `vibe` | Kiro agent 模式 |
 | `--log` | `false` | 开启请求访问日志（输出到 stdout/当前窗口）；默认关闭 |
 | `--log-file` | 空 | 把访问日志写到指定文件（隐含 `--log`）；特殊值 `stdout`/`stderr`/`none` |
@@ -190,48 +206,6 @@ http://127.0.0.1:27890/health      # 健康检查
 
 ---
 
-## 升级
-
-`upgrade` 子命令从 GitHub Releases 拉取匹配当前平台（`GOOS`/`GOARCH`）的归档，校验 `checksums.txt` 的 SHA-256，解出二进制后**原地替换**正在运行的可执行文件（Windows 上先把旧 exe 重命名为 `.old`，下次启动清理）。
-
-```bash
-./kiro-anthropic upgrade --check            # 只检查是否有新版，不下载不替换
-./kiro-anthropic upgrade                    # 交互确认后替换
-./kiro-anthropic upgrade -y                 # 跳过确认
-./kiro-anthropic upgrade --version v0.2.0   # 安装指定 tag（可降级/回滚）
-```
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--proxy` | 同 `serve` | GitHub API / 下载的出站代理；国内访问 GitHub 一般需要 |
-| `--check` | `false` | 仅检查，不下载不安装 |
-| `-y`, `--yes` | `false` | 跳过确认提示 |
-| `--version` | latest | 指定 release tag（如 `v0.2.0`） |
-| `--allow-unverified` | `false` | 即使缺少 `checksums.txt` 或未列出该资产也继续安装（不推荐） |
-
-说明：
-- 出站代理语义与 `serve` 完全一致：`--proxy` > `http(s)_proxy` 环境变量 > 内置默认 `http://127.0.0.1:7890`。GitHub 访问不通时按需设置 `--proxy none` 或可用代理。
-- 若可执行文件位于需要 root 的目录（如 `/usr/local/bin`），替换会失败，请用 `sudo` 重试或手动替换。
-- 可选设置 `GITHUB_TOKEN` 环境变量以提高 API 限流额度（未鉴权时 GitHub 有 60 次/小时限制）。
-- 版本比较走语义化版本（semver）。`dev` / 本地 `go build` 产物无法判定高低，会提示"开发版"并要求确认。
-
----
-
-## API 端点
-
-以下端点在 **API 端口**（`--port`，默认 17890）上。管理页端点（账号/额度/模型）在独立的**管理端口**上，见上文「管理页」一节。
-
-### `POST /v1/messages`
-Anthropic Messages API。支持 `stream: true`（SSE：`message_start` / `content_block_start` / `content_block_delta` / `content_block_stop` / `message_delta` / `message_stop`；`content_block_delta` 涵盖 `text_delta` / `thinking_delta` / `signature_delta` / `input_json_delta`）与非流式聚合响应。支持 `system`、`messages`、`tools`、`tool_result`、`image`、`thinking`、`output_config.effort` / `reasoning_effort`，以及历史消息中的 `thinking` / `redacted_thinking` 块回传。
-
-### `GET /v1/models`
-返回账号可用模型，每项包含：`id`、`type`、`display_name`、`created_at`、`max_input_tokens`、`max_tokens`、`capabilities.effort`（`supported` 及 `low/medium/high/xhigh/max`）。用池里任一账号查询；**账号池为空时不报错，返回内置的 fallback 静态模型列表**。
-
-### `GET /health`
-健康检查。
-
----
-
 ## 模型与能力
 
 在**管理页**（账号卡片上的「模型」按钮）查看你账号实际可用的模型。示例（取决于账号/套餐）：
@@ -276,18 +250,53 @@ Anthropic Messages API。支持 `stream: true`（SSE：`message_start` / `conten
 
 ---
 
-## 与 Claude Code 集成
+## API 端点
+
+以下端点在 **API 端口**（`--port`，默认 17890）上。管理页端点（账号/额度/模型）在独立的**管理端口**上，见上文「管理页」一节。
+
+### `POST /v1/messages`
+Anthropic Messages API。支持 `stream: true`（SSE：`message_start` / `content_block_start` / `content_block_delta` / `content_block_stop` / `message_delta` / `message_stop`；`content_block_delta` 涵盖 `text_delta` / `thinking_delta` / `signature_delta` / `input_json_delta`）与非流式聚合响应。支持 `system`、`messages`、`tools`、`tool_result`、`image`、`thinking`、`output_config.effort` / `reasoning_effort`，以及历史消息中的 `thinking` / `redacted_thinking` 块回传。
+
+### `GET /v1/models`
+返回账号可用模型，每项包含：`id`、`type`、`display_name`、`created_at`、`max_input_tokens`、`max_tokens`、`capabilities.effort`（`supported` 及 `low/medium/high/xhigh/max`）。用池里任一账号查询；**账号池为空时不报错，返回内置的 fallback 静态模型列表**。
+
+### `GET /health`
+健康检查。
+
+---
+
+## 服务器部署（EC2 等）
+
+在公网服务器上常驻运行时，核心原则：**API 默认只绑回环，管理页永远只绑回环且无鉴权**——别把这两个端口直接暴露到公网。绑非回环地址（如 `--host 0.0.0.0`）时**必须设 `--api-key`**，否则服务拒绝启动。
+
+完整指南（安全模型、SSH 隧道用法、`install.sh` 一键部署与 systemd、故障排查）见 **[服务器部署文档](docs/Server-Deployment.md)**。
+
+---
+
+## 升级
+
+`upgrade` 子命令从 GitHub Releases 拉取匹配当前平台（`GOOS`/`GOARCH`）的归档，校验 `checksums.txt` 的 SHA-256，解出二进制后**原地替换**正在运行的可执行文件（Windows 上先把旧 exe 重命名为 `.old`，下次启动清理）。
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:17890
-export ANTHROPIC_API_KEY=dummy                     # 服务默认开放，但 Claude Code 需要有个 key
-export ANTHROPIC_MODEL=claude-opus-4.8             # 主模型
-export ANTHROPIC_SMALL_FAST_MODEL=claude-haiku-4.5 # 后台/小任务模型
-export no_proxy=127.0.0.1,localhost                # 关键：让本地请求绕开代理
-export NO_PROXY=127.0.0.1,localhost
+./kiro-anthropic upgrade --check            # 只检查是否有新版，不下载不替换
+./kiro-anthropic upgrade                    # 交互确认后替换
+./kiro-anthropic upgrade -y                 # 跳过确认
+./kiro-anthropic upgrade --version v0.2.0   # 安装指定 tag（可降级/回滚）
 ```
 
-设置了 `--api-key` 时，把 `ANTHROPIC_API_KEY` 设成同一个值即可。
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--proxy` | 同 `serve` | GitHub API / 下载的出站代理；国内访问 GitHub 一般需要 |
+| `--check` | `false` | 仅检查，不下载不安装 |
+| `-y`, `--yes` | `false` | 跳过确认提示 |
+| `--version` | latest | 指定 release tag（如 `v0.2.0`） |
+| `--allow-unverified` | `false` | 即使缺少 `checksums.txt` 或未列出该资产也继续安装（不推荐） |
+
+说明：
+- 出站代理语义与 `serve` 完全一致：`--proxy` > `http(s)_proxy` 环境变量 > 内置默认 `http://127.0.0.1:7890`。GitHub 访问不通时按需设置 `--proxy none` 或可用代理。
+- 若可执行文件位于需要 root 的目录（如 `/usr/local/bin`），替换会失败，请用 `sudo` 重试或手动替换。
+- 可选设置 `GITHUB_TOKEN` 环境变量以提高 API 限流额度（未鉴权时 GitHub 有 60 次/小时限制）。
+- 版本比较走语义化版本（semver）。`dev` / 本地 `go build` 产物无法判定高低，会提示"开发版"并要求确认。
 
 ---
 
@@ -322,6 +331,35 @@ export NO_PROXY=127.0.0.1,localhost
 
 ---
 
+## 工作原理
+
+```
+Anthropic 客户端 ──/v1/messages──►  kiro-anthropic  ──GenerateAssistantResponse──►  runtime.<region>.kiro.dev
+   (Claude Code)                    (本地 :17890)      (AWS 事件流, 走出站代理)
+```
+
+- 鉴权：所有请求都从**账号池**取账号；池由三种来源填充——启动时自动导入本地凭据、管理页 IdC 登录、管理页「导入本机凭据」按钮。每个账号自带 `region` / `profileArn`，后台自动用 SSO-OIDC `CreateToken` 刷新保活。池为空时 `/v1/messages` 返回 **503**（提示去管理页登录/导入）。
+- 推理：向 `https://runtime.<region>.kiro.dev` 发送 `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`，解析其 `vnd.amazon.eventstream` 响应，再翻译回 Anthropic 的 SSE / JSON；`<region>` 取自被选中账号自身的记录。
+- 模型与 profile：通过 `https://management.<region>.kiro.dev` 的 `ListAvailableModels` / `ListAvailableProfiles` 获取。
+
+---
+
+## 构建
+
+```bash
+# 本机构建
+go build -o kiro-anthropic .
+
+# 跨平台打包（产物 + 校验和输出到 dist/）
+./build.sh
+./build.sh --help          # 查看用法、平台矩阵、环境变量
+VERSION=1.0.0 ./build.sh   # 打版本号进二进制
+```
+
+默认平台矩阵：`darwin/amd64`、`darwin/arm64`、`linux/amd64`、`linux/arm64`、`linux/386`、`windows/amd64`、`windows/arm64`。
+
+---
+
 ## 目录结构
 
 ```
@@ -341,6 +379,7 @@ refresher.go     后台定期刷新账号池令牌
 listen.go        监听辅助：端口被占用时自动 +1 重试
 upgrade.go       从 GitHub Release 自更新（minio/selfupdate + semver）
 build.sh         跨平台构建脚本
+install.sh       Linux/systemd 一键安装脚本（下载 release + 建服务）
 ```
 
 ---

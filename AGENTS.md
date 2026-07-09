@@ -67,3 +67,16 @@ feat(kiro)!: rename --token flag to --credentials
 ```
 
 避免：`update code`、`fixed bug`、`WIP`、以及缺少 type 前缀的标题。
+
+### 未发布功能的修补用 `feat`，不用 `fix`
+
+`fix` 是给**已发布版本里用户会遇到的 bug**用的——它会进下一版 changelog 的 “Bug Fixes”，用户看到才有意义。
+
+如果你在修一个**尚未随任何 tag 发布**的功能里的问题（即该功能是在上一个 release tag 之后才引入的），不要用 `fix`：对用户而言这个 bug 从不存在，甚至这个功能都还没出现，changelog 里冒出一条"修复"只会让人困惑。这类"让还没发布的新代码正常工作"的修补，归到该功能所属的 `feat` 即可。
+
+- 判断标准：`git describe --tags` 看该功能是否已在某个 tag 内。在最新 tag 之后引入的功能，其迭代修补都算未发布。
+- `fix` 只留给回归、或修复已发布行为。
+
+### 发版时润色 release notes
+
+git-cliff 按 commit 的 type 逐条分组，不区分"是否已发布"。当一个较大的新功能由多条 commit 组成时，发布 tag 后建议在 GitHub Release 描述**顶部手写一段用户视角的功能总结**（讲"新增了什么能力"），把 git-cliff 生成的分类列表作为下方的完整变更附录。这样用户先看到功能全貌，而不是一堆内部细节。

@@ -27,6 +27,7 @@ import (
 type StoredAccount struct {
 	ID         string `json:"id"`
 	Label      string `json:"label,omitempty"`
+	Email      string `json:"email,omitempty"`      // account email, resolved from getUsageLimits
 	Provider   string `json:"provider,omitempty"`   // e.g. "Enterprise", "BuilderId"
 	AuthMethod string `json:"authMethod,omitempty"` // e.g. "IdC"
 	Region     string `json:"region,omitempty"`
@@ -234,6 +235,7 @@ func (a StoredAccount) view() map[string]any {
 	m := map[string]any{
 		"id":           a.ID,
 		"label":        a.Label,
+		"email":        a.Email,
 		"provider":     a.Provider,
 		"auth_method":  a.AuthMethod,
 		"region":       a.Region,

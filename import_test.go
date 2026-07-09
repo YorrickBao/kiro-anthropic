@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -83,6 +85,35 @@ func TestImportLocalCredentialsNoRefreshToken(t *testing.T) {
 func TestImportLocalCredentialsMissingFile(t *testing.T) {
 	_, err := importLocalCredentials(context.Background(), &http.Client{}, filepath.Join(t.TempDir(), "nope.json"))
 	assert.Error(t, err)
+}
+
+func TestFetchAccountEmail(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/getUsageLimits", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "Bearer tok", r.Header.Get("Authorization"))
+		writeJSON(w, http.StatusOK, map[string]any{
+			"userInfo": map[string]any{"email": "user@example.com"},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	target, _ := url.Parse(srv.URL)
+	client := &http.Client{Transport: &rewriteTransport{host: target.Host, scheme: target.Scheme}}
+
+	email := fetchAccountEmail(context.Background(), client, "us-east-1", "arn:x", "tok")
+	assert.Equal(t, "user@example.com", email)
+}
+
+func TestFetchAccountEmailBestEffort(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+	target, _ := url.Parse(srv.URL)
+	client := &http.Client{Transport: &rewriteTransport{host: target.Host, scheme: target.Scheme}}
+
+	// Failure returns empty string, not an error.
+	assert.Equal(t, "", fetchAccountEmail(context.Background(), client, "us-east-1", "", "tok"))
 }
 
 func TestFindByRefreshTokenDedup(t *testing.T) {

@@ -286,6 +286,7 @@ func (m *loginManager) completeLogin(ctx context.Context, state, code string) (*
 	if arn, err := resolveProfileArn(ctx, m.client, p.region, tok.AccessToken); err == nil {
 		acct.ProfileArn = arn
 	}
+	acct.Email = fetchAccountEmail(ctx, m.client, p.region, acct.ProfileArn, tok.AccessToken)
 	return acct, nil
 }
 
@@ -326,6 +327,9 @@ func importLocalCredentials(ctx context.Context, client *http.Client, tokenFile 
 		if arn, err := resolveProfileArn(ctx, client, region, tok.AccessToken); err == nil {
 			acct.ProfileArn = arn
 		}
+	}
+	if tok.AccessToken != "" {
+		acct.Email = fetchAccountEmail(ctx, client, region, acct.ProfileArn, tok.AccessToken)
 	}
 	return acct, nil
 }
@@ -425,6 +429,48 @@ func randomURLSafe(n int) (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// fetchAccountEmail resolves the account email via getUsageLimits (userInfo.email)
+// using the given bearer token. It is best-effort: an empty string is returned
+// on any failure, since the email is only cosmetic (shown in the admin list).
+func fetchAccountEmail(ctx context.Context, client *http.Client, region, arn, accessToken string) string {
+	if region == "" {
+		region = "us-east-1"
+	}
+	endpoint := fmt.Sprintf("https://management.%s.kiro.dev/getUsageLimits", region)
+	q := url.Values{
+		"origin":          {"AI_EDITOR"},
+		"resourceType":    {"AGENTIC_REQUEST"},
+		"isEmailRequired": {"true"},
+	}
+	if arn != "" {
+		q.Set("profileArn", arn)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+q.Encode(), nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return ""
+	}
+	var out struct {
+		UserInfo struct {
+			Email string `json:"email"`
+		} `json:"userInfo"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return ""
+	}
+	return out.UserInfo.Email
 }
 
 // resolveProfileArn calls ListAvailableProfiles on the management endpoint with

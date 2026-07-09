@@ -37,6 +37,7 @@ func (s *Server) AdminHandler() http.Handler {
 	r.Post("/api/accounts/delete", s.handleAccountDelete)
 	r.Post("/api/accounts/label", s.handleAccountLabel)
 	r.Post("/api/accounts/import", s.handleAccountImport)
+	r.Post("/api/accounts/refresh", s.handleAccountRefresh)
 	r.Get("/oauth/callback", s.handleLoginCallback)
 	return r
 }
@@ -265,6 +266,58 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": acct.ID, "already_present": false})
+}
+
+// handleAccountRefresh forces an SSO-OIDC token refresh for one account (when
+// "id" is given) or every stored account (when "id" is empty). Refreshes are
+// coordinated by the store's singleflight, so this cannot double-spend a
+// rotating refresh token even if the background refresher fires concurrently.
+// The per-account usage cache is invalidated on success so the panel reflects
+// the fresh token on the next status poll. Per-account failures are reported
+// inline; the response is still 200 unless a specific id is unknown.
+func (s *Server) handleAccountRefresh(w http.ResponseWriter, r *http.Request) {
+	if s.accounts == nil {
+		adminError(w, http.StatusServiceUnavailable, "account store is not configured")
+		return
+	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	// An empty body is allowed and means "refresh all".
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+	}
+
+	ctx := r.Context()
+	var ids []string
+	if id := strings.TrimSpace(body.ID); id != "" {
+		if _, ok := s.accounts.Get(id); !ok {
+			adminError(w, http.StatusNotFound, "account not found: "+id)
+			return
+		}
+		ids = []string{id}
+	} else {
+		for _, a := range s.accounts.List() {
+			ids = append(ids, a.ID)
+		}
+	}
+
+	results := make([]map[string]any, 0, len(ids))
+	refreshed := 0
+	for _, id := range ids {
+		fresh, err := s.accounts.RefreshToken(ctx, s.login.client, id)
+		if err != nil {
+			noteError(ctx, err.Error())
+			results = append(results, map[string]any{"id": id, "ok": false, "error": err.Error()})
+			continue
+		}
+		s.invalidateUsage(id)
+		refreshed++
+		results = append(results, map[string]any{"id": id, "ok": true, "expires_at": fresh.ExpiresAt})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "refreshed": refreshed, "total": len(ids), "results": results,
+	})
 }
 
 // handleAccountLabel updates the note (label) of a stored account.

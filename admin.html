@@ -105,7 +105,11 @@
     </p>
   </section>
   <section class="card">
-    <h2>账号（<span id="acct-count">0</span>）</h2>
+    <h2 style="display:flex;align-items:center;gap:10px">账号（<span id="acct-count">0</span>）
+      <span style="flex:1"></span>
+      <button id="refresh-all-btn" class="ghost" type="button" style="text-transform:none;font-size:12px">刷新全部令牌</button>
+    </h2>
+    <span id="refresh-all-msg" class="muted" style="font-size:12px"></span>
     <div class="accounts" id="accounts"></div>
   </section>
 </div>
@@ -179,12 +183,14 @@ function renderAccounts(accounts) {
     ${usageHtml(a.usage)}
     <div class="actions">
       <button class="ghost" data-models type="button">模型</button>
+      <button class="ghost" data-refresh="${esc(a.id)}" type="button">刷新令牌</button>
       <button class="danger" data-del="${esc(a.id)}" type="button">删除</button>
     </div>
   </div>`).join("");
   el.querySelectorAll("button[data-del]").forEach(b => b.addEventListener("click", () => deleteAccount(b.dataset.del)));
   el.querySelectorAll("button[data-edit]").forEach(b => b.addEventListener("click", () => editLabel(b.dataset.edit, b.dataset.label)));
   el.querySelectorAll("button[data-models]").forEach(b => b.addEventListener("click", openModels));
+  el.querySelectorAll("button[data-refresh]").forEach(b => b.addEventListener("click", () => refreshAccount(b.dataset.refresh, b)));
 }
 
 function openModels() {
@@ -286,6 +292,47 @@ async function importLocal() {
   }
 }
 
+async function refreshAccount(id, btn) {
+  if (!id) return;
+  const orig = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "刷新中…"; }
+  try {
+    const res = await fetch("/api/accounts/refresh", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id })
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error((d.error && d.error.message) || ("HTTP " + res.status));
+    const r = (d.results && d.results[0]) || {};
+    if (r.ok === false) throw new Error(r.error || "刷新失败");
+    await tick();
+  } catch (e) {
+    alert("刷新失败: " + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = orig; }
+  }
+}
+
+async function refreshAllAccounts() {
+  const btn = $("refresh-all-btn"), msg = $("refresh-all-msg");
+  btn.disabled = true; msg.textContent = "正在刷新全部令牌…";
+  try {
+    const res = await fetch("/api/accounts/refresh", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({})
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error((d.error && d.error.message) || ("HTTP " + res.status));
+    const failed = (d.results || []).filter(r => !r.ok);
+    msg.innerHTML = failed.length
+      ? `<span class="err-box">已刷新 ${d.refreshed}/${d.total}，${failed.length} 个失败</span>`
+      : `已刷新全部 ${d.refreshed} 个账号。`;
+    await tick();
+  } catch (e) {
+    msg.innerHTML = `<span class="err-box">刷新失败: ${esc(e.message)}</span>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function tick() {
   try {
     const res = await fetch("/api/status.json", { cache: "no-store" });
@@ -304,6 +351,7 @@ async function tick() {
 
 $("login-btn").addEventListener("click", startLogin);
 $("import-btn").addEventListener("click", importLocal);
+$("refresh-all-btn").addEventListener("click", refreshAllAccounts);
 $("models-close").addEventListener("click", () => $("models-modal").classList.remove("open"));
 $("models-modal").addEventListener("click", (e) => { if (e.target === $("models-modal")) $("models-modal").classList.remove("open"); });
 tick();

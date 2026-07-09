@@ -112,6 +112,47 @@ func TestAdminAccountLabelUpdate(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, bad.Code)
 }
 
+func TestAdminAccountRefresh(t *testing.T) {
+	s, h, _ := newAdminTestServer(t)
+	require.NoError(t, s.accounts.Add(&StoredAccount{
+		ID: "a1", ClientID: "c", ClientSecret: "s", RefreshToken: "old", Region: "us-east-1",
+		AccessToken: "stale", CreatedAt: "1",
+	}))
+	require.NoError(t, s.accounts.Add(&StoredAccount{
+		ID: "a2", ClientID: "c", ClientSecret: "s", RefreshToken: "old", Region: "us-east-1",
+		AccessToken: "stale", CreatedAt: "2",
+	}))
+
+	// Refresh a single account by id.
+	one := doAdmin(h, http.MethodPost, "/api/accounts/refresh", `{"id":"a1"}`)
+	require.Equal(t, http.StatusOK, one.Code, one.Body.String())
+	var oneResp struct {
+		Refreshed, Total int
+		Results          []map[string]any
+	}
+	require.NoError(t, json.Unmarshal(one.Body.Bytes(), &oneResp))
+	assert.Equal(t, 1, oneResp.Refreshed)
+	assert.Equal(t, 1, oneResp.Total)
+	got, _ := s.accounts.Get("a1")
+	assert.Equal(t, "test-access", got.AccessToken, "token refreshed from fake OIDC")
+	still, _ := s.accounts.Get("a2")
+	assert.Equal(t, "stale", still.AccessToken, "other account untouched")
+
+	// Unknown id -> 404.
+	miss := doAdmin(h, http.MethodPost, "/api/accounts/refresh", `{"id":"nope"}`)
+	assert.Equal(t, http.StatusNotFound, miss.Code)
+
+	// Empty body -> refresh all.
+	all := doAdmin(h, http.MethodPost, "/api/accounts/refresh", `{}`)
+	require.Equal(t, http.StatusOK, all.Code, all.Body.String())
+	var allResp struct{ Refreshed, Total int }
+	require.NoError(t, json.Unmarshal(all.Body.Bytes(), &allResp))
+	assert.Equal(t, 2, allResp.Total)
+	assert.Equal(t, 2, allResp.Refreshed)
+	g2, _ := s.accounts.Get("a2")
+	assert.Equal(t, "test-access", g2.AccessToken)
+}
+
 func TestAdminStatusPerAccount(t *testing.T) {
 	s, h, _ := newAdminTestServer(t)
 	require.NoError(t, s.accounts.Add(&StoredAccount{

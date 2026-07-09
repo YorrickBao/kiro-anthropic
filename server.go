@@ -293,6 +293,14 @@ func (s *Server) ensureUsage(ctx context.Context, creds *accountCreds) (*kiroUsa
 	return u, nil
 }
 
+// invalidateUsage drops the cached usage for one account so the next status
+// poll refetches it (e.g. after a manual token refresh).
+func (s *Server) invalidateUsage(id string) {
+	s.usageMu.Lock()
+	delete(s.usageCache, id)
+	s.usageMu.Unlock()
+}
+
 // modelInfo returns the cached info for a model id from any account. Used to
 // clamp effort/max_tokens on outgoing requests.
 func (s *Server) modelInfo(ctx context.Context, modelID string) (kiroModelInfo, bool) {

@@ -59,6 +59,8 @@
   button.danger { background: transparent; color: var(--err); border: 1px solid var(--line); padding: 4px 10px; font-weight: 500; }
   button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); padding: 4px 10px; font-weight: 500; }
   button.copy { background: transparent; color: var(--muted); border: 0; padding: 0 6px; margin-left: 6px; cursor: pointer; font-size: 13px; }
+  button.edit { background: transparent; color: var(--muted); border: 0; padding: 0 6px; margin-left: 4px; cursor: pointer; font-size: 12px; }
+  button.edit:hover { color: var(--accent); }
   button.copy:hover { color: var(--accent); }
   /* account cards */
   .accounts { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
@@ -168,7 +170,7 @@ function renderAccounts(accounts) {
       ${expiryPill(a.expiry_state, a.expires_in_seconds)}
     </div>
     <dl class="meta">
-      <dt>备注</dt><dd>${esc(a.label || "—")}</dd>
+      <dt>备注</dt><dd>${esc(a.label || "—")}<button class="edit" data-edit="${esc(a.id)}" data-label="${esc(a.label || "")}" type="button" title="修改备注">✎</button></dd>
       <dt>Provider</dt><dd>${esc(a.provider || "—")} <span class="muted">${esc(a.auth_method || "")}</span></dd>
       <dt>Region</dt><dd>${esc(a.region || "—")}</dd>
       <dt>profileArn</dt><dd style="font-size:12px">${esc(a.profile_arn || "—")}</dd>
@@ -177,7 +179,6 @@ function renderAccounts(accounts) {
     ${usageHtml(a.usage)}
     <div class="actions">
       <button class="ghost" data-models type="button">模型</button>
-      <button class="ghost" data-edit="${esc(a.id)}" data-label="${esc(a.label || "")}" type="button">改备注</button>
       <button class="danger" data-del="${esc(a.id)}" type="button">删除</button>
     </div>
   </div>`).join("");

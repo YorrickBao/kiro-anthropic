@@ -50,3 +50,6 @@ Thumbs.db
 .zcode/
 *.swp
 
+# Playwright MCP smoke-test artifacts (browser snapshots, console logs)
+.playwright-mcp/
+

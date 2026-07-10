@@ -124,15 +124,27 @@ func TestBuildKiroRequestBasic(t *testing.T) {
 	k, err := buildKiroRequest(&Config{AgentMode: "vibe"}, areq)
 	require.NoError(t, err)
 	assert.Equal(t, "MANUAL", k.ConversationState.ChatTriggerType)
-	assert.Equal(t, "you are helpful", k.SystemPrompt)
+	assert.Empty(t, k.SystemPrompt, "system prompt must not be sent as a top-level field (runtime rejects it)")
 	assert.Equal(t, "vibe", k.AgentMode)
+	// The top-level systemPrompt field must not be populated (it 400s), so the
+	// marshaled body must not contain it.
+	raw, err := json.Marshal(k)
+	require.NoError(t, err)
+	assert.NotContains(t, string(raw), `"systemPrompt"`, "systemPrompt must be omitted from the wire body")
 
 	um := k.ConversationState.CurrentMessage.UserInputMessage
 	require.NotNil(t, um)
 	assert.Equal(t, "hello", um.Content)
 	assert.Equal(t, "claude-opus-4.8", um.ModelID)
 	assert.Equal(t, "AI_EDITOR", um.Origin)
-	assert.Empty(t, k.ConversationState.History, "history should be empty")
+
+	// The system prompt is injected as a leading user/assistant turn pair in
+	// history, since the runtime honors it there but rejects the top-level field.
+	require.Len(t, k.ConversationState.History, 2, "system prompt should add a leading turn pair")
+	spUser := k.ConversationState.History[0].UserInputMessage
+	require.NotNil(t, spUser)
+	assert.Equal(t, "you are helpful", spUser.Content)
+	require.NotNil(t, k.ConversationState.History[1].AssistantResponseMessage, "preamble needs an assistant ack")
 }
 
 func TestBuildKiroRequestMultiTurnAndTools(t *testing.T) {

@@ -303,6 +303,22 @@ func buildKiroRequest(cfg *Config, areq *anthropicRequest) (*kiroRequest, error)
 
 	history = sanitizeHistory(history)
 
+	// The Kiro runtime rejects a top-level systemPrompt field (HTTP 400
+	// "Improperly formed request"), so the Anthropic "system" is injected as a
+	// leading user/assistant turn pair in history instead. The runtime honors
+	// instructions delivered this way while rejecting the dedicated field.
+	if system != "" {
+		preamble := []kiroMessage{
+			{UserInputMessage: &kiroUserInputMessage{
+				Content: system, ModelID: modelID, Origin: "AI_EDITOR",
+			}},
+			{AssistantResponseMessage: &kiroAssistantMessage{
+				Content: "Understood. I will follow these instructions for this conversation.",
+			}},
+		}
+		history = append(preamble, history...)
+	}
+
 	return &kiroRequest{
 		ConversationState: kiroConversationState{
 			ChatTriggerType: "MANUAL",
@@ -310,9 +326,8 @@ func buildKiroRequest(cfg *Config, areq *anthropicRequest) (*kiroRequest, error)
 			CurrentMessage:  current,
 			History:         history,
 		},
-		ProfileArn:   "", // filled in by the server after resolution
-		AgentMode:    cfg.AgentMode,
-		SystemPrompt: system,
+		ProfileArn: "", // filled in by the server after resolution
+		AgentMode:  cfg.AgentMode,
 	}, nil
 }
 

@@ -126,9 +126,10 @@ type ctxKeyAccess struct{}
 
 // accessInfo carries request details that handlers attach for the access log.
 type accessInfo struct {
-	model  string
-	stream bool
-	errMsg string // failure cause, recorded when the request errors
+	model    string
+	stream   bool
+	errMsg   string // failure cause, recorded when the request errors
+	canceled bool   // client went away mid-stream (not a server failure)
 }
 
 func accessFrom(ctx context.Context) *accessInfo {
@@ -142,6 +143,15 @@ func accessFrom(ctx context.Context) *accessInfo {
 func noteError(ctx context.Context, msg string) {
 	if a := accessFrom(ctx); a != nil {
 		a.errMsg = msg
+	}
+}
+
+// noteCanceled records that a stream ended because the client went away. This
+// is a normal outcome, not a server fault, so the access log keeps it at Info
+// level and reports it under a "canceled" attribute instead of "error".
+func noteCanceled(ctx context.Context) {
+	if a := accessFrom(ctx); a != nil {
+		a.canceled = true
 	}
 }
 
@@ -188,6 +198,11 @@ func (s *Server) accessLog(next http.Handler) http.Handler {
 		}
 		if info.errMsg != "" {
 			attrs = append(attrs, slog.String("error", info.errMsg))
+		}
+		// A client disconnect mid-stream is expected, not a failure: keep it at
+		// Info and label it separately so it does not pollute the error logs.
+		if info.canceled {
+			attrs = append(attrs, slog.Bool("canceled", true))
 		}
 		s.logger.Log(r.Context(), level, "request", attrs...)
 	})
@@ -621,6 +636,13 @@ func (s *Server) aggregateMessages(w http.ResponseWriter, r *http.Request, areq 
 			break
 		}
 		if err != nil {
+			// Client disconnected before the aggregated response was ready: record
+			// it quietly rather than as a server error, and skip the write (the
+			// connection is gone).
+			if errors.Is(err, context.Canceled) || r.Context().Err() != nil {
+				noteCanceled(r.Context())
+				return
+			}
 			writeAnthropicError(w, r, http.StatusBadGateway, "api_error", "stream read error: "+err.Error())
 			return
 		}
@@ -719,6 +741,14 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, areq *an
 			break
 		}
 		if err != nil {
+			// The request context is canceled when the client disconnects; the
+			// upstream read then fails with context.Canceled. That is the client
+			// going away, not a server error, and there is no live connection
+			// left to emit onto, so just record it quietly and stop.
+			if errors.Is(err, context.Canceled) || r.Context().Err() != nil {
+				noteCanceled(r.Context())
+				return
+			}
 			noteError(r.Context(), "stream read error: "+err.Error())
 			_ = emit("error", map[string]any{
 				"type":  "error",

@@ -20,11 +20,15 @@ type fakeRuntime struct {
 	srv       *httptest.Server
 	badTokens map[string]bool
 	seen      []string
+	// bodies maps a bearer token to a raw 200 response body (event-stream
+	// frames). When set for a token, it is served instead of an empty stream,
+	// letting tests exercise post-200 in-stream outcomes.
+	bodies map[string][]byte
 }
 
 func newFakeRuntime(t *testing.T, bad ...string) *fakeRuntime {
 	t.Helper()
-	f := &fakeRuntime{badTokens: map[string]bool{}}
+	f := &fakeRuntime{badTokens: map[string]bool{}, bodies: map[string][]byte{}}
 	for _, b := range bad {
 		f.badTokens[b] = true
 	}
@@ -36,10 +40,33 @@ func newFakeRuntime(t *testing.T, bad ...string) *fakeRuntime {
 			_, _ = w.Write([]byte(`{"message":"boom"}`))
 			return
 		}
-		w.WriteHeader(http.StatusOK) // empty event stream; Send returns a stream
+		w.WriteHeader(http.StatusOK) // 200: a stream (empty unless a body is set)
+		if body, ok := f.bodies[tok]; ok {
+			_, _ = w.Write(body)
+		}
 	}))
 	t.Cleanup(f.srv.Close)
 	return f
+}
+
+// exceptionFrame builds a single event-stream frame carrying a service-level
+// exception, mirroring how the backend surfaces an in-stream error after a 200.
+func exceptionFrame(exceptionType, message string) []byte {
+	headers := append(
+		esStringHeader(":message-type", "exception"),
+		esStringHeader(":exception-type", exceptionType)...,
+	)
+	payload := []byte(`{"message":"` + message + `"}`)
+	return esFrame(headers, payload)
+}
+
+// contentFrame builds a single assistantResponseEvent frame with the given text.
+func contentFrame(text string) []byte {
+	headers := append(
+		esStringHeader(":message-type", "event"),
+		esStringHeader(":event-type", "assistantResponseEvent")...,
+	)
+	return esFrame(headers, []byte(`{"content":"`+text+`"}`))
 }
 
 // serverWithPool builds a Server whose KiroClient is routed to the fake runtime,
@@ -93,6 +120,49 @@ func TestOpenStreamAllAccountsFail(t *testing.T) {
 	he, ok := err.(*kiroHTTPError)
 	require.True(t, ok)
 	assert.Equal(t, http.StatusInternalServerError, he.Status)
+}
+
+// TestOpenStreamFailsOverOnFirstFrameException verifies that an upstream error
+// arriving as the very first stream frame (a 200 followed by an exception, with
+// no content produced) triggers pre-stream failover to a healthy account rather
+// than surfacing mid-stream.
+func TestOpenStreamFailsOverOnFirstFrameException(t *testing.T) {
+	rt := newFakeRuntime(t)
+	// "bad" returns 200 then immediately errors; "good" returns 200 + content.
+	rt.bodies["Bearer bad"] = exceptionFrame("InternalServerException",
+		"Encountered an unexpected error when processing the request, please try again.")
+	rt.bodies["Bearer good"] = contentFrame("hi")
+	s := serverWithPool(t, rt, "bad", "good")
+
+	stream, err := s.openStream(context.Background(), &kiroRequest{})
+	require.NoError(t, err, "first-frame exception should fail over to healthy account")
+	require.NotNil(t, stream)
+	defer stream.Close()
+
+	// The healthy stream's first event must be replayed intact by Recv.
+	ev, err := stream.Recv()
+	require.NoError(t, err)
+	assert.Equal(t, evText, ev.Kind)
+	assert.Equal(t, "hi", ev.Text)
+
+	assert.Contains(t, rt.seen, "Bearer bad", "tried the failing account")
+	assert.Contains(t, rt.seen, "Bearer good", "then the healthy one")
+}
+
+// TestOpenStreamAllFirstFrameExceptions verifies that when every account errors
+// on the first frame, the upstream error surfaces instead of a healthy stream.
+func TestOpenStreamAllFirstFrameExceptions(t *testing.T) {
+	rt := newFakeRuntime(t)
+	body := exceptionFrame("InternalServerException", "please try again")
+	rt.bodies["Bearer a"] = body
+	rt.bodies["Bearer b"] = body
+	s := serverWithPool(t, rt, "a", "b")
+
+	_, err := s.openStream(context.Background(), &kiroRequest{})
+	require.Error(t, err)
+	he, ok := err.(*kiroHTTPError)
+	require.True(t, ok, "want kiroHTTPError, got %T", err)
+	assert.Equal(t, http.StatusBadGateway, he.Status)
 }
 
 // TestDispatchFairnessTwoAccounts verifies that with 2 healthy accounts,

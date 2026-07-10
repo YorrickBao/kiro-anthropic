@@ -178,6 +178,13 @@ func (c *KiroClient) runtimeEndpoint(region string) string {
 type kiroStream struct {
 	resp *http.Response
 	dec  *eventStreamDecoder
+
+	// primed holds the first event (and its error) once peekFirst has run, so a
+	// caller can inspect it before committing response headers and still have
+	// Recv replay it as the first event.
+	primed    bool
+	primedEv  *kiroEvent
+	primedErr error
 }
 
 // Send issues the request using the supplied credentials and returns a stream
@@ -247,8 +254,33 @@ func (c *KiroClient) sendOnce(ctx context.Context, creds kiroCredentials, req *k
 	return &kiroStream{resp: resp, dec: newEventStreamDecoder(resp.Body)}, resp.StatusCode, "", nil
 }
 
+// peekFirst reads and buffers the first event so the caller can inspect it
+// before sending response headers. It is idempotent: the buffered event (or
+// error) is replayed by the first Recv call. This enables pre-stream failover
+// on an upstream exception that arrives as the very first frame, before any
+// assistant content has been produced.
+func (s *kiroStream) peekFirst() (*kiroEvent, error) {
+	if !s.primed {
+		s.primedEv, s.primedErr = s.recvRaw()
+		s.primed = true
+	}
+	return s.primedEv, s.primedErr
+}
+
 // Recv returns the next parsed event, or io.EOF when the stream ends.
 func (s *kiroStream) Recv() (*kiroEvent, error) {
+	if s.primed {
+		s.primed = false
+		ev, err := s.primedEv, s.primedErr
+		s.primedEv, s.primedErr = nil, nil
+		return ev, err
+	}
+	return s.recvRaw()
+}
+
+// recvRaw reads the next event directly from the decoder, bypassing the peek
+// buffer.
+func (s *kiroStream) recvRaw() (*kiroEvent, error) {
 	msg, err := s.dec.Next()
 	if err != nil {
 		return nil, err

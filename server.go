@@ -561,6 +561,21 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest) (*kiroStream
 
 		stream, err := s.sendWithReasoningRetry(ctx, creds, kreq)
 		if err == nil {
+			// Peek the first frame before committing. Some upstream failures
+			// arrive after a 200 as the very first event (e.g. a generic
+			// "unexpected error, please try again"). Since no content has been
+			// produced yet, we can still fail over to another account instead of
+			// surfacing it mid-stream.
+			if perr := firstFrameFailure(stream); perr != nil {
+				stream.Close()
+				lastErr = perr
+				if ctx.Err() != nil {
+					// Client went away while peeking: stop, don't burn accounts.
+					return nil, perr
+				}
+				s.selector.recordFailure(creds.id)
+				continue
+			}
 			s.selector.recordSuccess(creds.id)
 			return stream, nil
 		}
@@ -575,6 +590,30 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest) (*kiroStream
 		lastErr = errNoAccount
 	}
 	return nil, lastErr
+}
+
+// firstFrameFailure primes the stream's first event and reports a retriable
+// error when the upstream fails before producing any content. It returns nil
+// when the stream is healthy (the peeked event is replayed by the first Recv).
+//
+// Two cases are treated as pre-stream failures worth failing over on:
+//   - an in-stream exception frame arriving as the very first event, and
+//   - a transport error (other than a clean io.EOF) reading that first frame.
+//
+// A clean io.EOF is an empty-but-valid stream and passes through unchanged.
+// Failures are wrapped so isAccountFailure treats them as account failures.
+func firstFrameFailure(stream *kiroStream) error {
+	ev, err := stream.peekFirst()
+	if err != nil {
+		if err == io.EOF {
+			return nil
+		}
+		return fmt.Errorf("upstream stream failed before any content: %w", err)
+	}
+	if ev != nil && ev.Kind == evError {
+		return &kiroHTTPError{Status: http.StatusBadGateway, Body: upstreamEventError(ev)}
+	}
+	return nil
 }
 
 // sendWithReasoningRetry sends the request and, if the backend rejects a stale

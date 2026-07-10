@@ -265,6 +265,37 @@ func listReleases(ctx context.Context, client *http.Client) ([]githubRelease, er
 	return rels, nil
 }
 
+// latestTagViaRedirect resolves the latest release tag without touching the REST
+// API. GitHub serves github.com/<repo>/releases/latest as a 302 to
+// .../releases/tag/<tag>, and that github.com path is not subject to the
+// api.github.com 60 req/hour/IP limit. It is the cheap probe the admin update
+// check uses to answer "is there a newer version?"; only when the tag is newer
+// than the running build do we spend a REST call to fetch the aggregated notes.
+// It returns the raw tag (e.g. "v0.6.0"). The client is copied so we keep its
+// transport (and configured proxy) while overriding only the redirect policy.
+func latestTagViaRedirect(ctx context.Context, client *http.Client) (string, error) {
+	url := fmt.Sprintf("https://github.com/%s/releases/latest", githubRepo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "kiro-anthropic/"+version)
+
+	noRedirect := *client
+	noRedirect.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	resp, err := noRedirect.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusFound && resp.StatusCode != http.StatusMovedPermanently {
+		return "", fmt.Errorf("github: unexpected status %s resolving latest tag", resp.Status)
+	}
+	return tagFromLatestRedirect(resp.Header.Get("Location"))
+}
+
 // --- pure helpers (unit-tested) -------------------------------------------
 
 // assetNameFor returns the release asset name for the given platform, matching
@@ -418,6 +449,37 @@ func download(ctx context.Context, client *http.Client, url string) ([]byte, err
 }
 
 // --- small format/version helpers -----------------------------------------
+
+// tagFromLatestRedirect extracts the release tag from the Location header of a
+// github.com/<repo>/releases/latest redirect (which points at
+// .../releases/tag/<tag>). Pure and unit-tested. Returns an error when the
+// location carries no tag segment (e.g. a repo with no releases redirects to
+// .../releases instead).
+func tagFromLatestRedirect(location string) (string, error) {
+	const marker = "/releases/tag/"
+	i := strings.Index(location, marker)
+	if i < 0 {
+		return "", fmt.Errorf("github: no release tag in redirect %q", location)
+	}
+	tag := location[i+len(marker):]
+	if j := strings.IndexAny(tag, "?#/"); j >= 0 {
+		tag = tag[:j]
+	}
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return "", fmt.Errorf("github: empty release tag in redirect %q", location)
+	}
+	return tag, nil
+}
+
+// tagIsNewer reports whether release tag is a strictly newer semver than the
+// running version. It mirrors newerReleases' gating: if the running version is
+// not valid semver (e.g. a dev build) it returns false, so a dev build never
+// reports an update and never triggers a REST fetch.
+func tagIsNewer(current, tag string) bool {
+	c, t := canonicalSemver(current), canonicalSemver(tag)
+	return semver.IsValid(c) && semver.IsValid(t) && semver.Compare(t, c) > 0
+}
 
 func canonicalSemver(v string) string {
 	v = strings.TrimSpace(v)

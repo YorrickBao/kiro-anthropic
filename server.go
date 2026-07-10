@@ -35,8 +35,10 @@ type Server struct {
 	usageCache map[string]usageCacheEntry // per-account usage cache
 
 	updateMu    sync.Mutex
-	updateCache *updateStatus // last GitHub update check (nil until first fetch)
+	updateCache *updateStatus // last successful GitHub update check (nil until first fetch)
 	updateAt    time.Time     // when updateCache was fetched
+	updateErr   error         // last failed GitHub check (e.g. rate limit), negatively cached
+	updateErrAt time.Time     // when updateErr was recorded
 }
 
 // modelsCacheEntry caches one account's model list.
@@ -62,6 +64,12 @@ const modelsCacheTTL = 5 * time.Minute
 // because the admin page polls periodically and GitHub's unauthenticated rate
 // limit is only 60 requests/hour per IP.
 const updateCacheTTL = 30 * time.Minute
+
+// updateErrCacheTTL is how long a failed GitHub check is remembered before
+// retrying. Negatively caching failures matters most for the rate limit: once
+// the unauthenticated 60 req/hour/IP cap is hit, retrying on every admin poll
+// only keeps the limit pinned, so we back off and let it reset.
+const updateErrCacheTTL = 10 * time.Minute
 
 // updateStatus is the version-update view surfaced to the admin page: the
 // running version, the latest release tag, and the notes of every release newer
@@ -337,9 +345,13 @@ func (s *Server) ensureUsage(ctx context.Context, creds *accountCreds) (*kiroUsa
 }
 
 // ensureUpdateStatus returns the version-update view, querying GitHub at most
-// once per updateCacheTTL. The GitHub call reuses the proxy-aware shared client
-// (s.kiro.client), so it honors the configured HTTP proxy. A failed fetch is
-// not cached and is surfaced to the caller (the admin handler degrades softly).
+// once per updateCacheTTL. It is two-stage to spare the tight unauthenticated
+// REST rate limit: a cheap github.com redirect probe resolves the latest tag
+// (not rate-limited), and only when that tag is newer than the running build do
+// we spend one api.github.com call to aggregate the release notes. Both calls
+// reuse the proxy-aware shared client (s.kiro.client). A failed fetch is
+// negatively cached for updateErrCacheTTL and surfaced to the caller (the admin
+// handler degrades softly), so we back off rather than hammering GitHub.
 func (s *Server) ensureUpdateStatus(ctx context.Context) (*updateStatus, error) {
 	s.updateMu.Lock()
 	if s.updateCache != nil && time.Since(s.updateAt) < updateCacheTTL {
@@ -347,14 +359,47 @@ func (s *Server) ensureUpdateStatus(ctx context.Context) (*updateStatus, error) 
 		s.updateMu.Unlock()
 		return u, nil
 	}
+	// Back off on a recent failure (e.g. GitHub rate limit) instead of retrying
+	// on every poll, which would keep the limit pinned and never let it reset.
+	if s.updateErr != nil && time.Since(s.updateErrAt) < updateErrCacheTTL {
+		err := s.updateErr
+		s.updateMu.Unlock()
+		return nil, err
+	}
 	s.updateMu.Unlock()
 
-	rels, err := listReleases(ctx, s.kiro.client)
-	if err != nil {
+	fail := func(err error) (*updateStatus, error) {
+		s.updateMu.Lock()
+		s.updateErr = err
+		s.updateErrAt = time.Now()
+		s.updateMu.Unlock()
 		return nil, err
 	}
 
+	// Stage 1: cheap probe. Resolve the latest tag via the github.com redirect,
+	// which does not consume the api.github.com rate limit. When we are already
+	// up to date (the common case) we stop here and never touch the REST API.
+	tag, err := latestTagViaRedirect(ctx, s.kiro.client)
+	if err != nil {
+		return fail(err)
+	}
 	st := &updateStatus{Current: version, Releases: []releaseNote{}}
+	if !tagIsNewer(version, tag) {
+		s.updateMu.Lock()
+		s.updateCache = st
+		s.updateAt = time.Now()
+		s.updateErr = nil
+		s.updateErrAt = time.Time{}
+		s.updateMu.Unlock()
+		return st, nil
+	}
+
+	// Stage 2: a newer tag exists, so spend one REST call to aggregate the notes
+	// of every release newer than the running version.
+	rels, err := listReleases(ctx, s.kiro.client)
+	if err != nil {
+		return fail(err)
+	}
 	newer := newerReleases(rels, version)
 	if len(newer) > 0 {
 		st.UpdateAvailable = true
@@ -373,6 +418,8 @@ func (s *Server) ensureUpdateStatus(ctx context.Context) (*updateStatus, error) 
 	s.updateMu.Lock()
 	s.updateCache = st
 	s.updateAt = time.Now()
+	s.updateErr = nil
+	s.updateErrAt = time.Time{}
 	s.updateMu.Unlock()
 	return st, nil
 }

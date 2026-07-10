@@ -144,3 +144,37 @@ func TestBaseName(t *testing.T) {
 		assert.Equalf(t, want, baseName(in), "baseName(%q)", in)
 	}
 }
+
+func TestTagFromLatestRedirect(t *testing.T) {
+	cases := []struct {
+		loc     string
+		want    string
+		wantErr bool
+	}{
+		{"https://github.com/YorrickBao/kiro-anthropic/releases/tag/v0.6.0", "v0.6.0", false},
+		{"https://github.com/o/r/releases/tag/v1.2.3?foo=bar", "v1.2.3", false},
+		{"/o/r/releases/tag/v0.1.0", "v0.1.0", false},
+		// repo with no releases redirects to the releases index, not a tag.
+		{"https://github.com/o/r/releases", "", true},
+		{"", "", true},
+	}
+	for _, c := range cases {
+		got, err := tagFromLatestRedirect(c.loc)
+		if c.wantErr {
+			assert.Errorf(t, err, "tagFromLatestRedirect(%q)", c.loc)
+			continue
+		}
+		require.NoErrorf(t, err, "tagFromLatestRedirect(%q)", c.loc)
+		assert.Equalf(t, c.want, got, "tagFromLatestRedirect(%q)", c.loc)
+	}
+}
+
+func TestTagIsNewer(t *testing.T) {
+	assert.True(t, tagIsNewer("v0.5.0", "v0.6.0"))
+	assert.True(t, tagIsNewer("0.5.0", "v0.6.0"))
+	assert.False(t, tagIsNewer("v0.6.0", "v0.6.0"))
+	assert.False(t, tagIsNewer("v0.6.0", "v0.5.0"))
+	// dev / non-semver running build never reports an update.
+	assert.False(t, tagIsNewer("dev", "v9.9.9"))
+	assert.False(t, tagIsNewer("v0.5.0", "not-a-tag"))
+}

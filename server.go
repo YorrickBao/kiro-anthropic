@@ -33,6 +33,10 @@ type Server struct {
 
 	usageMu    sync.Mutex
 	usageCache map[string]usageCacheEntry // per-account usage cache
+
+	updateMu    sync.Mutex
+	updateCache *updateStatus // last GitHub update check (nil until first fetch)
+	updateAt    time.Time     // when updateCache was fetched
 }
 
 // modelsCacheEntry caches one account's model list.
@@ -53,6 +57,30 @@ const usageCacheTTL = 60 * time.Second
 
 // modelsCacheTTL is how long a per-account model list is reused.
 const modelsCacheTTL = 5 * time.Minute
+
+// updateCacheTTL is how long a GitHub release check is reused. It is long
+// because the admin page polls periodically and GitHub's unauthenticated rate
+// limit is only 60 requests/hour per IP.
+const updateCacheTTL = 30 * time.Minute
+
+// updateStatus is the version-update view surfaced to the admin page: the
+// running version, the latest release tag, and the notes of every release newer
+// than the running version (newest first).
+type updateStatus struct {
+	Current         string        `json:"current"`
+	Latest          string        `json:"latest"`
+	UpdateAvailable bool          `json:"update_available"`
+	Releases        []releaseNote `json:"releases"`
+}
+
+// releaseNote is one GitHub release rendered for the admin page.
+type releaseNote struct {
+	Tag         string `json:"tag"`
+	Name        string `json:"name"`
+	Body        string `json:"body"`
+	HTMLURL     string `json:"html_url"`
+	PublishedAt string `json:"published_at"`
+}
 
 // fallbackModels is used for /v1/models when no account can list live models.
 var fallbackModels = []string{
@@ -291,6 +319,47 @@ func (s *Server) ensureUsage(ctx context.Context, creds *accountCreds) (*kiroUsa
 	s.usageCache[creds.id] = usageCacheEntry{usage: u, fetched: time.Now()}
 	s.usageMu.Unlock()
 	return u, nil
+}
+
+// ensureUpdateStatus returns the version-update view, querying GitHub at most
+// once per updateCacheTTL. The GitHub call reuses the proxy-aware shared client
+// (s.kiro.client), so it honors the configured HTTP proxy. A failed fetch is
+// not cached and is surfaced to the caller (the admin handler degrades softly).
+func (s *Server) ensureUpdateStatus(ctx context.Context) (*updateStatus, error) {
+	s.updateMu.Lock()
+	if s.updateCache != nil && time.Since(s.updateAt) < updateCacheTTL {
+		u := s.updateCache
+		s.updateMu.Unlock()
+		return u, nil
+	}
+	s.updateMu.Unlock()
+
+	rels, err := listReleases(ctx, s.kiro.client)
+	if err != nil {
+		return nil, err
+	}
+
+	st := &updateStatus{Current: version, Releases: []releaseNote{}}
+	newer := newerReleases(rels, version)
+	if len(newer) > 0 {
+		st.UpdateAvailable = true
+		st.Latest = newer[0].TagName
+		for _, r := range newer {
+			st.Releases = append(st.Releases, releaseNote{
+				Tag:         r.TagName,
+				Name:        r.Name,
+				Body:        r.Body,
+				HTMLURL:     r.HTMLURL,
+				PublishedAt: r.PublishedAt,
+			})
+		}
+	}
+
+	s.updateMu.Lock()
+	s.updateCache = st
+	s.updateAt = time.Now()
+	s.updateMu.Unlock()
+	return st, nil
 }
 
 // invalidateUsage drops the cached usage for one account so the next status

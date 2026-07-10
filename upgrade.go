@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/minio/selfupdate"
@@ -175,9 +176,12 @@ type githubAsset struct {
 }
 
 type githubRelease struct {
-	TagName string        `json:"tag_name"`
-	Name    string        `json:"name"`
-	Assets  []githubAsset `json:"assets"`
+	TagName     string        `json:"tag_name"`
+	Name        string        `json:"name"`
+	Body        string        `json:"body"`         // markdown release notes
+	HTMLURL     string        `json:"html_url"`     // release page
+	PublishedAt string        `json:"published_at"` // RFC3339
+	Assets      []githubAsset `json:"assets"`
 }
 
 // checksumURL returns the browser_download_url for checksums.txt, or "" if the
@@ -227,6 +231,38 @@ func fetchRelease(ctx context.Context, client *http.Client, tag string) (githubR
 		return githubRelease{}, errors.New("release has no tag_name")
 	}
 	return rel, nil
+}
+
+// listReleases fetches the repo's releases (newest first, up to 100). It uses
+// the injected client, so it honors the process's configured HTTP proxy just
+// like fetchRelease. Used by the admin update check to aggregate the notes of
+// every release newer than the running version.
+func listReleases(ctx context.Context, client *http.Client) ([]githubRelease, error) {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=100", githubRepo)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "kiro-anthropic/"+version)
+	if tok := os.Getenv("GITHUB_TOKEN"); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("github api: %s: %s", resp.Status, readSnippet(resp.Body))
+	}
+
+	var rels []githubRelease
+	if err := json.NewDecoder(resp.Body).Decode(&rels); err != nil {
+		return nil, fmt.Errorf("decode releases: %w", err)
+	}
+	return rels, nil
 }
 
 // --- pure helpers (unit-tested) -------------------------------------------
@@ -409,6 +445,28 @@ func compareVersions(a, b string) int {
 	default:
 		return 0
 	}
+}
+
+// newerReleases returns the releases strictly newer than current, sorted newest
+// first. Non-semver releases (and everything when current itself is not semver,
+// e.g. a dev build) are excluded, so a dev build never reports an update. Pure
+// and side-effect free for unit testing.
+func newerReleases(all []githubRelease, current string) []githubRelease {
+	cur := canonicalSemver(current)
+	if !semver.IsValid(cur) {
+		return nil
+	}
+	out := make([]githubRelease, 0, len(all))
+	for _, r := range all {
+		tag := canonicalSemver(r.TagName)
+		if semver.IsValid(tag) && semver.Compare(tag, cur) > 0 {
+			out = append(out, r)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return compareVersions(out[i].TagName, out[j].TagName) > 0
+	})
+	return out
 }
 
 // selfExeLabel is a short, friendly label for the running binary path.

@@ -20,6 +20,11 @@
   }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
   header .ver { color: var(--muted); font-size: 12px; }
+  header .update-badge {
+    font-size: 11px; color: var(--bg); background: var(--ok); cursor: pointer;
+    padding: 2px 8px; border-radius: 999px; font-weight: 600; user-select: none;
+  }
+  header .update-badge:hover { filter: brightness(1.1); }
   header .spacer { flex: 1; }
   header .updated { color: var(--muted); font-size: 12px; }
   .wrap { padding: 20px 24px; max-width: 1100px; margin: 0 auto; display: grid; gap: 18px; }
@@ -82,6 +87,7 @@
 <header>
   <h1>kiro-anthropic</h1>
   <span class="ver" id="ver"></span>
+  <span class="update-badge" id="update-badge" title="" style="display:none">↑ 新版本</span>
   <span class="spacer"></span>
   <span class="updated" id="updated">加载中…</span>
 </header>
@@ -122,14 +128,69 @@
   </div>
 </div>
 
+<div class="modal-backdrop" id="update-modal">
+  <div class="modal">
+    <button class="ghost close" id="update-close" type="button">关闭</button>
+    <h2 style="text-transform:none;font-size:15px;color:var(--fg);margin-top:0">有新版本可更新</h2>
+    <div id="update-body"></div>
+  </div>
+</div>
+
 <script>
 const REFRESH_MS = 15000;
+const UPDATE_CHECK_MS = 30 * 60 * 1000; // idle re-check cadence; backend caches too
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmtNum = (n) => (n == null) ? "—" : Number(n).toLocaleString(undefined, {maximumFractionDigits: 2});
 const fmtDate = (s) => { if (!s) return "—"; const d = new Date(s); return isNaN(d) ? esc(s) : d.toLocaleString(); };
 
 let latestModels = [];
+let lastUpdateCheck = 0;
+
+// checkUpdate polls the backend (which caches the GitHub result) and shows a
+// header badge when a newer release exists. Failures are silent: a version
+// check must never disrupt the page.
+async function checkUpdate() {
+  lastUpdateCheck = Date.now();
+  try {
+    const res = await fetch("/api/update.json", { cache: "no-store" });
+    if (!res.ok) return;
+    const d = await res.json();
+    const badge = $("update-badge");
+    if (d && d.update_available && Array.isArray(d.releases) && d.releases.length) {
+      const cur = d.current ? (d.current.startsWith("v") ? d.current : "v" + d.current) : "";
+      const latest = d.latest || (d.releases[0] && d.releases[0].tag) || "";
+      badge.title = `当前 ${cur}，最新 ${latest}，点击查看变更`;
+      badge.textContent = `↑ ${latest}`;
+      badge.style.display = "";
+      badge.onclick = () => openUpdate(d);
+    } else {
+      badge.style.display = "none";
+      badge.onclick = null;
+    }
+  } catch (e) { /* silent */ }
+}
+
+// openUpdate renders the aggregated release notes (newest first) into the modal.
+// Notes are plain-text escaped and shown pre-wrapped; no markdown rendering, so
+// there is no injection surface.
+function openUpdate(d) {
+  const parts = (d.releases || []).map(r => {
+    const when = r.published_at ? ` · ${fmtDate(r.published_at)}` : "";
+    const title = esc(r.name && r.name !== r.tag ? `${r.tag} — ${r.name}` : r.tag);
+    const body = (r.body || "").trim();
+    const notes = body ? `<div style="white-space:pre-wrap;font-size:12.5px;color:var(--fg);margin-top:6px">${esc(body)}</div>`
+                       : `<div class="muted" style="font-size:12px;margin-top:6px">（无说明）</div>`;
+    const link = r.html_url ? ` <a href="${esc(r.html_url)}" target="_blank" rel="noopener" style="color:var(--accent);font-size:12px">在 GitHub 查看</a>` : "";
+    return `<div style="padding:10px 0;border-top:1px solid var(--line)">
+      <div style="font-size:13px;font-weight:600;color:var(--accent)">${title}<span class="muted" style="font-weight:400">${when}</span>${link}</div>
+      ${notes}
+    </div>`;
+  }).join("");
+  $("update-body").innerHTML =
+    `<p class="muted" style="font-size:12px;margin:0 0 4px">运行 <code>kiro-anthropic upgrade</code> 升级到最新版本。</p>${parts}`;
+  $("update-modal").classList.add("open");
+}
 
 function expiryPill(state, secs) {
   const cls = state === "valid" ? "ok" : (state === "expiring soon" ? "warn" : (state === "unknown" ? "" : "err"));
@@ -354,8 +415,16 @@ $("import-btn").addEventListener("click", importLocal);
 $("refresh-all-btn").addEventListener("click", refreshAllAccounts);
 $("models-close").addEventListener("click", () => $("models-modal").classList.remove("open"));
 $("models-modal").addEventListener("click", (e) => { if (e.target === $("models-modal")) $("models-modal").classList.remove("open"); });
+$("update-close").addEventListener("click", () => $("update-modal").classList.remove("open"));
+$("update-modal").addEventListener("click", (e) => { if (e.target === $("update-modal")) $("update-modal").classList.remove("open"); });
+// Re-check when the tab becomes visible again, but not more often than the cadence.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && Date.now() - lastUpdateCheck > UPDATE_CHECK_MS) checkUpdate();
+});
 tick();
 setInterval(tick, REFRESH_MS);
+checkUpdate();
+setInterval(checkUpdate, UPDATE_CHECK_MS);
 </script>
 </body>
 </html>

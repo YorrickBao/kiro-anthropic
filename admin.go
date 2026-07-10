@@ -32,6 +32,7 @@ func (s *Server) AdminHandler() http.Handler {
 	r.Get("/", s.handleAdminPage)
 	r.Get("/health", s.handleHealth)
 	r.Get("/api/status.json", s.handleAdminStatus)
+	r.Get("/api/update.json", s.handleUpdateCheck)
 	r.Get("/api/accounts.json", s.handleAccountsList)
 	r.Post("/api/login/start", s.handleLoginStart)
 	r.Post("/api/accounts/delete", s.handleAccountDelete)
@@ -131,6 +132,24 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 		"models":           s.modelsView(ctx, now),
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleUpdateCheck returns the version-update view (current version, latest
+// release, and aggregated notes of newer releases). A GitHub failure degrades
+// softly: it returns 200 with update_available=false and an error string so the
+// admin page can stay silent rather than surfacing a scary error.
+func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	st, err := s.ensureUpdateStatus(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"current":          version,
+			"update_available": false,
+			"releases":         []any{},
+			"error":            err.Error(),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
 }
 
 // accountsStatus assembles the per-account panel data: identity (redacted) plus

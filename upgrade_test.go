@@ -93,6 +93,34 @@ func TestCompareVersions(t *testing.T) {
 	}
 }
 
+func TestNewerReleases(t *testing.T) {
+	all := []githubRelease{
+		{TagName: "v0.5.1"},
+		{TagName: "v0.4.0"},
+		{TagName: "v0.5.0"},
+		{TagName: "not-semver"}, // excluded
+		{TagName: "v0.3.0"},
+	}
+
+	// current several versions behind: returns only newer, sorted newest-first.
+	got := newerReleases(all, "0.4.0")
+	require.Len(t, got, 2)
+	assert.Equal(t, "v0.5.1", got[0].TagName)
+	assert.Equal(t, "v0.5.0", got[1].TagName)
+
+	// current equals latest: nothing newer.
+	assert.Empty(t, newerReleases(all, "v0.5.1"))
+
+	// current ahead of everything: nothing newer.
+	assert.Empty(t, newerReleases(all, "v9.9.9"))
+
+	// dev / non-semver current: never reports an update.
+	assert.Empty(t, newerReleases(all, "dev"))
+
+	// empty input.
+	assert.Empty(t, newerReleases(nil, "v0.1.0"))
+}
+
 func TestCanonicalSemver(t *testing.T) {
 	cases := map[string]string{
 		"v0.1.0":  "v0.1.0",

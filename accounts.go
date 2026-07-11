@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -182,6 +183,16 @@ func (s *AccountStore) ReplaceCredentials(id string, fresh *StoredAccount) error
 	if !ok {
 		return fmt.Errorf("account %s not found", id)
 	}
+	applyCredentialsLocked(a, fresh)
+	return s.saveLocked()
+}
+
+// applyCredentialsLocked overwrites the credential and identity fields of a with
+// those from fresh (same AWS account, new sign-in/import/migration), preserving
+// a's id, label and creation time. Empty profileArn/email in fresh are ignored
+// so a partial refresh does not erase previously resolved identity. Caller holds
+// s.mu.
+func applyCredentialsLocked(a, fresh *StoredAccount) {
 	a.Provider = fresh.Provider
 	a.AuthMethod = fresh.AuthMethod
 	a.Region = fresh.Region
@@ -198,7 +209,57 @@ func (s *AccountStore) ReplaceCredentials(id string, fresh *StoredAccount) error
 	if fresh.Email != "" {
 		a.Email = fresh.Email
 	}
-	return s.saveLocked()
+}
+
+// ImportResult summarizes a bulk import (see ImportAccounts).
+type ImportResult struct {
+	Added    int
+	Replaced int
+}
+
+// ImportAccounts merges externally exported accounts (see the admin export
+// bundle) into the store for server-to-server migration. Each incoming account
+// is deduped by stable identity via findDuplicateLocked: a match has its
+// credentials replaced in place (preserving the existing id/label/createdAt),
+// while a new account is inserted, minting a fresh id when the export carried
+// none or one that collides with an unrelated account. Entries without any
+// usable credential are skipped. The store is persisted once, after all merges.
+func (s *AccountStore) ImportAccounts(incoming []*StoredAccount) (ImportResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var res ImportResult
+	for _, in := range incoming {
+		if in == nil || (in.RefreshToken == "" && in.AccessToken == "") {
+			continue
+		}
+		if id, ok := s.findDuplicateLocked(*in); ok {
+			applyCredentialsLocked(s.accounts[id], in)
+			res.Replaced++
+			continue
+		}
+		na := *in
+		if na.ID == "" {
+			na.ID = uuid.NewString()
+		}
+		if _, exists := s.accounts[na.ID]; exists {
+			// An unrelated account already owns this id (identity did not match);
+			// mint a new one rather than clobber it.
+			na.ID = uuid.NewString()
+		}
+		if na.CreatedAt == "" {
+			na.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+		}
+		s.accounts[na.ID] = &na
+		res.Added++
+	}
+	if res.Added == 0 && res.Replaced == 0 {
+		return res, nil
+	}
+	if err := s.saveLocked(); err != nil {
+		return ImportResult{}, err
+	}
+	return res, nil
 }
 
 // UpdateLabel sets the label (note) of an existing account and persists the
@@ -302,6 +363,11 @@ func (s *AccountStore) Remove(id string) error {
 func (s *AccountStore) FindDuplicate(candidate StoredAccount) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.findDuplicateLocked(candidate)
+}
+
+// findDuplicateLocked is FindDuplicate's body; caller holds s.mu.
+func (s *AccountStore) findDuplicateLocked(candidate StoredAccount) (string, bool) {
 	for _, a := range s.accounts {
 		switch {
 		case candidate.ProfileArn != "" && a.ProfileArn == candidate.ProfileArn:

@@ -42,6 +42,73 @@ func TestAccountStoreRoundTrip(t *testing.T) {
 	assert.Equal(t, "rtoken", got.RefreshToken)
 }
 
+func TestAccountStoreImportAccounts(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "accounts.json")
+
+	s, err := NewAccountStore(path)
+	require.NoError(t, err)
+
+	// Seed one account whose identity (email) will match an incoming one.
+	require.NoError(t, s.Add(&StoredAccount{
+		ID: "existing", Label: "keep me", Email: "a@x.com",
+		RefreshToken: "old-refresh", CreatedAt: "2020-01-01T00:00:00Z",
+	}))
+
+	res, err := s.ImportAccounts([]*StoredAccount{
+		// Same identity as "existing": credentials replaced in place.
+		{ID: "other-id", Email: "a@x.com", RefreshToken: "new-refresh", Label: "should not overwrite"},
+		// Brand new account, keeps its id.
+		{ID: "brand-new", Email: "b@x.com", RefreshToken: "r2"},
+		// No id: one is minted.
+		{Email: "c@x.com", RefreshToken: "r3"},
+		// No usable credential: skipped.
+		{Email: "d@x.com"},
+		// nil: skipped.
+		nil,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 2, res.Added)
+	assert.Equal(t, 1, res.Replaced)
+
+	// Reload from disk to confirm persistence.
+	s2, err := NewAccountStore(path)
+	require.NoError(t, err)
+
+	kept, ok := s2.Get("existing")
+	require.True(t, ok)
+	assert.Equal(t, "new-refresh", kept.RefreshToken, "credentials replaced in place")
+	assert.Equal(t, "keep me", kept.Label, "label preserved")
+	assert.Equal(t, "2020-01-01T00:00:00Z", kept.CreatedAt, "createdAt preserved")
+	_, gone := s2.Get("other-id")
+	assert.False(t, gone, "duplicate must not create a second account")
+
+	brand, ok := s2.Get("brand-new")
+	require.True(t, ok)
+	assert.Equal(t, "r2", brand.RefreshToken)
+	assert.NotEmpty(t, brand.CreatedAt, "createdAt minted when missing")
+
+	assert.Len(t, s2.List(), 3, "existing + brand-new + minted-id; empty/nil skipped")
+}
+
+func TestAccountStoreImportMintsIDOnCollision(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewAccountStore(filepath.Join(dir, "accounts.json"))
+	require.NoError(t, err)
+
+	require.NoError(t, s.Add(&StoredAccount{ID: "dup", Email: "a@x.com", RefreshToken: "r1", CreatedAt: "2020"}))
+
+	// Different identity but a colliding id: must mint a new id, not clobber.
+	res, err := s.ImportAccounts([]*StoredAccount{{ID: "dup", Email: "z@x.com", RefreshToken: "r9"}})
+	require.NoError(t, err)
+	assert.Equal(t, 1, res.Added)
+
+	orig, ok := s.Get("dup")
+	require.True(t, ok)
+	assert.Equal(t, "a@x.com", orig.Email, "original id owner untouched")
+	assert.Len(t, s.List(), 2)
+}
+
 func TestAccountStoreFilePermissions(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sub", "accounts.json")

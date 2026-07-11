@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -38,6 +39,8 @@ func (s *Server) AdminHandler() http.Handler {
 	r.Post("/api/accounts/delete", s.handleAccountDelete)
 	r.Post("/api/accounts/label", s.handleAccountLabel)
 	r.Post("/api/accounts/import", s.handleAccountImport)
+	r.Get("/api/accounts/export", s.handleAccountExport)
+	r.Post("/api/accounts/import-bundle", s.handleAccountImportBundle)
 	r.Post("/api/accounts/refresh", s.handleAccountRefresh)
 	r.Get("/oauth/callback", s.handleLoginCallback)
 	return r
@@ -285,6 +288,69 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": acct.ID, "already_present": false})
+}
+
+// maxImportBundleBytes caps the accepted import upload. A pool of a few hundred
+// accounts is well under this; the limit just bounds memory for a hostile body.
+const maxImportBundleBytes = 16 << 20 // 16 MiB
+
+// handleAccountExport streams the entire account pool as a JSON bundle for
+// migration to another server. Unlike the redacted status/list endpoints, this
+// deliberately includes the long-lived secrets (refreshToken, clientSecret) so
+// the pool can be reconstituted elsewhere. Exposing them here is acceptable only
+// because the admin surface is loopback-only and Host-pinned (see AdminHandler);
+// the downloaded file must still be treated as sensitive. The bundle re-imports
+// via handleAccountImportBundle.
+func (s *Server) handleAccountExport(w http.ResponseWriter, r *http.Request) {
+	if s.accounts == nil {
+		adminError(w, http.StatusServiceUnavailable, "account store is not configured")
+		return
+	}
+	bundle := map[string]any{
+		"type":        "kiro-anthropic/accounts-export",
+		"version":     1,
+		"exported_at": time.Now().UTC().Format(time.RFC3339),
+		"accounts":    s.accounts.List(),
+	}
+	filename := fmt.Sprintf("kiro-anthropic-accounts-%s.json", time.Now().Format("20060102-150405"))
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, filename))
+	w.WriteHeader(http.StatusOK)
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(bundle)
+}
+
+// handleAccountImportBundle merges an exported bundle (see handleAccountExport)
+// into the store. It accepts both the wrapped export shape and the bare
+// on-disk {"accounts":[...]} layout, since both carry an "accounts" array.
+// Accounts already present (matched by identity) are refreshed in place; the
+// rest are added. The response reports how many were added vs replaced.
+func (s *Server) handleAccountImportBundle(w http.ResponseWriter, r *http.Request) {
+	if s.accounts == nil {
+		adminError(w, http.StatusServiceUnavailable, "account store is not configured")
+		return
+	}
+	var bundle struct {
+		Accounts []*StoredAccount `json:"accounts"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxImportBundleBytes)).Decode(&bundle); err != nil {
+		adminError(w, http.StatusBadRequest, "invalid JSON bundle: "+err.Error())
+		return
+	}
+	if len(bundle.Accounts) == 0 {
+		adminError(w, http.StatusBadRequest, "bundle contains no accounts")
+		return
+	}
+	res, err := s.accounts.ImportAccounts(bundle.Accounts)
+	if err != nil {
+		noteError(r.Context(), err.Error())
+		adminError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "added": res.Added, "replaced": res.Replaced, "total": len(bundle.Accounts),
+	})
 }
 
 // handleAccountRefresh forces an SSO-OIDC token refresh for one account (when

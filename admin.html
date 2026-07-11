@@ -123,7 +123,10 @@
   <section class="card">
     <h2 style="display:flex;align-items:center;gap:10px">账号（<span id="acct-count">0</span>）
       <span style="flex:1"></span>
+      <button id="export-btn" class="ghost" type="button" style="text-transform:none;font-size:12px" title="导出全部号池凭据为 JSON 文件，用于迁移到其他服务器">导出号池</button>
+      <button id="import-file-btn" class="ghost" type="button" style="text-transform:none;font-size:12px" title="从导出的 JSON 文件导入号池凭据（按身份合并去重）">导入号池</button>
       <button id="refresh-all-btn" class="ghost" type="button" style="text-transform:none;font-size:12px">刷新全部令牌</button>
+      <input id="import-file-input" type="file" accept="application/json,.json" style="display:none" />
     </h2>
     <span id="refresh-all-msg" class="muted" style="font-size:12px"></span>
     <div class="accounts" id="accounts"></div>
@@ -443,6 +446,51 @@ async function refreshAllAccounts() {
   }
 }
 
+// exportAccounts downloads the full pool (secrets included) as a JSON file.
+// Fetched via XHR so a failed export surfaces an error instead of navigating
+// away; the blob is then saved through a synthetic <a download>.
+async function exportAccounts() {
+  const btn = $("export-btn"), msg = $("refresh-all-msg");
+  btn.disabled = true;
+  try {
+    const res = await fetch("/api/accounts/export", { cache: "no-store" });
+    if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error((d.error && d.error.message) || ("HTTP " + res.status)); }
+    const blob = await res.blob();
+    const ts = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `kiro-anthropic-accounts-${ts}.json`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    msg.textContent = "已导出号池凭据（含密钥，请妥善保管）。";
+  } catch (e) {
+    msg.innerHTML = `<span class="err-box">导出失败: ${esc(e.message)}</span>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// importBundle merges an exported bundle into the pool. It parses the file
+// client-side first for a friendly error, then posts the raw text.
+async function importBundle(file) {
+  if (!file) return;
+  const msg = $("refresh-all-msg");
+  msg.textContent = "正在导入号池…";
+  try {
+    const text = await file.text();
+    JSON.parse(text); // fail fast on a non-JSON file
+    const res = await fetch("/api/accounts/import-bundle", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: text
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error((d.error && d.error.message) || ("HTTP " + res.status));
+    msg.textContent = `导入完成：新增 ${d.added}，更新 ${d.replaced}（共 ${d.total}）。`;
+    await tick();
+  } catch (e) {
+    msg.innerHTML = `<span class="err-box">导入失败: ${esc(e.message)}</span>`;
+  }
+}
+
 async function tick() {
   try {
     const res = await fetch("/api/status.json", { cache: "no-store" });
@@ -462,6 +510,13 @@ async function tick() {
 $("login-btn").addEventListener("click", startLogin);
 $("import-btn").addEventListener("click", importLocal);
 $("refresh-all-btn").addEventListener("click", refreshAllAccounts);
+$("export-btn").addEventListener("click", exportAccounts);
+$("import-file-btn").addEventListener("click", () => $("import-file-input").click());
+$("import-file-input").addEventListener("change", (e) => {
+  const f = e.target.files && e.target.files[0];
+  importBundle(f);
+  e.target.value = ""; // let the same file be re-selected later
+});
 $("models-close").addEventListener("click", () => $("models-modal").classList.remove("open"));
 $("models-modal").addEventListener("click", (e) => { if (e.target === $("models-modal")) $("models-modal").classList.remove("open"); });
 $("update-close").addEventListener("click", () => $("update-modal").classList.remove("open"));

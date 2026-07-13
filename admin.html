@@ -76,6 +76,23 @@
   .acct .meta { display: grid; grid-template-columns: 88px 1fr; gap: 4px 10px; font-size: 12.5px; }
   .acct .meta dt { color: var(--muted); }
   .acct .meta dd { margin: 0; word-break: break-all; }
+  /* loading state: skeleton cards + inline status bar */
+  .acct.skeleton { min-height: 180px; }
+  .acct.skeleton .sk-line {
+    height: 12px; border-radius: 6px; margin: 10px 0;
+    background: linear-gradient(90deg, #1c2029 25%, #262b36 37%, #1c2029 63%);
+    background-size: 400% 100%;
+    animation: skeleton-pulse 1.4s ease infinite;
+  }
+  .acct.skeleton .sk-line.w70 { width: 70%; }
+  .acct.skeleton .sk-line.w90 { width: 90%; }
+  .acct.skeleton .sk-line.w40 { width: 40%; }
+  @keyframes skeleton-pulse { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
+  .status-bar { display: none; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); margin-bottom: 10px; }
+  .status-bar.show { display: flex; }
+  .status-bar.err { color: var(--err); }
+  .spinner { width: 13px; height: 13px; border-radius: 50%; border: 2px solid var(--line); border-top-color: var(--accent); animation: spin .8s linear infinite; flex: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
   /* popover */
   .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none; align-items: center; justify-content: center; z-index: 10; }
   .modal-backdrop.open { display: flex; }
@@ -129,6 +146,7 @@
       <input id="import-file-input" type="file" accept="application/json,.json" style="display:none" />
     </h2>
     <span id="refresh-all-msg" class="muted" style="font-size:12px"></span>
+    <div class="status-bar" id="acct-status"><span class="spinner"></span><span id="acct-status-text">正在加载账号额度…</span></div>
     <div class="accounts" id="accounts"></div>
   </section>
 </div>
@@ -159,6 +177,27 @@ const fmtDate = (s) => { if (!s) return "—"; const d = new Date(s); return isN
 
 let latestModels = [];
 let lastUpdateCheck = 0;
+let loaded = false; // whether the first status poll has completed successfully
+
+// setStatusBar toggles the inline loading/error indicator above the account grid.
+function setStatusBar(text, isErr) {
+  const bar = $("acct-status"), txt = $("acct-status-text");
+  if (!text) { bar.classList.remove("show", "err"); return; }
+  txt.textContent = text;
+  bar.classList.toggle("err", !!isErr);
+  bar.classList.add("show");
+}
+
+// renderSkeleton paints placeholder account cards while the first status poll is
+// in flight, so the panel is never blank. It mirrors the .accounts grid layout.
+function renderSkeleton() {
+  const card = `<div class="acct skeleton">
+    <div class="sk-line w70"></div><div class="sk-line w40"></div>
+    <div class="sk-line w90"></div><div class="sk-line w90"></div>
+    <div class="sk-line w70"></div>
+  </div>`;
+  $("accounts").innerHTML = card.repeat(3);
+}
 
 // checkUpdate polls the backend (which caches the GitHub result) and shows a
 // header badge when a newer release exists. Failures are silent: a version
@@ -492,6 +531,10 @@ async function importBundle(file) {
 }
 
 async function tick() {
+  // On the very first load, paint a skeleton + loading bar immediately so the
+  // panel is never blank while usage is fetched. Subsequent (background) polls
+  // keep showing the previous data and only touch the bar on error.
+  if (!loaded) { renderSkeleton(); setStatusBar("正在加载账号额度…"); }
   try {
     const res = await fetch("/api/status.json", { cache: "no-store" });
     if (!res.ok) throw new Error("HTTP " + res.status);
@@ -502,7 +545,17 @@ async function tick() {
     latestModels = d.models || [];
     renderAccounts(d.accounts);
     $("updated").textContent = "更新于 " + new Date().toLocaleTimeString();
+    loaded = true;
+    setStatusBar("");
   } catch (e) {
+    if (!loaded) {
+      // first load failed: surface the error in the bar, leave the skeleton.
+      setStatusBar("加载失败：" + e.message, true);
+    } else {
+      // background refresh failed: keep the last good data, just note it.
+      setStatusBar("刷新失败：" + e.message, true);
+      setTimeout(() => { if (loaded) setStatusBar(""); }, 4000);
+    }
     $("updated").innerHTML = `<span class="err-box">刷新失败: ${esc(e.message)}</span>`;
   }
 }

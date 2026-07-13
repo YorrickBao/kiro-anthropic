@@ -130,6 +130,11 @@ func (m *loginManager) postJSON(ctx context.Context, url string, body any, out a
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	// Mimic the Kiro IDE's SSO-OIDC client (AWS SDK for JavaScript): the real
+	// IDE reaches oidc.*.amazonaws.com via the SDK, which stamps aws-sdk-js UA
+	// and amz-sdk-* headers on every call. Sending a bare request here would
+	// stick out next to those, so we reuse the same header set.
+	applyKiroHeaders(req, "", "")
 	resp, err := m.client.Do(req)
 	if err != nil {
 		return err
@@ -469,7 +474,7 @@ func fetchAccountEmail(ctx context.Context, client *http.Client, region, arn, ac
 		return ""
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+accessToken)
+	applyKiroHeaders(req, accessToken, "")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -503,7 +508,7 @@ func resolveProfileArn(ctx context.Context, client *http.Client, region, accessT
 	}
 	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
 	req.Header.Set("X-Amz-Target", "AmazonCodeWhispererService.ListAvailableProfiles")
-	req.Header.Set("Authorization", "Bearer "+accessToken)
+	applyKiroHeaders(req, accessToken, "")
 
 	resp, err := client.Do(req)
 	if err != nil {

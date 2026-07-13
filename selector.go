@@ -25,6 +25,10 @@ type kiroCredentials interface {
 	apiRegion() string
 	// profileArn resolves the CodeWhisperer profileArn for the request.
 	profileArn(ctx context.Context) (string, error)
+	// machineID returns a stable per-account fingerprint for the User-Agent,
+	// so pooled accounts look like distinct Kiro IDE installs rather than one
+	// host running many sessions. Empty means "no fingerprint".
+	machineID() string
 	// refresh unconditionally refreshes the token (used to recover from 401/403).
 	refresh(ctx context.Context) error
 }
@@ -45,6 +49,10 @@ func (c *accountCreds) apiRegion() string {
 	}
 	return "us-east-1"
 }
+
+// machineID returns a stable fingerprint for this account, embedded in the
+// User-Agent so each pooled account looks like its own Kiro IDE install.
+func (c *accountCreds) machineID() string { return machineIDFor(c.id) }
 
 func (c *accountCreds) profileArn(ctx context.Context) (string, error) {
 	if c.acct.ProfileArn != "" {

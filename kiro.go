@@ -237,8 +237,7 @@ func (c *KiroClient) sendOnce(ctx context.Context, creds kiroCredentials, req *k
 	}
 	httpReq.Header.Set("Content-Type", "application/x-amz-json-1.0")
 	httpReq.Header.Set("X-Amz-Target", "AmazonCodeWhispererStreamingService.GenerateAssistantResponse")
-	httpReq.Header.Set("Authorization", "Bearer "+token)
-	httpReq.Header.Set("User-Agent", "kiro-anthropic/"+version)
+	applyKiroHeaders(httpReq, token, creds.machineID())
 
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
@@ -797,8 +796,7 @@ func (c *KiroClient) getUsageOnce(ctx context.Context, creds kiroCredentials) ([
 		return nil, 0, err
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("User-Agent", "kiro-anthropic/"+version)
+	applyKiroHeaders(req, token, creds.machineID())
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -834,7 +832,7 @@ func (c *KiroClient) ListModels(ctx context.Context, creds kiroCredentials) ([]k
 	}
 	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
 	req.Header.Set("X-Amz-Target", "KiroControlPlaneBearerService.ListAvailableModels")
-	req.Header.Set("Authorization", "Bearer "+token)
+	applyKiroHeaders(req, token, creds.machineID())
 
 	resp, err := c.client.Do(req)
 	if err != nil {

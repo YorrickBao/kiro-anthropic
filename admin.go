@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -157,24 +158,39 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 
 // accountsStatus assembles the per-account panel data: identity (redacted) plus
 // live usage (cached per account). Failures are surfaced inline per account.
+//
+// Usage is fetched concurrently across accounts so a cold cache does not make
+// the panel wait N sequential round-trips. Each goroutine builds its own view
+// map and writes it into a fixed index of the pre-sized results slice, so no
+// shared mutable state needs guarding; the output order still matches the store.
 func (s *Server) accountsStatus(ctx context.Context, now time.Time) []map[string]any {
-	out := make([]map[string]any, 0)
 	if s.selector == nil {
-		return out
+		return []map[string]any{}
 	}
-	for _, creds := range s.selector.listAll() {
-		v := creds.acct.view()
-		if u, err := s.ensureUsage(ctx, creds); err != nil {
-			v["usage"] = map[string]any{"error": err.Error()}
-		} else {
-			v["usage"] = u
-			if u.Email != "" && (v["email"] == nil || v["email"] == "") {
-				v["email"] = u.Email
+	credsList := s.selector.listAll()
+	results := make([]map[string]any, len(credsList))
+	if len(credsList) == 0 {
+		return results
+	}
+	var wg sync.WaitGroup
+	for i, creds := range credsList {
+		wg.Add(1)
+		go func(i int, creds *accountCreds) {
+			defer wg.Done()
+			v := creds.acct.view()
+			if u, err := s.ensureUsage(ctx, creds); err != nil {
+				v["usage"] = map[string]any{"error": err.Error()}
+			} else {
+				v["usage"] = u
+				if u.Email != "" && (v["email"] == nil || v["email"] == "") {
+					v["email"] = u.Email
+				}
 			}
-		}
-		out = append(out, v)
+			results[i] = v
+		}(i, creds)
 	}
-	return out
+	wg.Wait()
+	return results
 }
 
 // handleAccountsList returns the stored (self-managed) accounts, redacted.

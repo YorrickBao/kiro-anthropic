@@ -145,6 +145,35 @@ func TestAccountStoreUpdateLabel(t *testing.T) {
 	assert.Error(t, s.UpdateLabel("missing", "x"))
 }
 
+func TestAccountStoreSetDisabled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	s, err := NewAccountStore(path)
+	require.NoError(t, err)
+	require.NoError(t, s.Add(&StoredAccount{ID: "id", ClientID: "c", RefreshToken: "r", CreatedAt: "1"}))
+
+	// Default state is enabled (legacy accounts stay in the pool).
+	got, _ := s.Get("id")
+	assert.False(t, got.Disabled)
+
+	// Park the account out of the pool.
+	require.NoError(t, s.SetDisabled("id", true))
+	got, _ = s.Get("id")
+	assert.True(t, got.Disabled)
+
+	// Persisted across reload.
+	s2, err := NewAccountStore(path)
+	require.NoError(t, err)
+	got2, _ := s2.Get("id")
+	assert.True(t, got2.Disabled)
+
+	// Re-enable and verify the toggle is reversible.
+	require.NoError(t, s2.SetDisabled("id", false))
+	got2, _ = s2.Get("id")
+	assert.False(t, got2.Disabled)
+
+	assert.Error(t, s.SetDisabled("missing", true), "unknown id -> error")
+}
+
 func TestAccountStoreRemove(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "accounts.json")
 	s, err := NewAccountStore(path)
@@ -189,6 +218,7 @@ func TestStoredAccountViewRedacts(t *testing.T) {
 	assert.NotContains(t, v, "refresh_token", "raw refresh token must not be exposed")
 	assert.NotContains(t, v, "client_secret", "client secret must not be exposed")
 	assert.Equal(t, "valid", v["expiry_state"])
+	assert.Equal(t, false, v["disabled"], "disabled is surfaced for the admin toggle")
 }
 
 func TestStoredAccountExpiryState(t *testing.T) {

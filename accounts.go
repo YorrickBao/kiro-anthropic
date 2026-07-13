@@ -50,6 +50,11 @@ type StoredAccount struct {
 
 	ProfileArn string `json:"profileArn,omitempty"`
 	CreatedAt  string `json:"createdAt,omitempty"`
+
+	// Disabled omits the account from the round-robin pool: it is still stored,
+	// refreshed and shown on the admin page with usage, but never selected to
+	// serve requests. Defaults to false (opt-out), preserving legacy behaviour.
+	Disabled bool `json:"disabled,omitempty"`
 }
 
 // expiry parses ExpiresAt; zero time means unknown.
@@ -262,6 +267,21 @@ func (s *AccountStore) ImportAccounts(incoming []*StoredAccount) (ImportResult, 
 	return res, nil
 }
 
+// SetDisabled toggles whether an account participates in the round-robin pool
+// and persists the store. A disabled account remains stored, refreshed and
+// shown on the admin page; it is only excluded from selection. Returns an error
+// if the id is unknown.
+func (s *AccountStore) SetDisabled(id string, disabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.accounts[id]
+	if !ok {
+		return fmt.Errorf("account %s not found", id)
+	}
+	a.Disabled = disabled
+	return s.saveLocked()
+}
+
 // UpdateLabel sets the label (note) of an existing account and persists the
 // store. Returns an error if the id is unknown.
 func (s *AccountStore) UpdateLabel(id, label string) error {
@@ -408,6 +428,7 @@ func (a StoredAccount) view() map[string]any {
 		"profile_arn":  a.ProfileArn,
 		"created_at":   a.CreatedAt,
 		"expires_at":   a.ExpiresAt,
+		"disabled":     a.Disabled,
 		"access_token": masked(a.AccessToken),
 		"has_refresh":  a.RefreshToken != "",
 	}

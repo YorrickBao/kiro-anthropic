@@ -179,6 +179,61 @@ func TestSelectorAllUnusableReturnsFalse(t *testing.T) {
 	assert.False(t, ok, "no usable account -> peekAny fails")
 }
 
+func TestSelectorSkipsDisabledAccount(t *testing.T) {
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	// "off" is a fully-credentialed account but parked out of the pool.
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "off", ClientID: "c", ClientSecret: "s", RefreshToken: "r", Disabled: true, CreatedAt: "0",
+	}))
+	// "on" is identical but participates.
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "on", ClientID: "c", ClientSecret: "s", RefreshToken: "r", CreatedAt: "1",
+	}))
+	s := newAccountSelector(store, &http.Client{})
+
+	seen := map[string]bool{}
+	for i := 0; i < 6; i++ {
+		creds, ok := s.pick(map[string]bool{})
+		require.True(t, ok)
+		seen[creds.id] = true
+		s.recordSuccess(creds.id)
+	}
+	assert.True(t, seen["on"], "enabled account must be selected")
+	assert.False(t, seen["off"], "disabled account must never be selected")
+
+	// accountUsable reflects the same gate.
+	assert.False(t, accountUsable(StoredAccount{ProfileArn: "arn:x", Disabled: true}))
+	assert.True(t, accountUsable(StoredAccount{ProfileArn: "arn:x"}))
+
+	// Re-enabling brings it back into rotation.
+	require.NoError(t, store.SetDisabled("off", false))
+	seen = map[string]bool{}
+	for i := 0; i < 6; i++ {
+		creds, _ := s.pick(map[string]bool{})
+		seen[creds.id] = true
+		s.recordSuccess(creds.id)
+	}
+	assert.True(t, seen["off"], "re-enabled account rejoins the pool")
+}
+
+func TestSelectorAllDisabledReturnsFalse(t *testing.T) {
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "off1", ClientID: "c", ClientSecret: "s", RefreshToken: "r", Disabled: true, CreatedAt: "0",
+	}))
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "off2", ClientID: "c", ClientSecret: "s", RefreshToken: "r", Disabled: true, CreatedAt: "1",
+	}))
+	s := newAccountSelector(store, &http.Client{})
+
+	_, ok := s.pick(map[string]bool{})
+	assert.False(t, ok, "all-disabled pool -> pick fails (maps to 503)")
+	_, ok = s.peekAny()
+	assert.False(t, ok, "all-disabled pool -> peekAny fails (no schema source)")
+}
+
 func TestSelectorConcurrentPick(t *testing.T) {
 	s := newTestSelector(t, "a", "b", "c", "d")
 	var wg sync.WaitGroup

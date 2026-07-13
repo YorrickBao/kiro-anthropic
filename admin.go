@@ -39,6 +39,7 @@ func (s *Server) AdminHandler() http.Handler {
 	r.Post("/api/login/start", s.handleLoginStart)
 	r.Post("/api/accounts/delete", s.handleAccountDelete)
 	r.Post("/api/accounts/label", s.handleAccountLabel)
+	r.Post("/api/accounts/disable", s.handleAccountDisable)
 	r.Post("/api/accounts/import", s.handleAccountImport)
 	r.Get("/api/accounts/export", s.handleAccountExport)
 	r.Post("/api/accounts/import-bundle", s.handleAccountImportBundle)
@@ -444,6 +445,33 @@ func (s *Server) handleAccountLabel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleAccountDisable toggles whether an account participates in the
+// round-robin pool. A disabled account stays stored, refreshed and visible on
+// the admin page; it is only excluded from selection.
+func (s *Server) handleAccountDisable(w http.ResponseWriter, r *http.Request) {
+	if s.accounts == nil {
+		adminError(w, http.StatusServiceUnavailable, "account store is not configured")
+		return
+	}
+	var body struct {
+		ID       string `json:"id"`
+		Disabled bool   `json:"disabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		adminError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if body.ID == "" {
+		adminError(w, http.StatusBadRequest, "id is required")
+		return
+	}
+	if err := s.accounts.SetDisabled(body.ID, body.Disabled); err != nil {
+		adminError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "disabled": body.Disabled})
 }
 
 // handleAccountDelete removes a stored account by id.

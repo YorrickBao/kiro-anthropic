@@ -112,6 +112,38 @@ func TestAdminAccountLabelUpdate(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, bad.Code)
 }
 
+func TestAdminAccountDisable(t *testing.T) {
+	s, h, _ := newAdminTestServer(t)
+	require.NoError(t, s.accounts.Add(&StoredAccount{ID: "acc1", CreatedAt: "1"}))
+
+	// Park out of the pool.
+	rr := doAdmin(h, http.MethodPost, "/api/accounts/disable", `{"id":"acc1","disabled":true}`)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var resp struct {
+		OK       bool `json:"ok"`
+		Disabled bool `json:"disabled"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	assert.True(t, resp.OK)
+	assert.True(t, resp.Disabled)
+	got, _ := s.accounts.Get("acc1")
+	assert.True(t, got.Disabled, "store reflects the disabled flag")
+
+	// Re-enable.
+	rr2 := doAdmin(h, http.MethodPost, "/api/accounts/disable", `{"id":"acc1","disabled":false}`)
+	require.Equal(t, http.StatusOK, rr2.Code)
+	got, _ = s.accounts.Get("acc1")
+	assert.False(t, got.Disabled, "toggle is reversible")
+
+	// Unknown id -> 404.
+	miss := doAdmin(h, http.MethodPost, "/api/accounts/disable", `{"id":"nope","disabled":true}`)
+	assert.Equal(t, http.StatusNotFound, miss.Code)
+
+	// Missing id -> 400.
+	bad := doAdmin(h, http.MethodPost, "/api/accounts/disable", `{"disabled":true}`)
+	assert.Equal(t, http.StatusBadRequest, bad.Code)
+}
+
 func TestAdminAccountRefresh(t *testing.T) {
 	s, h, _ := newAdminTestServer(t)
 	require.NoError(t, s.accounts.Add(&StoredAccount{

@@ -70,6 +70,14 @@
   /* account cards */
   .accounts { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
   .acct { background: #12151c; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .switch { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; font-size: 12.5px; }
+  .switch input { appearance: none; -webkit-appearance: none; width: 34px; height: 18px; border-radius: 999px;
+    background: #2a2f3a; border: 1px solid var(--line); position: relative; margin: 0; transition: background .15s; cursor: pointer; }
+  .switch input::after { content: ""; position: absolute; top: 1px; left: 1px; width: 14px; height: 14px; border-radius: 50%;
+    background: var(--fg); transition: transform .15s; }
+  .switch input:checked { background: var(--accent); }
+  .switch input:checked::after { transform: translateX(16px); }
+  .switch input:disabled { opacity: .5; cursor: default; }
   .acct .top { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
   .acct .email { font-weight: 600; word-break: break-all; }
   .acct .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
@@ -334,6 +342,11 @@ function renderAccounts(accounts) {
     </dl>
     ${usageHtml(a.usage)}
     <div class="actions">
+      <label class="switch" title="是否参与号池负载均衡">
+        <input type="checkbox" data-toggle="${esc(a.id)}" ${a.disabled ? "" : "checked"} />
+        <span>${a.disabled ? "停用" : "启用"}</span>
+      </label>
+      <span style="flex:1"></span>
       <button class="ghost" data-models type="button">模型</button>
       <button class="ghost" data-refresh="${esc(a.id)}" type="button">刷新令牌</button>
       <button class="danger" data-del="${esc(a.id)}" type="button">删除</button>
@@ -343,6 +356,7 @@ function renderAccounts(accounts) {
   el.querySelectorAll("button[data-edit]").forEach(b => b.addEventListener("click", () => editLabel(b.dataset.edit, b.dataset.label)));
   el.querySelectorAll("button[data-models]").forEach(b => b.addEventListener("click", openModels));
   el.querySelectorAll("button[data-refresh]").forEach(b => b.addEventListener("click", () => refreshAccount(b.dataset.refresh, b)));
+  el.querySelectorAll("input[data-toggle]").forEach(b => b.addEventListener("change", () => toggleAccount(b.dataset.toggle, b.checked, b)));
 }
 
 function openModels() {
@@ -461,6 +475,26 @@ async function refreshAccount(id, btn) {
     alert("刷新失败: " + e.message);
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = orig; }
+  }
+}
+
+async function toggleAccount(id, enable, cb) {
+  if (!id) return;
+  // `enable` is the checkbox's new (checked) state. The backend takes the
+  // inverse: disabled = !enable.
+  if (cb) cb.disabled = true;
+  try {
+    const res = await fetch("/api/accounts/disable", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, disabled: !enable })
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error((d.error && d.error.message) || ("HTTP " + res.status));
+    await tick();
+  } catch (e) {
+    alert("切换失败: " + e.message);
+  } finally {
+    if (cb) cb.disabled = false;
   }
 }
 

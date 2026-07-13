@@ -178,11 +178,17 @@ func (s *accountSelector) credsFor(a StoredAccount) *accountCreds {
 }
 
 // accountUsable reports whether an account can serve a request at all: it must
-// either already carry a profileArn, or hold a full client registration plus
-// refresh token so accessToken()/profileArn() can refresh and resolve one. An
-// account with neither (e.g. an import whose profileArn lookup failed and that
-// lacks credentials to recover) is dead weight and is skipped during selection.
+// not be administratively parked (Disabled), and it must either already carry a
+// profileArn, or hold a full client registration plus refresh token so
+// accessToken()/profileArn() can refresh and resolve one. An account with
+// neither (e.g. an import whose profileArn lookup failed and that lacks
+// credentials to recover) is dead weight and is skipped during selection.
+// Disabled accounts are still stored, refreshed and shown on the admin page;
+// this gate only excludes them from selection.
 func accountUsable(a StoredAccount) bool {
+	if a.Disabled {
+		return false
+	}
 	if a.ProfileArn != "" {
 		return true
 	}

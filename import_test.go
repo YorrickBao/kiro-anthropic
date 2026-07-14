@@ -303,20 +303,20 @@ func TestFindDuplicateProfileArnSameButEmailDifferent(t *testing.T) {
 
 	// Bob: same profileArn (same org/profile), different email, different clientId.
 	_, ok := s.FindDuplicate(StoredAccount{
-		ClientID:    "cid-b",
+		ClientID:     "cid-b",
 		RefreshToken: "r-b",
-		ProfileArn:  "arn:aws:codewhisperer:us-east-1:111:profile/SHARED",
-		Email:       "bob@example.com",
+		ProfileArn:   "arn:aws:codewhisperer:us-east-1:111:profile/SHARED",
+		Email:        "bob@example.com",
 	})
 	assert.False(t, ok,
 		"same profileArn but different email = different user, must NOT dedup")
 
 	// Alice re-signs-in: same profileArn AND same email → duplicate.
 	id, ok := s.FindDuplicate(StoredAccount{
-		ClientID:    "cid-a-new",
+		ClientID:     "cid-a-new",
 		RefreshToken: "r-a-new",
-		ProfileArn:  "arn:aws:codewhisperer:us-east-1:111:profile/SHARED",
-		Email:       "alice@example.com",
+		ProfileArn:   "arn:aws:codewhisperer:us-east-1:111:profile/SHARED",
+		Email:        "alice@example.com",
 	})
 	assert.True(t, ok, "same profileArn AND same email = same user, must dedup")
 	assert.Equal(t, "alice", id)

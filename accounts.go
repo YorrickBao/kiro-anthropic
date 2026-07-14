@@ -373,13 +373,22 @@ func (s *AccountStore) Remove(id string) error {
 // import) is recognised as one: a login and an import of the same account get
 // distinct clientId/refreshToken pairs, but share profileArn and email.
 //
-// Precedence: profileArn (most reliable for enterprise) > email > clientId
-// (used only when no identity fields are available). The clientId fallback
-// matches on the OIDC client registration alone, not refreshToken: a single
-// machine re-imports the same account across restarts, but the refreshToken
-// rotates on every refresh, so matching refreshToken would miss the duplicate.
-// Different machines register distinct clients and fall through to no match,
-// which is correct — cross-machine dedup relies on profileArn/email.
+// Matching rules, in priority order:
+//
+//  1. profileArn: both have the same non-empty profileArn.
+//  2. email: both have the same non-empty email.
+//  3. clientId backfill: the candidate carries identity (profileArn or email)
+//     that the stored account is missing, but they share the same clientId.
+//     This lets a sign-in that resolved identity backfill an earlier import
+//     that could not, replacing it in place instead of creating a duplicate.
+//  4. clientId only: neither side has identity, but they share the same
+//     clientId — a same-machine re-import whose profileArn/email lookup failed
+//     both times.
+//
+// clientId is never used to match a candidate that has NO identity against a
+// stored account that DOES: two different AWS accounts signed in via the same
+// IdC start URL can share an OIDC client registration, so a bare clientId match
+// would wrongly merge distinct users.
 func (s *AccountStore) FindDuplicate(candidate StoredAccount) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -388,14 +397,21 @@ func (s *AccountStore) FindDuplicate(candidate StoredAccount) (string, bool) {
 
 // findDuplicateLocked is FindDuplicate's body; caller holds s.mu.
 func (s *AccountStore) findDuplicateLocked(candidate StoredAccount) (string, bool) {
+	candHasIdentity := candidate.ProfileArn != "" || candidate.Email != ""
 	for _, a := range s.accounts {
 		switch {
 		case candidate.ProfileArn != "" && a.ProfileArn == candidate.ProfileArn:
 			return a.ID, true
 		case candidate.Email != "" && a.Email == candidate.Email:
 			return a.ID, true
-		case candidate.ProfileArn == "" && candidate.Email == "" &&
+		case candHasIdentity && a.ProfileArn == "" && a.Email == "" &&
 			candidate.ClientID != "" && a.ClientID == candidate.ClientID:
+			// Backfill: the stored account's identity was never resolved, but the
+			// candidate now carries it and shares the same OIDC client registration.
+			return a.ID, true
+		case !candHasIdentity && a.ProfileArn == "" && a.Email == "" &&
+			candidate.ClientID != "" && a.ClientID == candidate.ClientID:
+			// Neither side has identity; same machine re-import.
 			return a.ID, true
 		}
 	}

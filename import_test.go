@@ -87,6 +87,42 @@ func TestImportLocalCredentialsMissingFile(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// TestImportLocalCredentialsRejectsNoIdentity reproduces the duplicate-account
+// bug: when the token file has no profileArn and the management endpoint is
+// unreachable (returning non-2xx), both profileArn and email resolve to empty.
+// The import must be rejected rather than creating a blank "imported" entry
+// that dedup can never recognise on the next import.
+func TestImportLocalCredentialsRejectsNoIdentity(t *testing.T) {
+	// Management endpoint returns 403 for every call.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+	target, _ := url.Parse(srv.URL)
+	client := &http.Client{Transport: &rewriteTransport{host: target.Host, scheme: target.Scheme}}
+
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "kiro-auth-token.json")
+	writeJSONFile(t, tokenFile, map[string]any{
+		"accessToken":  "acc",
+		"refreshToken": "ref",
+		"clientIdHash": "hash123",
+		"authMethod":   "IdC",
+		"provider":     "Enterprise",
+		"region":       "us-east-1",
+		// No profileArn — forces resolveProfileArn + fetchAccountEmail network calls.
+		"expiresAt":    "2030-01-01T00:00:00.000Z",
+	})
+	writeJSONFile(t, filepath.Join(dir, "hash123.json"), map[string]any{
+		"clientId":     "cid",
+		"clientSecret": "csecret",
+	})
+
+	_, err := importLocalCredentials(context.Background(), client, tokenFile)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "could not resolve profileArn or email")
+}
+
 func TestFetchAccountEmail(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/getUsageLimits", func(w http.ResponseWriter, r *http.Request) {
@@ -139,15 +175,17 @@ func TestFindDuplicate(t *testing.T) {
 	_, ok = s.FindDuplicate(StoredAccount{ProfileArn: "arn:2", Email: "other@x.com"})
 	assert.False(t, ok)
 
-	// No identity fields on the candidate: fall back to clientId alone. The
-	// refreshToken rotates across re-imports, so it must NOT be part of the key.
-	id, ok = s.FindDuplicate(StoredAccount{ClientID: "cid", RefreshToken: "ref"})
-	assert.True(t, ok)
-	assert.Equal(t, "a", id)
-	id, ok = s.FindDuplicate(StoredAccount{ClientID: "cid", RefreshToken: "rotated-different"})
-	assert.True(t, ok, "same clientId, rotated refreshToken -> still a duplicate")
-	assert.Equal(t, "a", id)
-	// Different clientId (e.g. another machine) -> no match via this fallback.
+	// Candidate has NO identity but the stored account HAS identity. clientId
+	// alone must NOT match here: two different AWS accounts signed in via the
+	// same IdC start URL can share an OIDC client registration, so a bare
+	// clientId match would wrongly merge distinct users. The refreshToken
+	// rotates across re-imports, so it must NOT be part of the key either.
+	_, ok = s.FindDuplicate(StoredAccount{ClientID: "cid", RefreshToken: "ref"})
+	assert.False(t, ok,
+		"candidate without identity must not match a stored account that HAS identity")
+	_, ok = s.FindDuplicate(StoredAccount{ClientID: "cid", RefreshToken: "rotated-different"})
+	assert.False(t, ok, "same clientId, rotated refreshToken -> still no match without identity")
+	// Different clientId -> also no match.
 	_, ok = s.FindDuplicate(StoredAccount{ClientID: "other-cid", RefreshToken: "ref"})
 	assert.False(t, ok)
 }
@@ -166,6 +204,81 @@ func TestFindDuplicateByClientIDWhenProfileArnEmpty(t *testing.T) {
 	id, ok := s.FindDuplicate(StoredAccount{ClientID: "C1", ClientSecret: "s", RefreshToken: "NEW"})
 	assert.True(t, ok, "same machine re-import must dedup despite rotated refreshToken")
 	assert.Equal(t, "first", id)
+}
+
+// TestFindDuplicateClientIDDoesNotOverrideIdentity reproduces the cross-account
+// overwrite bug: two different AWS accounts signed in via the same IdC start URL
+// can share the same OIDC clientId (AWS reuses the client registration for the
+// same start URL). When the second account's profileArn/email lookup fails,
+// path 3 (clientId fallback) must NOT match it against the first account — they
+// are different accounts with different emails.
+func TestFindDuplicateClientIDDoesNotOverrideIdentity(t *testing.T) {
+	s, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	// First account: fully resolved identity.
+	require.NoError(t, s.Add(&StoredAccount{
+		ID: "acct-a", ClientID: "shared-cid", RefreshToken: "r1",
+		ProfileArn: "arn:account-a", Email: "alice@example.com", CreatedAt: "1",
+	}))
+
+	// Second account (different email, different profileArn) but same clientId
+	// because the IdC start URL is the same. profileArn/email failed to resolve
+	// (empty) on this candidate — path 3 would wrongly match acct-a.
+	_, ok := s.FindDuplicate(StoredAccount{
+		ClientID: "shared-cid", RefreshToken: "r2",
+		// ProfileArn and Email both empty.
+	})
+	assert.False(t, ok,
+		"different account with empty identity must not match by clientId alone "+
+			"when the stored account HAS identity — it is a different person")
+}
+
+// TestFindDuplicateBackfillsExistingEmptyIdentity covers the scenario where an
+// account was first stored with empty identity (profileArn/email lookup failed
+// during import), and later the same account signs in via OAuth with a
+// resolved profileArn. The candidate's clientId matches the stored account, and
+// the candidate now carries the profileArn the stored one is missing. Dedup
+// should match so the identity gets backfilled via ReplaceCredentials, rather
+// than creating a duplicate.
+func TestFindDuplicateBackfillsExistingEmptyIdentity(t *testing.T) {
+	s, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	// Stored account: identity empty, only clientId is set (imported with
+	// network failure).
+	require.NoError(t, s.Add(&StoredAccount{
+		ID: "blank", ClientID: "C1", ClientSecret: "s", RefreshToken: "old",
+		CreatedAt: "1",
+	}))
+
+	// Same account now arrives with profileArn resolved (via OAuth sign-in).
+	id, ok := s.FindDuplicate(StoredAccount{
+		ClientID: "C1", RefreshToken: "new",
+		ProfileArn: "arn:now-resolved", Email: "user@example.com",
+	})
+	assert.True(t, ok, "candidate with identity + matching clientId should dedup "+
+		"against a stored account whose identity is still empty")
+	assert.Equal(t, "blank", id)
+}
+
+// TestFindDuplicateEmailBackfillsExistingEmptyIdentity is the email-only variant
+// of the backfill scenario: stored account has empty identity, candidate arrives
+// with only email (profileArn still empty) and matching clientId.
+func TestFindDuplicateEmailBackfillsExistingEmptyIdentity(t *testing.T) {
+	s, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, s.Add(&StoredAccount{
+		ID: "blank", ClientID: "C1", ClientSecret: "s", RefreshToken: "old",
+		CreatedAt: "1",
+	}))
+
+	id, ok := s.FindDuplicate(StoredAccount{
+		ClientID: "C1", RefreshToken: "new",
+		Email: "user@example.com",
+		// ProfileArn still empty.
+	})
+	assert.True(t, ok, "candidate with email + matching clientId should dedup "+
+		"against a stored account whose identity is still empty")
+	assert.Equal(t, "blank", id)
 }
 
 func TestReplaceCredentials(t *testing.T) {

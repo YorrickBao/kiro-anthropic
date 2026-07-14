@@ -336,6 +336,17 @@ func importLocalCredentials(ctx context.Context, client *http.Client, tokenFile 
 	if tok.AccessToken != "" {
 		acct.Email = fetchAccountEmail(ctx, client, region, acct.ProfileArn, tok.AccessToken)
 	}
+	// Reject an account with no resolvable identity. Without profileArn or email,
+	// dedup cannot recognise it on the next import (all three dedup paths miss),
+	// so it would accumulate as a duplicate "imported" entry with blank fields.
+	// Surface the failure so the caller can tell the user rather than silently
+	// polluting the pool.
+	if acct.ProfileArn == "" && acct.Email == "" {
+		return nil, fmt.Errorf(
+			"could not resolve profileArn or email for the local Kiro account; " +
+				"the access token may be expired or the management endpoint unreachable. " +
+				"Re-login in the Kiro desktop app, then restart")
+	}
 	return acct, nil
 }
 

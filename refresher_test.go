@@ -49,7 +49,8 @@ func TestAccountStoreUpdateTokens(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, s.Add(&StoredAccount{
 		ID: "id", ClientID: "c", ClientSecret: "sec", RefreshToken: "old-refresh",
-		AccessToken: "old-access", CreatedAt: "1",
+		AccessToken: "old-access", ProfileArn: "arn:x", Email: "u@x.com",
+		UserID: "d-dir.uid", CreatedAt: "1",
 	}))
 
 	require.NoError(t, s.UpdateTokens("id", "new-access", "new-refresh", "2030-01-01T00:00:00.000Z"))
@@ -59,6 +60,11 @@ func TestAccountStoreUpdateTokens(t *testing.T) {
 	assert.Equal(t, "2030-01-01T00:00:00.000Z", got.ExpiresAt)
 	// Registration fields untouched.
 	assert.Equal(t, "sec", got.ClientSecret)
+	// Identity fields must survive a token refresh: userId in particular is the
+	// stable dedup key and is never re-fetched by the refresh path.
+	assert.Equal(t, "arn:x", got.ProfileArn)
+	assert.Equal(t, "u@x.com", got.Email)
+	assert.Equal(t, "d-dir.uid", got.UserID)
 
 	// Empty refresh token preserves the existing one.
 	require.NoError(t, s.UpdateTokens("id", "a2", "", "2031-01-01T00:00:00.000Z"))

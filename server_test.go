@@ -98,6 +98,8 @@ func TestModelInfoJSON(t *testing.T) {
 	assert.Equal(t, "claude-opus-4.8", info["id"])
 	assert.Equal(t, 1000000, info["max_input_tokens"])
 	assert.Equal(t, 128000, info["max_tokens"])
+	assert.Equal(t, 1.5, info["rate_multiplier"])
+	assert.Equal(t, "credit", info["rate_unit"])
 
 	caps := info["capabilities"].(map[string]any)["effort"].(map[string]any)
 	assert.Equal(t, true, caps["supported"])
@@ -105,8 +107,15 @@ func TestModelInfoJSON(t *testing.T) {
 	assert.Equal(t, true, caps["xhigh"])
 
 	// sonnet-4.5: no effort support.
-	caps = modelInfoJSON(testSonnet45Model(), "x")["capabilities"].(map[string]any)["effort"].(map[string]any)
+	sonnetInfo := modelInfoJSON(testSonnet45Model(), "x")
+	caps = sonnetInfo["capabilities"].(map[string]any)["effort"].(map[string]any)
 	assert.Equal(t, false, caps["supported"])
+
+	// sonnet-4.5: no rate multiplier → keys omitted.
+	_, hasRate := sonnetInfo["rate_multiplier"]
+	assert.False(t, hasRate)
+	_, hasUnit := sonnetInfo["rate_unit"]
+	assert.False(t, hasUnit)
 }
 
 func TestMapUpstreamError(t *testing.T) {

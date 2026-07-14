@@ -446,6 +446,11 @@ type kiroModelInfo struct {
 		MaxInputTokens  int `json:"maxInputTokens"`
 		MaxOutputTokens int `json:"maxOutputTokens"`
 	} `json:"tokenLimits"`
+	// Per-model credit consumption multiplier returned by the control plane
+	// (e.g. 1.3 means each request costs 1.3x the base credit). Display-only;
+	// the real per-request cost comes from the stream's metering event.
+	RateMultiplier float64 `json:"rateMultiplier,omitempty"`
+	RateUnit       string  `json:"rateUnit,omitempty"`
 }
 
 // maxTokensRange reports the [min, max] the model accepts for the additional

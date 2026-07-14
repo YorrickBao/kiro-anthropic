@@ -274,6 +274,12 @@ func modelInfoJSON(m kiroModelInfo, now string) map[string]any {
 	if m.TokenLimits.MaxOutputTokens > 0 {
 		info["max_tokens"] = m.TokenLimits.MaxOutputTokens
 	}
+	if m.RateMultiplier > 0 {
+		info["rate_multiplier"] = m.RateMultiplier
+		if m.RateUnit != "" {
+			info["rate_unit"] = m.RateUnit
+		}
+	}
 
 	effortCap := map[string]any{"supported": false}
 	for _, lvl := range allEffortLevels {

@@ -20,6 +20,8 @@ func testOpusModel() kiroModelInfo {
 		AdditionalModelRequestFieldsSchema: json.RawMessage(testOpusSchema)}
 	m.TokenLimits.MaxInputTokens = 1000000
 	m.TokenLimits.MaxOutputTokens = 128000
+	m.RateMultiplier = 1.5
+	m.RateUnit = "credit"
 	return m
 }
 

@@ -368,15 +368,18 @@ function openModels() {
       const eff = m.capabilities && m.capabilities.effort;
       let effTxt = "—";
       if (eff && eff.supported) effTxt = ["low","medium","high","xhigh","max"].filter(l => eff[l]).join(" / ") || "yes";
+      let rateTxt = "—";
+      if (m.rate_multiplier) rateTxt = `<span class="pill">${m.rate_multiplier}x ${esc(m.rate_unit || "credit")}</span>`;
       return `<tr>
         <td style="white-space:nowrap"><code>${esc(m.id)}</code><button class="copy" data-copy="${esc(m.id)}" type="button" title="复制">⧉</button></td>
         <td>${esc(m.display_name || "")}</td>
         <td class="num">${m.max_input_tokens ? fmtNum(m.max_input_tokens) : "—"}</td>
         <td class="num">${m.max_tokens ? fmtNum(m.max_tokens) : "—"}</td>
+        <td class="num">${rateTxt}</td>
         <td>${esc(effTxt)}</td>
       </tr>`;
     }).join("");
-    body.innerHTML = `<table><thead><tr><th>模型 ID</th><th>名称</th><th class="num">最大输入</th><th class="num">最大输出</th><th>Effort</th></tr></thead><tbody>${rows}</tbody></table>`;
+    body.innerHTML = `<table><thead><tr><th>模型 ID</th><th>名称</th><th class="num">最大输入</th><th class="num">最大输出</th><th class="num">倍率</th><th>Effort</th></tr></thead><tbody>${rows}</tbody></table>`;
     body.querySelectorAll("button.copy").forEach(b => b.addEventListener("click", () => copyText(b.dataset.copy, b)));
   }
   $("models-modal").classList.add("open");

@@ -379,6 +379,7 @@ function openModels() {
     body.innerHTML = '<span class="muted">无模型信息。</span>';
   } else {
     const hasDetail = latestModels.some(m => m.description || (m.supported_input_types && m.supported_input_types.length) || (m.prompt_caching && m.prompt_caching.supported));
+    const hasStatus = latestModels.some(m => m.status);
     const rows = latestModels.map((m, i) => {
       const eff = m.capabilities && m.capabilities.effort;
       let effTxt = "—";
@@ -407,12 +408,12 @@ function openModels() {
         <td class="num">${ctxTxt}</td>
         <td class="ctr">${rateTxt}</td>
         <td>${esc(effTxt)}</td>
-        <td class="ctr">${statusTxt}</td>
+        ${hasStatus ? `<td class="ctr">${statusTxt}</td>` : ""}
       </tr>`;
-      const detailRow = expandable ? `<tr class="detail" id="detail-${i}" style="display:none"><td colspan="6"><dl class="kv">${detailCells.join("")}</dl></td></tr>` : "";
+      const detailRow = expandable ? `<tr class="detail" id="detail-${i}" style="display:none"><td colspan="${hasStatus ? 6 : 5}"><dl class="kv">${detailCells.join("")}</dl></td></tr>` : "";
       return mainRow + detailRow;
     }).join("");
-    const statusHdr = '<th class="ctr">状态</th>';
+    const statusHdr = hasStatus ? '<th class="ctr">状态</th>' : "";
     body.innerHTML = `<table><thead><tr><th>模型 ID</th><th>名称</th><th class="num">上下文窗口 <span class="th-hint">输入 / 输出</span></th><th class="ctr">倍率</th><th>Effort</th>${statusHdr}</tr></thead><tbody>${rows}</tbody></table>`;
     body.querySelectorAll("button.copy").forEach(b => b.addEventListener("click", () => copyText(b.dataset.copy, b)));
     body.querySelectorAll("[data-idx]").forEach(r => r.addEventListener("click", () => {

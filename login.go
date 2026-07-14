@@ -292,13 +292,23 @@ func (m *loginManager) completeLogin(ctx context.Context, state, code string) (*
 		acct.ProfileArn = arn
 	}
 	acct.Email = fetchAccountEmail(ctx, m.client, p.region, acct.ProfileArn, tok.AccessToken)
+	// Reject an account with no resolvable identity. Without profileArn or email,
+	// dedup cannot recognise it on a later re-import, so it would accumulate as a
+	// duplicate. Surface the failure so the caller can tell the user.
+	if acct.ProfileArn == "" && acct.Email == "" {
+		return nil, fmt.Errorf(
+			"could not resolve profileArn or email after sign-in; " +
+				"the management endpoint may be unreachable. Check network/proxy and retry")
+	}
 	return acct, nil
 }
 
 // importLocalCredentials builds a StoredAccount from an existing Kiro auth
-// cache: the token file plus its client registration companion. It resolves the
-// profileArn best-effort. The returned
-// account has a fresh id; the caller is responsible for dedup and persistence.
+// cache: the token file plus its client registration companion. If the cached
+// access token is expired (the common case — the Kiro desktop app's token is
+// usually stale by the time we import), it is refreshed first so profileArn and
+// email can be resolved. The returned account has a fresh id; the caller is
+// responsible for dedup and persistence.
 func importLocalCredentials(ctx context.Context, client *http.Client, tokenFile string) (*StoredAccount, error) {
 	tok, _, err := loadToken(tokenFile)
 	if err != nil {
@@ -328,13 +338,40 @@ func importLocalCredentials(ctx context.Context, client *http.Client, tokenFile 
 		ProfileArn:   tok.ProfileArn,
 		CreatedAt:    time.Now().UTC().Format(time.RFC3339),
 	}
-	if acct.ProfileArn == "" && tok.AccessToken != "" {
-		if arn, err := resolveProfileArn(ctx, client, region, tok.AccessToken); err == nil {
+
+	// The Kiro desktop app's cached access token is usually expired by the time
+	// we import. Refresh it first so the management endpoint (ListAvailableProfiles,
+	// getUsageLimits) accepts the call and we can resolve profileArn/email. This
+	// is only needed when profileArn is not already in the token file — if it is,
+	// there is no network call to make.
+	accessToken := tok.AccessToken
+	if acct.ProfileArn == "" && clientID != "" && clientSecret != "" && tokenNeedsRefresh(tok) {
+		fresh, refresh, expiresAt, err := refreshAccountToken(ctx, client, StoredAccount{
+			Region:       region,
+			ClientID:     clientID,
+			ClientSecret: clientSecret,
+			RefreshToken: tok.RefreshToken,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("refresh expired token during import: %w", err)
+		}
+		accessToken = fresh
+		acct.AccessToken = fresh
+		if refresh != "" {
+			acct.RefreshToken = refresh
+		}
+		if expiresAt != "" {
+			acct.ExpiresAt = expiresAt
+		}
+	}
+
+	if acct.ProfileArn == "" && accessToken != "" {
+		if arn, err := resolveProfileArn(ctx, client, region, accessToken); err == nil {
 			acct.ProfileArn = arn
 		}
 	}
-	if tok.AccessToken != "" {
-		acct.Email = fetchAccountEmail(ctx, client, region, acct.ProfileArn, tok.AccessToken)
+	if accessToken != "" {
+		acct.Email = fetchAccountEmail(ctx, client, region, acct.ProfileArn, accessToken)
 	}
 	// Reject an account with no resolvable identity. Without profileArn or email,
 	// dedup cannot recognise it on the next import (all three dedup paths miss),
@@ -348,6 +385,20 @@ func importLocalCredentials(ctx context.Context, client *http.Client, tokenFile 
 				"Re-login in the Kiro desktop app, then restart")
 	}
 	return acct, nil
+}
+
+// tokenNeedsRefresh reports whether the on-disk Kiro token's access token is
+// expired or about to expire, and thus needs a refresh before it can be used to
+// call the management endpoint.
+func tokenNeedsRefresh(t Token) bool {
+	if t.AccessToken == "" {
+		return true
+	}
+	exp := t.expiry()
+	if exp.IsZero() {
+		return true
+	}
+	return time.Now().Add(tokenRefreshBuffer).After(exp)
 }
 
 // importLocalIntoStore imports the local Kiro credentials into the account

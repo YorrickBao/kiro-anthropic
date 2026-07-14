@@ -8,7 +8,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -121,6 +123,73 @@ func TestImportLocalCredentialsRejectsNoIdentity(t *testing.T) {
 	_, err := importLocalCredentials(context.Background(), client, tokenFile)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "could not resolve profileArn or email")
+}
+
+// TestImportLocalCredentialsRefreshesExpiredToken verifies that when the cached
+// access token is expired, importLocalCredentials refreshes it via SSO-OIDC
+// before resolving profileArn/email. The management endpoint should see the
+// refreshed access token, not the stale one from the cache.
+func TestImportLocalCredentialsRefreshesExpiredToken(t *testing.T) {
+	var tokenHits int32
+	mux := http.NewServeMux()
+	// SSO-OIDC CreateToken endpoint.
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&tokenHits, 1)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"accessToken":  "refreshed-access",
+			"refreshToken": "refreshed-refresh",
+			"tokenType":    "Bearer",
+			"expiresIn":    3600,
+		})
+	})
+	// management endpoint — ListAvailableProfiles (POST /).
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		// Verify the refreshed token is used, not the stale one.
+		assert.Equal(t, "Bearer refreshed-access", r.Header.Get("Authorization"))
+		writeJSON(w, http.StatusOK, map[string]any{
+			"profiles": []map[string]any{{"arn": "arn:aws:codewhisperer:us-east-1:1:profile/imported"}},
+		})
+	})
+	// management endpoint — getUsageLimits.
+	mux.HandleFunc("/getUsageLimits", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "Bearer refreshed-access", r.Header.Get("Authorization"))
+		writeJSON(w, http.StatusOK, map[string]any{
+			"userInfo": map[string]any{"email": "imported@example.com"},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	target, _ := url.Parse(srv.URL)
+	client := &http.Client{Transport: &rewriteTransport{host: target.Host, scheme: target.Scheme}}
+
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "kiro-auth-token.json")
+	writeJSONFile(t, tokenFile, map[string]any{
+		"accessToken":  "stale-access",
+		"refreshToken": "orig-refresh",
+		"clientIdHash": "hash123",
+		"authMethod":   "IdC",
+		"provider":     "Enterprise",
+		"region":       "us-east-1",
+		// No profileArn; access token expired.
+		"expiresAt": time.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
+	})
+	writeJSONFile(t, filepath.Join(dir, "hash123.json"), map[string]any{
+		"clientId":     "cid",
+		"clientSecret": "csecret",
+	})
+
+	acct, err := importLocalCredentials(context.Background(), client, tokenFile)
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&tokenHits), "expired token must trigger exactly one refresh")
+	assert.Equal(t, "refreshed-access", acct.AccessToken)
+	assert.Equal(t, "refreshed-refresh", acct.RefreshToken)
+	assert.Equal(t, "arn:aws:codewhisperer:us-east-1:1:profile/imported", acct.ProfileArn)
+	assert.Equal(t, "imported@example.com", acct.Email)
 }
 
 func TestFetchAccountEmail(t *testing.T) {

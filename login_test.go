@@ -47,6 +47,23 @@ func newFakeOIDC(t *testing.T) *fakeOIDC {
 			"expiresIn":    3600,
 		})
 	})
+	// management.<region>.kiro.dev routes — used by resolveProfileArn (POST /)
+	// and fetchAccountEmail (GET /getUsageLimits). rewriteTransport redirects
+	// these to the same fake server.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"profiles": []map[string]any{{"arn": "arn:aws:codewhisperer:us-east-1:1:profile/test"}},
+		})
+	})
+	mux.HandleFunc("/getUsageLimits", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"userInfo": map[string]any{"email": "test@example.com"},
+		})
+	})
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
 	return f
@@ -164,6 +181,53 @@ func TestCompleteLoginMissingCode(t *testing.T) {
 	require.NoError(t, err)
 	_, err = m.completeLogin(context.Background(), state, "")
 	assert.Error(t, err)
+}
+
+// TestCompleteLoginRejectsNoIdentity verifies that when the management endpoint
+// is unreachable (returns non-2xx), both profileArn and email resolve to empty,
+// and completeLogin rejects the account instead of returning a blank entry that
+// dedup can never recognise.
+func TestCompleteLoginRejectsNoIdentity(t *testing.T) {
+	fake := newFakeOIDC(t)
+	m := newTestLoginManager(t, fake.srv.URL)
+	_, state, err := m.startLogin(context.Background(),
+		"https://org.awsapps.com/start", "us-east-1", "", "http://localhost/cb")
+	require.NoError(t, err)
+
+	// Override the management routes to return 403, simulating an unreachable
+	// or unauthorized management endpoint.
+	fake.srv.Close()
+	failingMux := http.NewServeMux()
+	failingMux.HandleFunc("/client/register", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"clientId":              "test-client-id",
+			"clientSecret":          "test-client-secret",
+			"clientSecretExpiresAt": 1234567890,
+		})
+	})
+	failingMux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"accessToken":  "test-access",
+			"refreshToken": "test-refresh",
+			"expiresIn":    3600,
+		})
+	})
+	failingMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	})
+	failingMux.HandleFunc("/getUsageLimits", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	})
+	fake.srv = httptest.NewServer(failingMux)
+	// Rebuild the login manager with the new fake server URL.
+	m = newTestLoginManager(t, fake.srv.URL)
+	_, state, err = m.startLogin(context.Background(),
+		"https://org.awsapps.com/start", "us-east-1", "", "http://localhost/cb")
+	require.NoError(t, err)
+
+	_, err = m.completeLogin(context.Background(), state, "auth-code-123")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "could not resolve profileArn or email")
 }
 
 func TestLoginGCDropsExpired(t *testing.T) {

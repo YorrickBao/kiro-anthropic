@@ -77,7 +77,23 @@ func runUpgrade(ctx context.Context, opts *upgradeOptions) error {
 
 	rel, err := fetchRelease(ctx, client, opts.version)
 	if err != nil {
-		return fmt.Errorf("lookup release: %w", err)
+		// The REST API failed — most often an anonymous rate-limit 403 from
+		// api.github.com (60 req/hour/IP). When the user asked for "latest"
+		// (the default), the github.com redirect probe can still answer the
+		// common questions — "am I up to date?" and "is an update available?"
+		// — without consuming the API quota. A pinned --version can't be
+		// resolved this way (the redirect only resolves "latest"), so it
+		// falls through to the original error.
+		if opts.version == "" {
+			if tag, rerr := latestTagViaRedirect(ctx, client); rerr == nil {
+				fmt.Fprintf(os.Stderr, "warning: github api unavailable (%v); used redirect probe to resolve latest tag\n", err)
+				rel = githubRelease{TagName: tag}
+				err = nil
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("lookup release: %w", err)
+		}
 	}
 
 	current := canonicalSemver(version)
@@ -102,6 +118,13 @@ func runUpgrade(ctx context.Context, opts *upgradeOptions) error {
 
 	asset, err := pickAsset(rel.Assets, runtime.GOOS, runtime.GOARCH, rel.TagName)
 	if err != nil {
+		// We fell back to the redirect probe (no asset list) or the release
+		// genuinely lacks a matching asset. In the fallback case the install
+		// can't proceed without the REST API; tell the user how to get past
+		// the rate limit instead of showing a confusing "no asset" error.
+		if len(rel.Assets) == 0 {
+			return fmt.Errorf("%w\n(the GitHub API was rate-limited and only the tag could be resolved; set GH_TOKEN/GITHUB_TOKEN or retry later)", err)
+		}
 		return err
 	}
 
@@ -195,6 +218,17 @@ func (r githubRelease) checksumURL() string {
 	return ""
 }
 
+// githubToken returns a GitHub access token from the environment, or "" when
+// none is set (leaving requests anonymous). GH_TOKEN is preferred to match the
+// gh CLI convention; GITHUB_TOKEN is honored as a fallback so GitHub Actions'
+// auto-injected token also works.
+func githubToken() string {
+	if tok := os.Getenv("GH_TOKEN"); tok != "" {
+		return tok
+	}
+	return os.Getenv("GITHUB_TOKEN")
+}
+
 // fetchRelease fetches the latest release (or the one named by tag if non-empty).
 func fetchRelease(ctx context.Context, client *http.Client, tag string) (githubRelease, error) {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", githubRepo)
@@ -210,7 +244,7 @@ func fetchRelease(ctx context.Context, client *http.Client, tag string) (githubR
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "kiro-anthropic/"+version)
-	if tok := os.Getenv("GITHUB_TOKEN"); tok != "" {
+	if tok := githubToken(); tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 
@@ -245,7 +279,7 @@ func listReleases(ctx context.Context, client *http.Client) ([]githubRelease, er
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "kiro-anthropic/"+version)
-	if tok := os.Getenv("GITHUB_TOKEN"); tok != "" {
+	if tok := githubToken(); tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 

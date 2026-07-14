@@ -1,11 +1,40 @@
 package main
 
 import (
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestGithubToken(t *testing.T) {
+	// Snapshot and restore both env vars; the helper reads the live environment.
+	keyGH, keyGITHUB := "GH_TOKEN", "GITHUB_TOKEN"
+	prevGH, hadGH := os.LookupEnv(keyGH)
+	prevGITHUB, hadGITHUB := os.LookupEnv(keyGITHUB)
+	t.Cleanup(func() {
+		os.Unsetenv(keyGH)
+		os.Unsetenv(keyGITHUB)
+		if hadGH {
+			os.Setenv(keyGH, prevGH)
+		}
+		if hadGITHUB {
+			os.Setenv(keyGITHUB, prevGITHUB)
+		}
+	})
+
+	os.Unsetenv(keyGH)
+	os.Unsetenv(keyGITHUB)
+	assert.Equal(t, "", githubToken(), "no token set")
+
+	os.Setenv(keyGITHUB, "ghp_github")
+	os.Unsetenv(keyGH)
+	assert.Equal(t, "ghp_github", githubToken(), "GITHUB_TOKEN fallback")
+
+	os.Setenv(keyGH, "ghp_gh")
+	assert.Equal(t, "ghp_gh", githubToken(), "GH_TOKEN takes precedence over GITHUB_TOKEN")
+}
 
 func TestAssetNameFor(t *testing.T) {
 	cases := []struct {

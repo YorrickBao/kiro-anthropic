@@ -279,7 +279,8 @@ func (s *Server) handleLoginCallback(w http.ResponseWriter, r *http.Request) {
 
 // handleAccountImport imports the credentials from the local Kiro auth cache
 // (the --token-file and its client registration) into the multi-account store.
-// A credential already present (same clientId + refreshToken) is not duplicated.
+// An account already present is left untouched (reported via already_present),
+// never overwritten — see the dedup branch below for why.
 func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 	if s.accounts == nil {
 		adminError(w, http.StatusServiceUnavailable, "account store is not configured")
@@ -292,12 +293,14 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if id, ok := s.accounts.FindDuplicate(*acct); ok {
-		// Same account already stored (possibly added via sign-in): refresh its
-		// credentials in place rather than creating a duplicate.
-		if err := s.accounts.ReplaceCredentials(id, acct); err != nil {
-			adminError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
+		// Same account already stored: leave it untouched rather than overwriting.
+		// A local import copies the Kiro desktop client's rotating refresh-token
+		// chain, so replacing a stored account with it makes the two contend for
+		// that chain (each refresh invalidates the other's token). An account added
+		// via independent sign-in owns a separate chain that does NOT disturb the
+		// client; overwriting it with imported credentials would downgrade it into
+		// a contending one. Skip so existing accounts keep the chain they arrived
+		// with; use re-sign-in to refresh a stored account's credentials.
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id, "already_present": true})
 		return
 	}

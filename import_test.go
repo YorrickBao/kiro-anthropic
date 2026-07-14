@@ -552,3 +552,40 @@ func TestAdminImportEndpointAndDedup(t *testing.T) {
 	assert.True(t, second.AlreadyPresent)
 	assert.Len(t, store.List(), 1, "no duplicate created")
 }
+
+// TestAdminImportDoesNotOverwriteExisting verifies the key rule: a local import
+// that matches an existing account leaves that account's credentials untouched.
+// An account added independently (e.g. via sign-in) owns a separate rotating
+// refresh-token chain that does not disturb the Kiro desktop client; importing
+// must NOT overwrite it with the client's chain, or the two would contend.
+func TestAdminImportDoesNotOverwriteExisting(t *testing.T) {
+	cacheDir := t.TempDir()
+	tokenFile := filepath.Join(cacheDir, "kiro-auth-token.json")
+	writeJSONFile(t, tokenFile, map[string]any{
+		"accessToken": "client-acc", "refreshToken": "client-ref", "clientIdHash": "h",
+		"region": "us-east-1", "provider": "Enterprise", "authMethod": "IdC",
+		"profileArn": "arn:shared",
+	})
+	writeJSONFile(t, filepath.Join(cacheDir, "h.json"), map[string]any{"clientId": "client-cid", "clientSecret": "sec"})
+
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	// Pre-seed an account for the SAME profileArn but from an independent sign-in:
+	// its own clientId and refresh-token chain, plus a user label.
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "signed-in", Label: "keep me", ProfileArn: "arn:shared",
+		ClientID: "signin-cid", ClientSecret: "signin-sec",
+		AccessToken: "signin-acc", RefreshToken: "signin-ref", CreatedAt: "1",
+	}))
+
+	s := &Server{cfg: &Config{TokenFile: tokenFile}, accounts: store, login: newLoginManager(&http.Client{})}
+	rr := doAdmin(s.AdminHandler(), http.MethodPost, "/api/accounts/import", "")
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	got, ok := store.Get("signed-in")
+	require.True(t, ok)
+	assert.Equal(t, "signin-ref", got.RefreshToken, "existing refresh-token chain must NOT be overwritten by import")
+	assert.Equal(t, "signin-cid", got.ClientID, "existing client registration must be preserved")
+	assert.Equal(t, "keep me", got.Label, "existing label must be preserved")
+	assert.Len(t, store.List(), 1, "import of an existing account creates no duplicate")
+}

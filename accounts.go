@@ -396,8 +396,12 @@ func (s *AccountStore) Remove(id string) error {
 //
 // Matching rules, in priority order:
 //
-//  1. profileArn: both have the same non-empty profileArn.
-//  2. email: both have the same non-empty email.
+//  1. email: when both sides have a non-empty email, it is the decisive key.
+//     Same email → duplicate; different email → never a duplicate, even if
+//     profileArn matches (multiple users in the same IdC organization share a
+//     profileArn but are distinct people).
+//  2. profileArn: when email is unavailable on at least one side, a matching
+//     non-empty profileArn is used as a fallback.
 //  3. clientId backfill: the candidate carries identity (profileArn or email)
 //     that the stored account is missing, but they share the same clientId.
 //     This lets a sign-in that resolved identity backfill an earlier import
@@ -420,19 +424,30 @@ func (s *AccountStore) FindDuplicate(candidate StoredAccount) (string, bool) {
 func (s *AccountStore) findDuplicateLocked(candidate StoredAccount) (string, bool) {
 	candHasIdentity := candidate.ProfileArn != "" || candidate.Email != ""
 	for _, a := range s.accounts {
-		switch {
-		case candidate.ProfileArn != "" && a.ProfileArn == candidate.ProfileArn:
+		// Rule 1: when both emails are known, email is the decisive identity.
+		if candidate.Email != "" && a.Email != "" {
+			if candidate.Email == a.Email {
+				return a.ID, true
+			}
+			// Different emails → provably different users; skip this account.
+			// (profileArn must NOT override this, even if it matches.)
+			continue
+		}
+		// Rule 2: profileArn fallback — only when email is unavailable on BOTH
+		// sides. If one side has email, we cannot confirm they are the same user
+		// just from profileArn (multiple users share a profile in IdC).
+		if candidate.Email == "" && a.Email == "" &&
+			candidate.ProfileArn != "" && a.ProfileArn == candidate.ProfileArn {
 			return a.ID, true
-		case candidate.Email != "" && a.Email == candidate.Email:
+		}
+		// Rule 3: backfill — candidate has identity, stored has none, same clientId.
+		if candHasIdentity && a.ProfileArn == "" && a.Email == "" &&
+			candidate.ClientID != "" && a.ClientID == candidate.ClientID {
 			return a.ID, true
-		case candHasIdentity && a.ProfileArn == "" && a.Email == "" &&
-			candidate.ClientID != "" && a.ClientID == candidate.ClientID:
-			// Backfill: the stored account's identity was never resolved, but the
-			// candidate now carries it and shares the same OIDC client registration.
-			return a.ID, true
-		case !candHasIdentity && a.ProfileArn == "" && a.Email == "" &&
-			candidate.ClientID != "" && a.ClientID == candidate.ClientID:
-			// Neither side has identity; same machine re-import.
+		}
+		// Rule 4: neither side has identity; same machine re-import.
+		if !candHasIdentity && a.ProfileArn == "" && a.Email == "" &&
+			candidate.ClientID != "" && a.ClientID == candidate.ClientID {
 			return a.ID, true
 		}
 	}

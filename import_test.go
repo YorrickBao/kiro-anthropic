@@ -231,11 +231,20 @@ func TestFindDuplicate(t *testing.T) {
 		ProfileArn: "arn:1", Email: "u@x.com", CreatedAt: "1",
 	}))
 
-	// Same account via a different path (new clientId/refreshToken) but same
-	// profileArn -> duplicate.
-	id, ok := s.FindDuplicate(StoredAccount{ClientID: "other", RefreshToken: "other", ProfileArn: "arn:1"})
+	// Same account, same profileArn, same email → duplicate.
+	id, ok := s.FindDuplicate(StoredAccount{
+		ClientID: "other", RefreshToken: "other",
+		ProfileArn: "arn:1", Email: "u@x.com",
+	})
 	assert.True(t, ok)
 	assert.Equal(t, "a", id)
+
+	// Same profileArn but candidate has no email while stored does: could be a
+	// different user in the same IdC profile → must NOT match.
+	_, ok = s.FindDuplicate(StoredAccount{ClientID: "other", RefreshToken: "other", ProfileArn: "arn:1"})
+	assert.False(t, ok,
+		"same profileArn but candidate lacks email while stored has it: might be "+
+			"a different user sharing the profile")
 
 	// Match by email when profileArn differs/absent.
 	id, ok = s.FindDuplicate(StoredAccount{Email: "u@x.com"})
@@ -275,6 +284,64 @@ func TestFindDuplicateByClientIDWhenProfileArnEmpty(t *testing.T) {
 	id, ok := s.FindDuplicate(StoredAccount{ClientID: "C1", ClientSecret: "s", RefreshToken: "NEW"})
 	assert.True(t, ok, "same machine re-import must dedup despite rotated refreshToken")
 	assert.Equal(t, "first", id)
+}
+
+// TestFindDuplicateProfileArnSameButEmailDifferent reproduces the cross-account
+// overwrite bug in IdC (Enterprise) deployments: multiple users in the same AWS
+// organization are assigned the same CodeWhisperer profile, so they share a
+// profileArn even though they are different people. Dedup must NOT treat them
+// as the same account — email is the user-level identity, and when both sides
+// have email, a mismatch must override any profileArn match.
+func TestFindDuplicateProfileArnSameButEmailDifferent(t *testing.T) {
+	s, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, s.Add(&StoredAccount{
+		ID: "alice", ClientID: "cid-a", RefreshToken: "r-a",
+		ProfileArn: "arn:aws:codewhisperer:us-east-1:111:profile/SHARED",
+		Email:      "alice@example.com", CreatedAt: "1",
+	}))
+
+	// Bob: same profileArn (same org/profile), different email, different clientId.
+	_, ok := s.FindDuplicate(StoredAccount{
+		ClientID:    "cid-b",
+		RefreshToken: "r-b",
+		ProfileArn:  "arn:aws:codewhisperer:us-east-1:111:profile/SHARED",
+		Email:       "bob@example.com",
+	})
+	assert.False(t, ok,
+		"same profileArn but different email = different user, must NOT dedup")
+
+	// Alice re-signs-in: same profileArn AND same email → duplicate.
+	id, ok := s.FindDuplicate(StoredAccount{
+		ClientID:    "cid-a-new",
+		RefreshToken: "r-a-new",
+		ProfileArn:  "arn:aws:codewhisperer:us-east-1:111:profile/SHARED",
+		Email:       "alice@example.com",
+	})
+	assert.True(t, ok, "same profileArn AND same email = same user, must dedup")
+	assert.Equal(t, "alice", id)
+}
+
+// TestFindDuplicateProfileArnFallbackWhenEmailMissing covers the case where one
+// side has no email (e.g. an earlier import that could not resolve email). In
+// that scenario profileArn is the only comparable identity, so a match is still
+// correct — but only because email is genuinely unavailable, not ignored.
+func TestFindDuplicateProfileArnFallbackWhenEmailMissing(t *testing.T) {
+	s, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	// Stored account has profileArn but no email.
+	require.NoError(t, s.Add(&StoredAccount{
+		ID: "no-email", ClientID: "cid", RefreshToken: "r",
+		ProfileArn: "arn:shared", CreatedAt: "1",
+	}))
+
+	// Candidate has the same profileArn; email still empty. This is the same
+	// account (e.g. re-import with network still failing for email) → match.
+	id, ok := s.FindDuplicate(StoredAccount{
+		ClientID: "cid2", RefreshToken: "r2", ProfileArn: "arn:shared",
+	})
+	assert.True(t, ok, "profileArn match when email is unavailable on both sides")
+	assert.Equal(t, "no-email", id)
 }
 
 // TestFindDuplicateClientIDDoesNotOverrideIdentity reproduces the cross-account

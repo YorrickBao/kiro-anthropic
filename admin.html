@@ -45,6 +45,8 @@
   th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
   th { color: var(--muted); font-weight: 500; }
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.ctr, th.ctr { text-align: center; }
+  .th-hint { color: var(--muted); font-size: 10px; font-weight: 400; }
   pre { background: #0b0d11; border: 1px solid var(--line); border-radius: 8px; padding: 12px; overflow: auto; font-size: 12px; }
   .err-box { color: var(--err); }
   a { color: var(--accent); }
@@ -181,6 +183,12 @@ const UPDATE_CHECK_MS = 30 * 60 * 1000; // idle re-check cadence; backend caches
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmtNum = (n) => (n == null) ? "—" : Number(n).toLocaleString(undefined, {maximumFractionDigits: 2});
+const fmtCtx = (n) => {
+  if (!n) return "?";
+  if (n >= 1e6) return (n / 1e6).toFixed(n % 1e6 ? 1 : 0) + "M";
+  if (n >= 1e3) return Math.round(n / 1e3) + "K";
+  return String(n);
+};
 const fmtDate = (s) => { if (!s) return "—"; const d = new Date(s); return isNaN(d) ? esc(s) : d.toLocaleString(); };
 
 let latestModels = [];
@@ -370,16 +378,19 @@ function openModels() {
       if (eff && eff.supported) effTxt = ["low","medium","high","xhigh","max"].filter(l => eff[l]).join(" / ") || "yes";
       let rateTxt = "—";
       if (m.rate_multiplier) rateTxt = `<span class="pill">${m.rate_multiplier}x ${esc(m.rate_unit || "credit")}</span>`;
+      let ctxTxt = "—";
+      if (m.max_input_tokens || m.max_tokens) {
+        ctxTxt = `${fmtCtx(m.max_input_tokens)} / ${fmtCtx(m.max_tokens)}`;
+      }
       return `<tr>
         <td style="white-space:nowrap"><code>${esc(m.id)}</code><button class="copy" data-copy="${esc(m.id)}" type="button" title="复制">⧉</button></td>
         <td>${esc(m.display_name || "")}</td>
-        <td class="num">${m.max_input_tokens ? fmtNum(m.max_input_tokens) : "—"}</td>
-        <td class="num">${m.max_tokens ? fmtNum(m.max_tokens) : "—"}</td>
-        <td class="num">${rateTxt}</td>
+        <td class="num">${ctxTxt}</td>
+        <td class="ctr">${rateTxt}</td>
         <td>${esc(effTxt)}</td>
       </tr>`;
     }).join("");
-    body.innerHTML = `<table><thead><tr><th>模型 ID</th><th>名称</th><th class="num">最大输入</th><th class="num">最大输出</th><th class="num">倍率</th><th>Effort</th></tr></thead><tbody>${rows}</tbody></table>`;
+    body.innerHTML = `<table><thead><tr><th>模型 ID</th><th>名称</th><th class="num">上下文窗口 <span class="th-hint">输入 / 输出</span></th><th class="ctr">倍率</th><th>Effort</th></tr></thead><tbody>${rows}</tbody></table>`;
     body.querySelectorAll("button.copy").forEach(b => b.addEventListener("click", () => copyText(b.dataset.copy, b)));
   }
   $("models-modal").classList.add("open");

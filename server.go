@@ -280,6 +280,20 @@ func modelInfoJSON(m kiroModelInfo, now string) map[string]any {
 			info["rate_unit"] = m.RateUnit
 		}
 	}
+	if m.Description != "" {
+		info["description"] = m.Description
+	}
+	if m.Status != "" {
+		info["status"] = m.Status
+	}
+	if len(m.SupportedInputTypes) > 0 {
+		info["supported_input_types"] = m.SupportedInputTypes
+	}
+	if m.PromptCaching != nil {
+		info["prompt_caching"] = map[string]any{
+			"supported": m.PromptCaching.SupportsPromptCaching,
+		}
+	}
 
 	effortCap := map[string]any{"supported": false}
 	for _, lvl := range allEffortLevels {

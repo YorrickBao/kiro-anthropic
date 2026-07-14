@@ -69,6 +69,11 @@
   button.edit { background: transparent; color: var(--muted); border: 0; padding: 0 6px; margin-left: 4px; cursor: pointer; font-size: 12px; }
   button.edit:hover { color: var(--accent); }
   button.copy:hover { color: var(--accent); }
+  tr.expandable { cursor: pointer; }
+  tr.expandable:hover { background: rgba(110,168,254,.06); }
+  .caret { display: inline-block; width: 12px; color: var(--muted); font-size: 10px; margin-right: 4px; transition: transform .15s; }
+  tr.detail > td { background: #0e1015; }
+  tr.detail .kv { grid-template-columns: 90px 1fr; }
   /* account cards */
   .accounts { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
   .acct { background: #12151c; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
@@ -372,7 +377,8 @@ function openModels() {
   if (!latestModels || !latestModels.length) {
     body.innerHTML = '<span class="muted">无模型信息。</span>';
   } else {
-    const rows = latestModels.map(m => {
+    const hasDetail = latestModels.some(m => m.description || (m.supported_input_types && m.supported_input_types.length) || (m.prompt_caching && m.prompt_caching.supported));
+    const rows = latestModels.map((m, i) => {
       const eff = m.capabilities && m.capabilities.effort;
       let effTxt = "—";
       if (eff && eff.supported) effTxt = ["low","medium","high","xhigh","max"].filter(l => eff[l]).join(" / ") || "yes";
@@ -382,16 +388,38 @@ function openModels() {
       if (m.max_input_tokens || m.max_tokens) {
         ctxTxt = `${fmtCtx(m.max_input_tokens)} / ${fmtCtx(m.max_tokens)}`;
       }
-      return `<tr>
-        <td style="white-space:nowrap"><code>${esc(m.id)}</code><button class="copy" data-copy="${esc(m.id)}" type="button" title="复制">⧉</button></td>
+      const isActive = (m.status || "").toUpperCase() === "ACTIVE";
+      let statusTxt = "—";
+      if (m.status) statusTxt = isActive
+        ? `<span class="pill ok">${esc(m.status)}</span>`
+        : `<span class="pill">${esc(m.status)}</span>`;
+      const expandable = hasDetail && (m.description || (m.supported_input_types && m.supported_input_types.length) || (m.prompt_caching && m.prompt_caching.supported));
+      const marker = expandable ? `<span class="caret" data-expand="${i}">▶</span>` : "";
+      // Detail row content
+      let detailCells = [];
+      if (m.description) detailCells.push(`<dt>描述</dt><dd>${esc(m.description)}</dd>`);
+      if (m.supported_input_types && m.supported_input_types.length) detailCells.push(`<dt>输入类型</dt><dd>${esc(m.supported_input_types.join(" / "))}</dd>`);
+      if (m.prompt_caching && m.prompt_caching.supported) detailCells.push(`<dt>缓存</dt><dd><span class="pill ok">Prompt Caching</span></dd>`);
+      const mainRow = `<tr class="mrow${expandable ? " expandable" : ""}" ${expandable ? `data-idx="${i}"` : ""}>
+        <td style="white-space:nowrap">${marker}<code>${esc(m.id)}</code><button class="copy" data-copy="${esc(m.id)}" type="button" title="复制">⧉</button></td>
         <td>${esc(m.display_name || "")}</td>
         <td class="num">${ctxTxt}</td>
         <td class="ctr">${rateTxt}</td>
         <td>${esc(effTxt)}</td>
+        <td class="ctr">${statusTxt}</td>
       </tr>`;
+      const detailRow = expandable ? `<tr class="detail" id="detail-${i}" style="display:none"><td colspan="6"><dl class="kv">${detailCells.join("")}</dl></td></tr>` : "";
+      return mainRow + detailRow;
     }).join("");
-    body.innerHTML = `<table><thead><tr><th>模型 ID</th><th>名称</th><th class="num">上下文窗口 <span class="th-hint">输入 / 输出</span></th><th class="ctr">倍率</th><th>Effort</th></tr></thead><tbody>${rows}</tbody></table>`;
+    const statusHdr = '<th class="ctr">状态</th>';
+    body.innerHTML = `<table><thead><tr><th>模型 ID</th><th>名称</th><th class="num">上下文窗口 <span class="th-hint">输入 / 输出</span></th><th class="ctr">倍率</th><th>Effort</th>${statusHdr}</tr></thead><tbody>${rows}</tbody></table>`;
     body.querySelectorAll("button.copy").forEach(b => b.addEventListener("click", () => copyText(b.dataset.copy, b)));
+    body.querySelectorAll("[data-idx]").forEach(r => r.addEventListener("click", () => {
+      const idx = r.dataset.idx;
+      const d = $("detail-" + idx);
+      const c = r.querySelector(".caret");
+      if (d.style.display === "none") { d.style.display = ""; c.textContent = "▼"; } else { d.style.display = "none"; c.textContent = "▶"; }
+    }));
   }
   $("models-modal").classList.add("open");
 }

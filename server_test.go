@@ -100,6 +100,11 @@ func TestModelInfoJSON(t *testing.T) {
 	assert.Equal(t, 128000, info["max_tokens"])
 	assert.Equal(t, 1.5, info["rate_multiplier"])
 	assert.Equal(t, "credit", info["rate_unit"])
+	assert.Equal(t, "Most powerful model for complex tasks.", info["description"])
+	assert.Equal(t, "ACTIVE", info["status"])
+	assert.Equal(t, []string{"text", "image"}, info["supported_input_types"])
+	pc := info["prompt_caching"].(map[string]any)
+	assert.Equal(t, true, pc["supported"])
 
 	caps := info["capabilities"].(map[string]any)["effort"].(map[string]any)
 	assert.Equal(t, true, caps["supported"])
@@ -116,6 +121,12 @@ func TestModelInfoJSON(t *testing.T) {
 	assert.False(t, hasRate)
 	_, hasUnit := sonnetInfo["rate_unit"]
 	assert.False(t, hasUnit)
+
+	// sonnet-4.5: no description/status/inputTypes/caching → keys omitted.
+	for _, k := range []string{"description", "status", "supported_input_types", "prompt_caching"} {
+		_, ok := sonnetInfo[k]
+		assert.False(t, ok, "%s should be absent for sonnet", k)
+	}
 }
 
 func TestMapUpstreamError(t *testing.T) {

@@ -22,6 +22,14 @@ func testOpusModel() kiroModelInfo {
 	m.TokenLimits.MaxOutputTokens = 128000
 	m.RateMultiplier = 1.5
 	m.RateUnit = "credit"
+	m.Description = "Most powerful model for complex tasks."
+	m.Status = "ACTIVE"
+	m.SupportedInputTypes = []string{"text", "image"}
+	m.PromptCaching = &struct {
+		SupportsPromptCaching             bool `json:"supportsPromptCaching"`
+		MaximumCacheCheckpointsPerRequest int  `json:"maximumCacheCheckpointsPerRequest,omitempty"`
+		MinimumTokensPerCacheCheckpoint   int  `json:"minimumTokensPerCacheCheckpoint,omitempty"`
+	}{SupportsPromptCaching: true, MaximumCacheCheckpointsPerRequest: 2}
 	return m
 }
 

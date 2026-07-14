@@ -451,6 +451,18 @@ type kiroModelInfo struct {
 	// the real per-request cost comes from the stream's metering event.
 	RateMultiplier float64 `json:"rateMultiplier,omitempty"`
 	RateUnit       string  `json:"rateUnit,omitempty"`
+	// Human-readable model description.
+	Description string `json:"description,omitempty"`
+	// Lifecycle status, e.g. "ACTIVE", "LEGACY".
+	Status string `json:"status,omitempty"`
+	// Accepted input modalities, e.g. ["text", "image"].
+	SupportedInputTypes []string `json:"supportedInputTypes,omitempty"`
+	// Prompt-caching capability.
+	PromptCaching *struct {
+		SupportsPromptCaching             bool `json:"supportsPromptCaching"`
+		MaximumCacheCheckpointsPerRequest int  `json:"maximumCacheCheckpointsPerRequest,omitempty"`
+		MinimumTokensPerCacheCheckpoint   int  `json:"minimumTokensPerCacheCheckpoint,omitempty"`
+	} `json:"promptCaching,omitempty"`
 }
 
 // maxTokensRange reports the [min, max] the model accepts for the additional

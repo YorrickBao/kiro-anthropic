@@ -75,13 +75,20 @@ func (c *accountCreds) profileArn(ctx context.Context) (string, error) {
 	c.acct.ProfileArn = arn
 	// Persist the resolved profileArn so it survives restarts and shows up on
 	// the admin page. Best-effort: a write failure does not affect this request.
-	_ = c.store.UpdateIdentity(c.id, arn, "")
-	// While we have a valid token, also resolve email best-effort and persist it
-	// for the same reason. fetchAccountEmail is non-fatal on failure.
-	if c.acct.Email == "" {
-		if email := fetchAccountEmail(ctx, c.client, c.apiRegion(), arn, tok); email != "" {
-			c.acct.Email = email
-			_ = c.store.UpdateIdentity(c.id, "", email)
+	_ = c.store.UpdateIdentity(c.id, arn, "", "")
+	// While we have a valid token, also resolve email and userId best-effort and
+	// persist them for the same reason (and to backfill userId onto older records
+	// that predate the field). fetchAccountIdentity is non-fatal on failure.
+	if c.acct.Email == "" || c.acct.UserID == "" {
+		ident := fetchAccountIdentity(ctx, c.client, c.apiRegion(), arn, tok)
+		if ident.Email != "" {
+			c.acct.Email = ident.Email
+		}
+		if ident.UserID != "" {
+			c.acct.UserID = ident.UserID
+		}
+		if ident.Email != "" || ident.UserID != "" {
+			_ = c.store.UpdateIdentity(c.id, "", ident.Email, ident.UserID)
 		}
 	}
 	return arn, nil

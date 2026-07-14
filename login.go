@@ -291,8 +291,10 @@ func (m *loginManager) completeLogin(ctx context.Context, state, code string) (*
 	if arn, err := resolveProfileArn(ctx, m.client, p.region, tok.AccessToken); err == nil {
 		acct.ProfileArn = arn
 	}
-	acct.Email = fetchAccountEmail(ctx, m.client, p.region, acct.ProfileArn, tok.AccessToken)
-	// profileArn/email are best-effort here. If neither could be resolved the
+	ident := fetchAccountIdentity(ctx, m.client, p.region, acct.ProfileArn, tok.AccessToken)
+	acct.Email = ident.Email
+	acct.UserID = ident.UserID
+	// profileArn/email/userId are best-effort here. If none could be resolved the
 	// account is still usable: profileArn() in selector.go lazily resolves it at
 	// request time using a refreshed token, and persists it back to the store.
 	return acct, nil
@@ -366,9 +368,11 @@ func importLocalCredentials(ctx context.Context, client *http.Client, tokenFile 
 		}
 	}
 	if accessToken != "" {
-		acct.Email = fetchAccountEmail(ctx, client, region, acct.ProfileArn, accessToken)
+		ident := fetchAccountIdentity(ctx, client, region, acct.ProfileArn, accessToken)
+		acct.Email = ident.Email
+		acct.UserID = ident.UserID
 	}
-	// profileArn/email are best-effort here. If neither could be resolved the
+	// profileArn/email/userId are best-effort here. If none could be resolved the
 	// account is still usable: profileArn() in selector.go lazily resolves it at
 	// request time using a refreshed token, and persists it back to the store.
 	return acct, nil
@@ -502,10 +506,19 @@ func randomURLSafe(n int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-// fetchAccountEmail resolves the account email via getUsageLimits (userInfo.email)
-// using the given bearer token. It is best-effort: an empty string is returned
-// on any failure, since the email is only cosmetic (shown in the admin list).
-func fetchAccountEmail(ctx context.Context, client *http.Client, region, arn, accessToken string) string {
+// accountIdentity is the stable identity resolved from getUsageLimits: the
+// account email and the IAM Identity Center userId. Both come from the same
+// response, so either both are populated or both are empty.
+type accountIdentity struct {
+	Email  string
+	UserID string
+}
+
+// fetchAccountIdentity resolves the account email and IdC userId via
+// getUsageLimits (userInfo) using the given bearer token. It is best-effort: a
+// zero accountIdentity is returned on any failure. Email is cosmetic (shown in
+// the admin list); userId is the primary dedup key (see StoredAccount.UserID).
+func fetchAccountIdentity(ctx context.Context, client *http.Client, region, arn, accessToken string) accountIdentity {
 	if region == "" {
 		region = "us-east-1"
 	}
@@ -520,28 +533,29 @@ func fetchAccountEmail(ctx context.Context, client *http.Client, region, arn, ac
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?"+q.Encode(), nil)
 	if err != nil {
-		return ""
+		return accountIdentity{}
 	}
 	req.Header.Set("Accept", "application/json")
 	applyKiroHeaders(req, accessToken, "")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return ""
+		return accountIdentity{}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return ""
+		return accountIdentity{}
 	}
 	var out struct {
 		UserInfo struct {
-			Email string `json:"email"`
+			Email  string `json:"email"`
+			UserID string `json:"userId"`
 		} `json:"userInfo"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return ""
+		return accountIdentity{}
 	}
-	return out.UserInfo.Email
+	return accountIdentity{Email: out.UserInfo.Email, UserID: out.UserInfo.UserID}
 }
 
 // resolveProfileArn calls ListAvailableProfiles on the management endpoint with

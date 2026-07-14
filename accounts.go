@@ -49,7 +49,15 @@ type StoredAccount struct {
 	ExpiresAt    string `json:"expiresAt,omitempty"` // RFC3339
 
 	ProfileArn string `json:"profileArn,omitempty"`
-	CreatedAt  string `json:"createdAt,omitempty"`
+	// UserID is the IAM Identity Center user identity from getUsageLimits
+	// (userInfo.userId, format "d-<directory>.<uuid>"). Unlike profileArn (shared
+	// by every user in an IdC organization) and email (which an admin can change),
+	// it is globally unique per person and stable across email changes, so it is
+	// the primary dedup key. Resolved from the same call as Email, so both are
+	// present or both absent; older records predating this field carry only Email
+	// until a lazy resolve backfills it.
+	UserID    string `json:"userId,omitempty"`
+	CreatedAt string `json:"createdAt,omitempty"`
 
 	// Disabled omits the account from the round-robin pool: it is still stored,
 	// refreshed and shown on the admin page with usage, but never selected to
@@ -214,6 +222,9 @@ func applyCredentialsLocked(a, fresh *StoredAccount) {
 	if fresh.Email != "" {
 		a.Email = fresh.Email
 	}
+	if fresh.UserID != "" {
+		a.UserID = fresh.UserID
+	}
 }
 
 // ImportResult summarizes a bulk import (see ImportAccounts).
@@ -295,12 +306,13 @@ func (s *AccountStore) UpdateLabel(id, label string) error {
 	return s.saveLocked()
 }
 
-// UpdateIdentity persists the profileArn and/or email of an existing account.
-// Empty values are ignored so a partial resolution does not erase previously
-// stored identity. This is used by the lazy resolver in selector.go to write
-// back a profileArn/email resolved at request time, so it survives restarts and
-// is visible on the admin page. Returns an error if the id is unknown.
-func (s *AccountStore) UpdateIdentity(id, profileArn, email string) error {
+// UpdateIdentity persists the profileArn, email and/or userId of an existing
+// account. Empty values are ignored so a partial resolution does not erase
+// previously stored identity. This is used by the lazy resolver in selector.go
+// to write back identity resolved at request time, so it survives restarts and
+// is visible on the admin page. It also backfills userId onto older records that
+// predate the field. Returns an error if the id is unknown.
+func (s *AccountStore) UpdateIdentity(id, profileArn, email, userID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a, ok := s.accounts[id]
@@ -312,6 +324,9 @@ func (s *AccountStore) UpdateIdentity(id, profileArn, email string) error {
 	}
 	if email != "" {
 		a.Email = email
+	}
+	if userID != "" {
+		a.UserID = userID
 	}
 	return s.saveLocked()
 }
@@ -396,19 +411,25 @@ func (s *AccountStore) Remove(id string) error {
 //
 // Matching rules, in priority order:
 //
-//  1. email: when both sides have a non-empty email, it is the decisive key.
-//     Same email → duplicate; different email → never a duplicate, even if
-//     profileArn matches (multiple users in the same IdC organization share a
-//     profileArn but are distinct people).
+//  0. userId: the IAM Identity Center user identity (StoredAccount.UserID). When
+//     both sides have a non-empty userId it is decisive — same userId → duplicate,
+//     different userId → never a duplicate. Unlike email it survives an admin
+//     changing the account's email, so re-signing-in after an email change is
+//     recognised as the same account instead of leaving an orphan. Older records
+//     predating the field lack userId and fall through to the email rule until a
+//     lazy resolve backfills it.
+//  1. email: when both sides have a non-empty email (and userId did not decide),
+//     it is the decisive key. Same email → duplicate; different email → never a
+//     duplicate, even if profileArn matches (multiple users in the same IdC
+//     organization share a profileArn but are distinct people).
 //  2. profileArn: when email is unavailable on at least one side, a matching
 //     non-empty profileArn is used as a fallback.
-//  3. clientId backfill: the candidate carries identity (profileArn or email)
+//  3. clientId backfill: the candidate carries identity (userId/profileArn/email)
 //     that the stored account is missing, but they share the same clientId.
 //     This lets a sign-in that resolved identity backfill an earlier import
 //     that could not, replacing it in place instead of creating a duplicate.
 //  4. clientId only: neither side has identity, but they share the same
-//     clientId — a same-machine re-import whose profileArn/email lookup failed
-//     both times.
+//     clientId — a same-machine re-import whose identity lookup failed both times.
 //
 // clientId is never used to match a candidate that has NO identity against a
 // stored account that DOES: two different AWS accounts signed in via the same
@@ -422,8 +443,18 @@ func (s *AccountStore) FindDuplicate(candidate StoredAccount) (string, bool) {
 
 // findDuplicateLocked is FindDuplicate's body; caller holds s.mu.
 func (s *AccountStore) findDuplicateLocked(candidate StoredAccount) (string, bool) {
-	candHasIdentity := candidate.ProfileArn != "" || candidate.Email != ""
+	candHasIdentity := candidate.UserID != "" || candidate.ProfileArn != "" || candidate.Email != ""
 	for _, a := range s.accounts {
+		// Rule 0: userId is the definitive IdC user identity. When both sides have
+		// it, it decides outright — and a mismatch means provably different users,
+		// so no lower rule may override it (email/profileArn cannot resurrect a
+		// match the userId ruled out).
+		if candidate.UserID != "" && a.UserID != "" {
+			if candidate.UserID == a.UserID {
+				return a.ID, true
+			}
+			continue
+		}
 		// Rule 1: when both emails are known, email is the decisive identity.
 		if candidate.Email != "" && a.Email != "" {
 			if candidate.Email == a.Email {
@@ -478,6 +509,7 @@ func (a StoredAccount) view() map[string]any {
 		"region":       a.Region,
 		"start_url":    a.StartURL,
 		"profile_arn":  a.ProfileArn,
+		"user_id":      a.UserID,
 		"created_at":   a.CreatedAt,
 		"expires_at":   a.ExpiresAt,
 		"disabled":     a.Disabled,

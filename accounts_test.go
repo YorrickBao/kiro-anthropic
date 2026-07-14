@@ -154,17 +154,19 @@ func TestAccountStoreUpdateIdentity(t *testing.T) {
 		// profileArn and Email both empty — as if imported with network failure.
 	}))
 
-	// Backfill both fields.
-	require.NoError(t, s.UpdateIdentity("id", "arn:resolved", "user@example.com"))
+	// Backfill all three fields.
+	require.NoError(t, s.UpdateIdentity("id", "arn:resolved", "user@example.com", "d-dir.uid"))
 	got, _ := s.Get("id")
 	assert.Equal(t, "arn:resolved", got.ProfileArn)
 	assert.Equal(t, "user@example.com", got.Email)
+	assert.Equal(t, "d-dir.uid", got.UserID)
 
 	// Partial update: empty values are ignored, not erased.
-	require.NoError(t, s.UpdateIdentity("id", "arn:new", ""))
+	require.NoError(t, s.UpdateIdentity("id", "arn:new", "", ""))
 	got, _ = s.Get("id")
 	assert.Equal(t, "arn:new", got.ProfileArn)
 	assert.Equal(t, "user@example.com", got.Email, "email must not be erased by empty value")
+	assert.Equal(t, "d-dir.uid", got.UserID, "userId must not be erased by empty value")
 
 	// Persisted across reload.
 	s2, err := NewAccountStore(path)
@@ -172,8 +174,9 @@ func TestAccountStoreUpdateIdentity(t *testing.T) {
 	got2, _ := s2.Get("id")
 	assert.Equal(t, "arn:new", got2.ProfileArn)
 	assert.Equal(t, "user@example.com", got2.Email)
+	assert.Equal(t, "d-dir.uid", got2.UserID)
 
-	assert.Error(t, s.UpdateIdentity("missing", "arn", "e"))
+	assert.Error(t, s.UpdateIdentity("missing", "arn", "e", "u"))
 }
 
 func TestAccountStoreSetDisabled(t *testing.T) {
@@ -241,11 +244,13 @@ func TestStoredAccountViewRedacts(t *testing.T) {
 		ID:           "id",
 		AccessToken:  "abcdefghijklmnopqrstuvwxyz",
 		RefreshToken: "secret-refresh",
+		UserID:       "d-dir.uid",
 		ExpiresAt:    time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
 	}
 	v := a.view()
 	assert.NotEqual(t, a.AccessToken, v["access_token"], "access token must be masked")
 	assert.Equal(t, true, v["has_refresh"])
+	assert.Equal(t, "d-dir.uid", v["user_id"], "userId is surfaced for the admin page")
 	assert.NotContains(t, v, "refresh_token", "raw refresh token must not be exposed")
 	assert.NotContains(t, v, "client_secret", "client secret must not be exposed")
 	assert.Equal(t, "valid", v["expiry_state"])

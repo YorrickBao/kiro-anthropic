@@ -351,6 +351,7 @@ function renderAccounts(accounts) {
       <dt>Provider</dt><dd>${esc(a.provider || "—")} <span class="muted">${esc(a.auth_method || "")}</span></dd>
       <dt>Region</dt><dd>${esc(a.region || "—")}</dd>
       <dt>profileArn</dt><dd style="font-size:12px">${esc(a.profile_arn || "—")}</dd>
+      <dt>userId</dt><dd style="font-size:12px">${esc(a.user_id || "—")}</dd>
       <dt>Token</dt><dd><code>${esc(a.access_token || "—")}</code></dd>
     </dl>
     ${usageHtml(a.usage)}

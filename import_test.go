@@ -194,12 +194,12 @@ func TestImportLocalCredentialsRefreshesExpiredToken(t *testing.T) {
 	assert.Equal(t, "imported@example.com", acct.Email)
 }
 
-func TestFetchAccountEmail(t *testing.T) {
+func TestFetchAccountIdentity(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/getUsageLimits", func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "Bearer tok", r.Header.Get("Authorization"))
 		writeJSON(w, http.StatusOK, map[string]any{
-			"userInfo": map[string]any{"email": "user@example.com"},
+			"userInfo": map[string]any{"email": "user@example.com", "userId": "d-dir.uid"},
 		})
 	})
 	srv := httptest.NewServer(mux)
@@ -207,11 +207,12 @@ func TestFetchAccountEmail(t *testing.T) {
 	target, _ := url.Parse(srv.URL)
 	client := &http.Client{Transport: &rewriteTransport{host: target.Host, scheme: target.Scheme}}
 
-	email := fetchAccountEmail(context.Background(), client, "us-east-1", "arn:x", "tok")
-	assert.Equal(t, "user@example.com", email)
+	ident := fetchAccountIdentity(context.Background(), client, "us-east-1", "arn:x", "tok")
+	assert.Equal(t, "user@example.com", ident.Email)
+	assert.Equal(t, "d-dir.uid", ident.UserID)
 }
 
-func TestFetchAccountEmailBestEffort(t *testing.T) {
+func TestFetchAccountIdentityBestEffort(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 	}))
@@ -219,8 +220,8 @@ func TestFetchAccountEmailBestEffort(t *testing.T) {
 	target, _ := url.Parse(srv.URL)
 	client := &http.Client{Transport: &rewriteTransport{host: target.Host, scheme: target.Scheme}}
 
-	// Failure returns empty string, not an error.
-	assert.Equal(t, "", fetchAccountEmail(context.Background(), client, "us-east-1", "", "tok"))
+	// Failure returns a zero identity, not an error.
+	assert.Equal(t, accountIdentity{}, fetchAccountIdentity(context.Background(), client, "us-east-1", "", "tok"))
 }
 
 func TestFindDuplicate(t *testing.T) {
@@ -320,6 +321,75 @@ func TestFindDuplicateProfileArnSameButEmailDifferent(t *testing.T) {
 	})
 	assert.True(t, ok, "same profileArn AND same email = same user, must dedup")
 	assert.Equal(t, "alice", id)
+}
+
+// TestFindDuplicateUserIDSurvivesEmailChange is the core reason userId is the
+// primary key: an admin (or external IdP) changes the account's email. On the
+// next sign-in the candidate carries the SAME userId but a DIFFERENT email.
+// Dedup must recognise it as the same account (refresh in place) rather than
+// leaving the old record as an orphan and inserting a new one.
+func TestFindDuplicateUserIDSurvivesEmailChange(t *testing.T) {
+	s, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, s.Add(&StoredAccount{
+		ID: "alice", ClientID: "cid-a", RefreshToken: "r-a",
+		ProfileArn: "arn:shared", Email: "alice.old@example.com",
+		UserID: "d-90660bbad1.alice-uuid", CreatedAt: "1",
+	}))
+
+	id, ok := s.FindDuplicate(StoredAccount{
+		ClientID: "cid-a-new", RefreshToken: "r-a-new",
+		ProfileArn: "arn:shared", Email: "alice.new@example.com",
+		UserID: "d-90660bbad1.alice-uuid",
+	})
+	assert.True(t, ok, "same userId = same user even after an email change, must dedup")
+	assert.Equal(t, "alice", id)
+}
+
+// TestFindDuplicateUserIDOverridesProfileArn verifies userId decides outright:
+// two users in the same IdC org share a profileArn but have distinct userIds, so
+// a userId mismatch must NOT be merged even though profileArn matches. Mirrors
+// the real observation that share01 and yuyun.bao share profile/NVW3XE4VNPK9 but
+// carry different userInfo.userId values.
+func TestFindDuplicateUserIDOverridesProfileArn(t *testing.T) {
+	s, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, s.Add(&StoredAccount{
+		ID: "share01", ClientID: "cid-1", RefreshToken: "r1",
+		ProfileArn: "arn:aws:codewhisperer:us-east-1:495599739596:profile/NVW3XE4VNPK9",
+		Email:      "usl.share01@bizops.com.cn", UserID: "d-90660bbad1.64484488",
+		CreatedAt: "1",
+	}))
+
+	// Different person, same org/profileArn, different userId (and different email).
+	_, ok := s.FindDuplicate(StoredAccount{
+		ClientID: "cid-2", RefreshToken: "r2",
+		ProfileArn: "arn:aws:codewhisperer:us-east-1:495599739596:profile/NVW3XE4VNPK9",
+		Email:      "yuyun.bao@bizops.com.cn", UserID: "d-90660bbad1.848814b8",
+	})
+	assert.False(t, ok, "different userId = different user, must NOT dedup despite shared profileArn")
+}
+
+// TestFindDuplicateUserIDMissingFallsThroughToEmail covers backward
+// compatibility: an older stored record predates the UserID field (email only),
+// while the candidate now carries userId. The userId rule cannot decide (stored
+// side empty), so it falls through to the email rule and still matches, letting
+// ReplaceCredentials backfill the userId onto the old record.
+func TestFindDuplicateUserIDMissingFallsThroughToEmail(t *testing.T) {
+	s, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, s.Add(&StoredAccount{
+		ID: "legacy", ClientID: "cid", RefreshToken: "r",
+		Email: "user@example.com", CreatedAt: "1",
+		// No UserID — predates the field.
+	}))
+
+	id, ok := s.FindDuplicate(StoredAccount{
+		ClientID: "cid-new", RefreshToken: "r-new",
+		Email: "user@example.com", UserID: "d-dir.uid",
+	})
+	assert.True(t, ok, "candidate userId absent on stored side falls through to email match")
+	assert.Equal(t, "legacy", id)
 }
 
 // TestFindDuplicateProfileArnFallbackWhenEmailMissing covers the case where one

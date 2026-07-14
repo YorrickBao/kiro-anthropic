@@ -22,13 +22,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # 拉取完整历史与 tag，供 build.sh 的 git describe 使用
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           # 直接读取 go.mod 中的 Go 版本（当前为 1.26）
           go-version-file: go.mod

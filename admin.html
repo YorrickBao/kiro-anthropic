@@ -363,6 +363,7 @@ function renderAccounts(accounts) {
       <span style="flex:1"></span>
       <button class="ghost" data-models type="button">模型</button>
       <button class="ghost" data-refresh="${esc(a.id)}" type="button">刷新令牌</button>
+      <button class="ghost" data-refresh-id="${esc(a.id)}" type="button">刷新身份</button>
       <button class="danger" data-del="${esc(a.id)}" type="button">删除</button>
     </div>
   </div>`).join("");
@@ -370,6 +371,7 @@ function renderAccounts(accounts) {
   el.querySelectorAll("button[data-edit]").forEach(b => b.addEventListener("click", () => editLabel(b.dataset.edit, b.dataset.label)));
   el.querySelectorAll("button[data-models]").forEach(b => b.addEventListener("click", openModels));
   el.querySelectorAll("button[data-refresh]").forEach(b => b.addEventListener("click", () => refreshAccount(b.dataset.refresh, b)));
+  el.querySelectorAll("button[data-refresh-id]").forEach(b => b.addEventListener("click", () => refreshIdentity(b.dataset.refreshId, b)));
   el.querySelectorAll("input[data-toggle]").forEach(b => b.addEventListener("change", () => toggleAccount(b.dataset.toggle, b.checked, b)));
 }
 
@@ -517,6 +519,24 @@ async function refreshAccount(id, btn) {
     await tick();
   } catch (e) {
     alert("刷新失败: " + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = orig; }
+  }
+}
+
+async function refreshIdentity(id, btn) {
+  if (!id) return;
+  const orig = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "解析中…"; }
+  try {
+    const res = await fetch("/api/accounts/refresh-identity", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id })
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error((d.error && d.error.message) || ("HTTP " + res.status));
+    await tick();
+  } catch (e) {
+    alert("刷新身份失败: " + e.message);
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = orig; }
   }

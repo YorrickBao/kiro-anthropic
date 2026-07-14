@@ -1,6 +1,10 @@
 package main
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -40,6 +44,101 @@ func TestAccountStoreRoundTrip(t *testing.T) {
 	assert.Equal(t, "team a", got.Label)
 	assert.Equal(t, "csecret", got.ClientSecret)
 	assert.Equal(t, "rtoken", got.RefreshToken)
+}
+
+func TestAccountStoreRefreshIdentityOverwritesAndPersists(t *testing.T) {
+	// Fake management endpoint returning fresh identity. rewriteTransport (from
+	// login_test.go) redirects management.<region>.kiro.dev to this server.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"profiles": []map[string]any{{"arn": "arn:new"}},
+		})
+	})
+	mux.HandleFunc("/getUsageLimits", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"userInfo": map[string]any{"email": "new@x.com", "userId": "user-new"},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	target, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	client := &http.Client{Transport: &rewriteTransport{host: target.Host, scheme: target.Scheme}}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "accounts.json")
+	s, err := NewAccountStore(path)
+	require.NoError(t, err)
+
+	// Seed with stale identity and a token valid far into the future, so
+	// RefreshIdentity skips the token refresh and only re-resolves identity.
+	require.NoError(t, s.Add(&StoredAccount{
+		ID:          "id-1",
+		Region:      "us-east-1",
+		AccessToken: "atoken",
+		ExpiresAt:   time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		ProfileArn:  "arn:old",
+		Email:       "old@x.com",
+		UserID:      "user-old",
+		CreatedAt:   "2020-01-01T00:00:00Z",
+	}))
+
+	got, err := s.RefreshIdentity(context.Background(), client, "id-1")
+	require.NoError(t, err)
+	assert.Equal(t, "arn:new", got.ProfileArn)
+	assert.Equal(t, "new@x.com", got.Email)
+	assert.Equal(t, "user-new", got.UserID)
+
+	// The overwrite must survive a reload from disk.
+	s2, err := NewAccountStore(path)
+	require.NoError(t, err)
+	reloaded, ok := s2.Get("id-1")
+	require.True(t, ok)
+	assert.Equal(t, "arn:new", reloaded.ProfileArn)
+	assert.Equal(t, "new@x.com", reloaded.Email)
+	assert.Equal(t, "user-new", reloaded.UserID)
+}
+
+// A failed identity lookup must not erase existing identity.
+func TestAccountStoreRefreshIdentityKeepsExistingOnError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	target, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	client := &http.Client{Transport: &rewriteTransport{host: target.Host, scheme: target.Scheme}}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "accounts.json")
+	s, err := NewAccountStore(path)
+	require.NoError(t, err)
+	require.NoError(t, s.Add(&StoredAccount{
+		ID:          "id-1",
+		Region:      "us-east-1",
+		AccessToken: "atoken",
+		ExpiresAt:   time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		ProfileArn:  "arn:old",
+		Email:       "old@x.com",
+		UserID:      "user-old",
+		CreatedAt:   "2020-01-01T00:00:00Z",
+	}))
+
+	_, err = s.RefreshIdentity(context.Background(), client, "id-1")
+	require.Error(t, err)
+
+	got, ok := s.Get("id-1")
+	require.True(t, ok)
+	assert.Equal(t, "arn:old", got.ProfileArn)
+	assert.Equal(t, "old@x.com", got.Email)
+	assert.Equal(t, "user-old", got.UserID)
 }
 
 func TestAccountStoreImportAccounts(t *testing.T) {

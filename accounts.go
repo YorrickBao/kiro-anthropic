@@ -380,6 +380,46 @@ func (s *AccountStore) RefreshToken(ctx context.Context, client *http.Client, id
 	return v.(StoredAccount), nil
 }
 
+// RefreshIdentity re-resolves the account's profileArn, email and userId from
+// the Kiro management endpoint and persists them. Unlike the lazy resolver in
+// selector.go, which only fills fields that are empty, this forces a fresh
+// lookup and overwrites the stored identity, so an admin can correct stale
+// identity from the admin page. The management endpoint rejects a stale token,
+// so the token is refreshed first when missing or near expiry. Values that come
+// back empty are left untouched (see UpdateIdentity), so a partial lookup never
+// erases existing identity. Returns the refreshed account snapshot.
+func (s *AccountStore) RefreshIdentity(ctx context.Context, client *http.Client, id string) (StoredAccount, error) {
+	cur, ok := s.Get(id)
+	if !ok {
+		return StoredAccount{}, fmt.Errorf("account %s not found", id)
+	}
+	// Ensure a usable token: the ListAvailableProfiles / getUsageLimits calls
+	// 401 on an expired one. Fall back to the stored token only if a refresh
+	// fails but we still hold something to try.
+	exp := cur.expiry()
+	if cur.AccessToken == "" || (!exp.IsZero() && time.Now().Add(tokenRefreshBuffer).After(exp)) {
+		if fresh, err := s.RefreshToken(ctx, client, id); err == nil {
+			cur = fresh
+		} else if cur.AccessToken == "" {
+			return StoredAccount{}, err
+		}
+	}
+	region := cur.Region
+	if region == "" {
+		region = "us-east-1"
+	}
+	arn, err := resolveProfileArn(ctx, client, region, cur.AccessToken)
+	if err != nil {
+		return StoredAccount{}, fmt.Errorf("resolve identity for account %s: %w", id, err)
+	}
+	ident := fetchAccountIdentity(ctx, client, region, arn, cur.AccessToken)
+	if err := s.UpdateIdentity(id, arn, ident.Email, ident.UserID); err != nil {
+		return StoredAccount{}, err
+	}
+	updated, _ := s.Get(id)
+	return updated, nil
+}
+
 // Get returns a copy of the account with the given id.
 func (s *AccountStore) Get(id string) (StoredAccount, bool) {
 	s.mu.Lock()

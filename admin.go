@@ -44,6 +44,7 @@ func (s *Server) AdminHandler() http.Handler {
 	r.Get("/api/accounts/export", s.handleAccountExport)
 	r.Post("/api/accounts/import-bundle", s.handleAccountImportBundle)
 	r.Post("/api/accounts/refresh", s.handleAccountRefresh)
+	r.Post("/api/accounts/refresh-identity", s.handleAccountRefreshIdentity)
 	r.Get("/oauth/callback", s.handleLoginCallback)
 	return r
 }
@@ -419,6 +420,47 @@ func (s *Server) handleAccountRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "refreshed": refreshed, "total": len(ids), "results": results,
+	})
+}
+
+// handleAccountRefreshIdentity forces a fresh identity lookup (profileArn,
+// email, userId) for a single account and persists the result, so an admin can
+// correct stale identity shown on a card. Unlike handleAccountRefresh it does
+// not touch tokens beyond the refresh needed to reach the management endpoint.
+func (s *Server) handleAccountRefreshIdentity(w http.ResponseWriter, r *http.Request) {
+	if s.accounts == nil {
+		adminError(w, http.StatusServiceUnavailable, "account store is not configured")
+		return
+	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		adminError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	id := strings.TrimSpace(body.ID)
+	if id == "" {
+		adminError(w, http.StatusBadRequest, "id is required")
+		return
+	}
+	if _, ok := s.accounts.Get(id); !ok {
+		adminError(w, http.StatusNotFound, "account not found: "+id)
+		return
+	}
+	acct, err := s.accounts.RefreshIdentity(r.Context(), s.login.client, id)
+	if err != nil {
+		noteError(r.Context(), err.Error())
+		adminError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	// Email may have changed; drop the cached usage so it is re-fetched.
+	s.invalidateUsage(id)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":          true,
+		"profile_arn": acct.ProfileArn,
+		"user_id":     acct.UserID,
+		"email":       acct.Email,
 	})
 }
 

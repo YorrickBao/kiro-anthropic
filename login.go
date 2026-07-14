@@ -292,14 +292,9 @@ func (m *loginManager) completeLogin(ctx context.Context, state, code string) (*
 		acct.ProfileArn = arn
 	}
 	acct.Email = fetchAccountEmail(ctx, m.client, p.region, acct.ProfileArn, tok.AccessToken)
-	// Reject an account with no resolvable identity. Without profileArn or email,
-	// dedup cannot recognise it on a later re-import, so it would accumulate as a
-	// duplicate. Surface the failure so the caller can tell the user.
-	if acct.ProfileArn == "" && acct.Email == "" {
-		return nil, fmt.Errorf(
-			"could not resolve profileArn or email after sign-in; " +
-				"the management endpoint may be unreachable. Check network/proxy and retry")
-	}
+	// profileArn/email are best-effort here. If neither could be resolved the
+	// account is still usable: profileArn() in selector.go lazily resolves it at
+	// request time using a refreshed token, and persists it back to the store.
 	return acct, nil
 }
 
@@ -373,17 +368,9 @@ func importLocalCredentials(ctx context.Context, client *http.Client, tokenFile 
 	if accessToken != "" {
 		acct.Email = fetchAccountEmail(ctx, client, region, acct.ProfileArn, accessToken)
 	}
-	// Reject an account with no resolvable identity. Without profileArn or email,
-	// dedup cannot recognise it on the next import (all three dedup paths miss),
-	// so it would accumulate as a duplicate "imported" entry with blank fields.
-	// Surface the failure so the caller can tell the user rather than silently
-	// polluting the pool.
-	if acct.ProfileArn == "" && acct.Email == "" {
-		return nil, fmt.Errorf(
-			"could not resolve profileArn or email for the local Kiro account; " +
-				"the access token may be expired or the management endpoint unreachable. " +
-				"Re-login in the Kiro desktop app, then restart")
-	}
+	// profileArn/email are best-effort here. If neither could be resolved the
+	// account is still usable: profileArn() in selector.go lazily resolves it at
+	// request time using a refreshed token, and persists it back to the store.
 	return acct, nil
 }
 

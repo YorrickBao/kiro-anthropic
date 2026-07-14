@@ -183,20 +183,11 @@ func TestCompleteLoginMissingCode(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// TestCompleteLoginRejectsNoIdentity verifies that when the management endpoint
+// TestCompleteLoginAllowsEmptyIdentity verifies that when the management endpoint
 // is unreachable (returns non-2xx), both profileArn and email resolve to empty,
-// and completeLogin rejects the account instead of returning a blank entry that
-// dedup can never recognise.
-func TestCompleteLoginRejectsNoIdentity(t *testing.T) {
-	fake := newFakeOIDC(t)
-	m := newTestLoginManager(t, fake.srv.URL)
-	_, state, err := m.startLogin(context.Background(),
-		"https://org.awsapps.com/start", "us-east-1", "", "http://localhost/cb")
-	require.NoError(t, err)
-
-	// Override the management routes to return 403, simulating an unreachable
-	// or unauthorized management endpoint.
-	fake.srv.Close()
+// but completeLogin still returns the account. The account is usable: profileArn
+// is lazily resolved at request time and persisted back to the store.
+func TestCompleteLoginAllowsEmptyIdentity(t *testing.T) {
 	failingMux := http.NewServeMux()
 	failingMux.HandleFunc("/client/register", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -218,16 +209,18 @@ func TestCompleteLoginRejectsNoIdentity(t *testing.T) {
 	failingMux.HandleFunc("/getUsageLimits", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 	})
-	fake.srv = httptest.NewServer(failingMux)
-	// Rebuild the login manager with the new fake server URL.
-	m = newTestLoginManager(t, fake.srv.URL)
-	_, state, err = m.startLogin(context.Background(),
+	srv := httptest.NewServer(failingMux)
+	defer srv.Close()
+	m := newTestLoginManager(t, srv.URL)
+	_, state, err := m.startLogin(context.Background(),
 		"https://org.awsapps.com/start", "us-east-1", "", "http://localhost/cb")
 	require.NoError(t, err)
 
-	_, err = m.completeLogin(context.Background(), state, "auth-code-123")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "could not resolve profileArn or email")
+	acct, err := m.completeLogin(context.Background(), state, "auth-code-123")
+	require.NoError(t, err, "empty identity must not block sign-in")
+	assert.Empty(t, acct.ProfileArn)
+	assert.Empty(t, acct.Email)
+	assert.Equal(t, "test-access", acct.AccessToken, "credentials still present")
 }
 
 func TestLoginGCDropsExpired(t *testing.T) {

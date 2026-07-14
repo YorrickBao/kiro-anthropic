@@ -89,12 +89,11 @@ func TestImportLocalCredentialsMissingFile(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// TestImportLocalCredentialsRejectsNoIdentity reproduces the duplicate-account
-// bug: when the token file has no profileArn and the management endpoint is
-// unreachable (returning non-2xx), both profileArn and email resolve to empty.
-// The import must be rejected rather than creating a blank "imported" entry
-// that dedup can never recognise on the next import.
-func TestImportLocalCredentialsRejectsNoIdentity(t *testing.T) {
+// TestImportLocalCredentialsAllowsEmptyIdentity verifies that an import whose
+// profileArn and email both resolve to empty (management endpoint unreachable)
+// is still imported. The account is usable: profileArn() in selector.go lazily
+// resolves it at request time using a refreshed token and persists it back.
+func TestImportLocalCredentialsAllowsEmptyIdentity(t *testing.T) {
 	// Management endpoint returns 403 for every call.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
@@ -112,17 +111,20 @@ func TestImportLocalCredentialsRejectsNoIdentity(t *testing.T) {
 		"authMethod":   "IdC",
 		"provider":     "Enterprise",
 		"region":       "us-east-1",
-		// No profileArn — forces resolveProfileArn + fetchAccountEmail network calls.
-		"expiresAt":    "2030-01-01T00:00:00.000Z",
+		// No profileArn; expiresAt in the future so no refresh is attempted.
+		"expiresAt": "2030-01-01T00:00:00.000Z",
 	})
 	writeJSONFile(t, filepath.Join(dir, "hash123.json"), map[string]any{
 		"clientId":     "cid",
 		"clientSecret": "csecret",
 	})
 
-	_, err := importLocalCredentials(context.Background(), client, tokenFile)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "could not resolve profileArn or email")
+	acct, err := importLocalCredentials(context.Background(), client, tokenFile)
+	require.NoError(t, err, "empty identity must not block import")
+	assert.Empty(t, acct.ProfileArn)
+	assert.Empty(t, acct.Email)
+	assert.Equal(t, "ref", acct.RefreshToken, "credentials still present")
+	assert.Equal(t, "cid", acct.ClientID)
 }
 
 // TestImportLocalCredentialsRefreshesExpiredToken verifies that when the cached

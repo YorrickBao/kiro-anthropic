@@ -295,6 +295,27 @@ func (s *AccountStore) UpdateLabel(id, label string) error {
 	return s.saveLocked()
 }
 
+// UpdateIdentity persists the profileArn and/or email of an existing account.
+// Empty values are ignored so a partial resolution does not erase previously
+// stored identity. This is used by the lazy resolver in selector.go to write
+// back a profileArn/email resolved at request time, so it survives restarts and
+// is visible on the admin page. Returns an error if the id is unknown.
+func (s *AccountStore) UpdateIdentity(id, profileArn, email string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.accounts[id]
+	if !ok {
+		return fmt.Errorf("account %s not found", id)
+	}
+	if profileArn != "" {
+		a.ProfileArn = profileArn
+	}
+	if email != "" {
+		a.Email = email
+	}
+	return s.saveLocked()
+}
+
 // UpdateTokens updates the token fields of an existing account and persists the
 // store. It is a no-op error if the id is unknown. Only token/expiry fields are
 // touched; registration and identity fields are left intact.

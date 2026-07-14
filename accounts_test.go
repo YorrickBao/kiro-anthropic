@@ -145,6 +145,37 @@ func TestAccountStoreUpdateLabel(t *testing.T) {
 	assert.Error(t, s.UpdateLabel("missing", "x"))
 }
 
+func TestAccountStoreUpdateIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	s, err := NewAccountStore(path)
+	require.NoError(t, err)
+	require.NoError(t, s.Add(&StoredAccount{
+		ID: "id", ClientID: "cid", RefreshToken: "ref", CreatedAt: "1",
+		// profileArn and Email both empty — as if imported with network failure.
+	}))
+
+	// Backfill both fields.
+	require.NoError(t, s.UpdateIdentity("id", "arn:resolved", "user@example.com"))
+	got, _ := s.Get("id")
+	assert.Equal(t, "arn:resolved", got.ProfileArn)
+	assert.Equal(t, "user@example.com", got.Email)
+
+	// Partial update: empty values are ignored, not erased.
+	require.NoError(t, s.UpdateIdentity("id", "arn:new", ""))
+	got, _ = s.Get("id")
+	assert.Equal(t, "arn:new", got.ProfileArn)
+	assert.Equal(t, "user@example.com", got.Email, "email must not be erased by empty value")
+
+	// Persisted across reload.
+	s2, err := NewAccountStore(path)
+	require.NoError(t, err)
+	got2, _ := s2.Get("id")
+	assert.Equal(t, "arn:new", got2.ProfileArn)
+	assert.Equal(t, "user@example.com", got2.Email)
+
+	assert.Error(t, s.UpdateIdentity("missing", "arn", "e"))
+}
+
 func TestAccountStoreSetDisabled(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "accounts.json")
 	s, err := NewAccountStore(path)

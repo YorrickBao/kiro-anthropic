@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -327,11 +328,26 @@ func runServe(cfg *Config) error {
 		return err
 	case <-ctx.Done():
 	}
-	fmt.Println("\nshutting down...")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = httpServer.Shutdown(shutdownCtx)
-	_ = adminServer.Shutdown(shutdownCtx)
+	fmt.Println("\nshutting down... (draining in-flight requests; press Ctrl+C again to force quit)")
+
+	// Drain until all connections close on their own — no fixed deadline, so a
+	// long-lived stream is allowed to finish rather than being cut at 5s. A
+	// second SIGINT/SIGTERM cancels the wait and forces an immediate exit, which
+	// is the escape hatch when a stream never ends.
+	shutdownCtx, stopForce := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopForce()
+
+	// Shut both servers down concurrently; each Shutdown returns once its
+	// connections have drained (or shutdownCtx is cancelled by a second signal).
+	var wg sync.WaitGroup
+	for _, hs := range []*http.Server{httpServer, adminServer} {
+		wg.Add(1)
+		go func(hs *http.Server) {
+			defer wg.Done()
+			_ = hs.Shutdown(shutdownCtx)
+		}(hs)
+	}
+	wg.Wait()
 	return nil
 }
 

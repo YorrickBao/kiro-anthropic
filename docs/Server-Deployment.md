@@ -156,6 +156,8 @@ sudo -u kiro /usr/local/bin/kiro-anthropic upgrade --check
 sudo bash install.sh                  # 拉最新 release 重装
 ```
 
+> 想要**零中断升级**（新旧实例并存、切流量、排空长流后再退旧实例），见 [蓝绿切换升级](./blue-green.md)。
+
 ### 故障排查
 
 - **启动即退出，日志报 `--api-key is required`**：你把 `--host` 绑成了非回环地址却没给 key。要么改回 `127.0.0.1`（配合隧道），要么加 `--api-key`。

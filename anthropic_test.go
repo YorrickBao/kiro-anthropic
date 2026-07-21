@@ -476,11 +476,248 @@ func TestStripReasoningFromHistory(t *testing.T) {
 		{AssistantResponseMessage: &kiroAssistantMessage{Content: "a",
 			ReasoningContent: &kiroReasoningContent{ReasoningText: &kiroReasoningText{Text: "t", Signature: "s"}}}},
 	}}}
+	assert.True(t, hasReasoningInHistory(kreq), "reasoning should be detected")
 	assert.True(t, stripReasoningFromHistory(kreq), "should report stripped")
 	assert.Nil(t, kreq.ConversationState.History[1].AssistantResponseMessage.ReasoningContent,
 		"reasoningContent not stripped")
+	assert.False(t, hasReasoningInHistory(kreq), "stripped history should not report reasoning")
 	// nothing left to strip -> false
 	assert.False(t, stripReasoningFromHistory(kreq), "second strip should be false")
+}
+
+func TestTrimOldestCompleteTurnPlain(t *testing.T) {
+	req := &anthropicRequest{
+		System: json.RawMessage(`"keep system"`),
+		Messages: []anthropicMessage{
+			{Role: "user", Content: json.RawMessage(`"u1"`)},
+			{Role: "assistant", Content: json.RawMessage(`"a1"`)},
+			{Role: "user", Content: json.RawMessage(`"u2"`)},
+			{Role: "assistant", Content: json.RawMessage(`"a2"`)},
+			{Role: "user", Content: json.RawMessage(`"current"`)},
+		},
+	}
+
+	require.True(t, trimOldestCompleteTurn(req))
+	require.Len(t, req.Messages, 3, "only one turn should be removed")
+	assert.JSONEq(t, `"u2"`, string(req.Messages[0].Content))
+	assert.JSONEq(t, `"keep system"`, string(req.System), "system must be preserved")
+
+	require.True(t, trimOldestCompleteTurn(req))
+	require.Len(t, req.Messages, 1)
+	assert.JSONEq(t, `"current"`, string(req.Messages[0].Content))
+	assert.False(t, trimOldestCompleteTurn(req), "current message is not removable")
+}
+
+func TestTrimOldestCompleteToolChain(t *testing.T) {
+	req := &anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: json.RawMessage(`"research"`)},
+		{Role: "assistant", Content: json.RawMessage(`[
+			{"type":"tool_use","id":"t1","name":"one","input":{}},
+			{"type":"tool_use","id":"t2","name":"two","input":{}}
+		]`)},
+		{Role: "user", Content: json.RawMessage(`[
+			{"type":"tool_result","tool_use_id":"t2","content":"two"},
+			{"type":"tool_result","tool_use_id":"t1","content":"one"}
+		]`)},
+		{Role: "assistant", Content: json.RawMessage(`[
+			{"type":"text","text":"one more"},
+			{"type":"tool_use","id":"t3","name":"three","input":{}}
+		]`)},
+		{Role: "user", Content: json.RawMessage(`[
+			{"type":"tool_result","tool_use_id":"t3","content":"three"}
+		]`)},
+		{Role: "assistant", Content: json.RawMessage(`"done"`)},
+		{Role: "user", Content: json.RawMessage(`"current"`)},
+	}}
+
+	require.True(t, trimOldestCompleteTurn(req))
+	require.Len(t, req.Messages, 1, "the entire multi-step tool chain should be atomic")
+	assert.JSONEq(t, `"current"`, string(req.Messages[0].Content))
+}
+
+func TestTrimOldestCompleteTurnPreservesActiveToolChain(t *testing.T) {
+	active := []anthropicMessage{
+		{Role: "user", Content: json.RawMessage(`"run tool"`)},
+		{Role: "assistant", Content: json.RawMessage(`[
+			{"type":"tool_use","id":"active","name":"run","input":{}}
+		]`)},
+		{Role: "user", Content: json.RawMessage(`[
+			{"type":"tool_result","tool_use_id":"active","content":"result"}
+		]`)},
+	}
+
+	req := &anthropicRequest{Messages: append([]anthropicMessage(nil), active...)}
+	before := append([]anthropicMessage(nil), req.Messages...)
+	assert.False(t, trimOldestCompleteTurn(req), "a chain ending at the current tool result is still active")
+	assert.Equal(t, before, req.Messages)
+
+	req.Messages = append([]anthropicMessage{
+		{Role: "user", Content: json.RawMessage(`"old question"`)},
+		{Role: "assistant", Content: json.RawMessage(`"old answer"`)},
+	}, active...)
+	require.True(t, trimOldestCompleteTurn(req), "an older closed turn remains removable")
+	assert.Equal(t, active, req.Messages)
+	assert.False(t, trimOldestCompleteTurn(req), "the active chain must remain intact")
+}
+
+func TestTrimOldestCompleteTurnPreservesAssistantPrefill(t *testing.T) {
+	req := &anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: json.RawMessage(`"old"`)},
+		{Role: "assistant", Content: json.RawMessage(`"answer"`)},
+		{Role: "user", Content: json.RawMessage(`"continue with"`)},
+		{Role: "assistant", Content: json.RawMessage(`"prefill"`)},
+	}}
+
+	require.True(t, trimOldestCompleteTurn(req))
+	require.Len(t, req.Messages, 2)
+	assert.False(t, trimOldestCompleteTurn(req), "the final assistant-prefill unit must remain")
+}
+
+func TestTrimOldestCompleteTurnRejectsUnsafeHistory(t *testing.T) {
+	tests := map[string][]anthropicMessage{
+		"leading tool result": {
+			{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"t","content":"x"}]`)},
+			{Role: "assistant", Content: json.RawMessage(`"done"`)},
+			{Role: "user", Content: json.RawMessage(`"current"`)},
+		},
+		"missing tool result": {
+			{Role: "user", Content: json.RawMessage(`"q"`)},
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","id":"t","name":"f","input":{}}]`)},
+			{Role: "user", Content: json.RawMessage(`"not a result"`)},
+			{Role: "assistant", Content: json.RawMessage(`"done"`)},
+			{Role: "user", Content: json.RawMessage(`"current"`)},
+		},
+		"mismatched tool result": {
+			{Role: "user", Content: json.RawMessage(`"q"`)},
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","id":"t1","name":"f","input":{}}]`)},
+			{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"t2","content":"x"}]`)},
+			{Role: "assistant", Content: json.RawMessage(`"done"`)},
+			{Role: "user", Content: json.RawMessage(`"current"`)},
+		},
+		"duplicate tool use": {
+			{Role: "user", Content: json.RawMessage(`"q"`)},
+			{Role: "assistant", Content: json.RawMessage(`[
+				{"type":"tool_use","id":"t","name":"f","input":{}},
+				{"type":"tool_use","id":"t","name":"g","input":{}}
+			]`)},
+			{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"t","content":"x"}]`)},
+			{Role: "assistant", Content: json.RawMessage(`"done"`)},
+			{Role: "user", Content: json.RawMessage(`"current"`)},
+		},
+		"assistant boundary before active tool": {
+			{Role: "user", Content: json.RawMessage(`"q"`)},
+			{Role: "assistant", Content: json.RawMessage(`"partial"`)},
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","id":"t","name":"f","input":{}}]`)},
+			{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"t","content":"x"}]`)},
+		},
+		"assistant boundary before prefill": {
+			{Role: "user", Content: json.RawMessage(`"q"`)},
+			{Role: "assistant", Content: json.RawMessage(`"answer"`)},
+			{Role: "assistant", Content: json.RawMessage(`"prefill"`)},
+		},
+		"boundary leaves tool result": {
+			{Role: "user", Content: json.RawMessage(`"q"`)},
+			{Role: "assistant", Content: json.RawMessage(`"answer"`)},
+			{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"unknown","content":"x"}]`)},
+		},
+		"invalid role sequence": {
+			{Role: "assistant", Content: json.RawMessage(`"a"`)},
+			{Role: "user", Content: json.RawMessage(`"u"`)},
+			{Role: "assistant", Content: json.RawMessage(`"a2"`)},
+			{Role: "user", Content: json.RawMessage(`"current"`)},
+		},
+	}
+
+	for name, messages := range tests {
+		t.Run(name, func(t *testing.T) {
+			req := &anthropicRequest{Messages: append([]anthropicMessage(nil), messages...)}
+			before := append([]anthropicMessage(nil), req.Messages...)
+			assert.False(t, trimOldestCompleteTurn(req))
+			assert.Equal(t, before, req.Messages, "unsafe input must remain unchanged")
+		})
+	}
+}
+
+func TestTrimOldestCompleteTurnConsecutiveRoles(t *testing.T) {
+	// Split tool-use + text across consecutive assistant messages: trimmable.
+	t.Run("split tool use across assistant", func(t *testing.T) {
+		req := &anthropicRequest{Messages: []anthropicMessage{
+			{Role: "user", Content: json.RawMessage(`"old"`)},
+			{Role: "assistant", Content: json.RawMessage(`"text part"`)},
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","id":"t1","name":"f","input":{}}]`)},
+			{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"t1","content":"x"}]`)},
+			{Role: "assistant", Content: json.RawMessage(`"final"`)},
+			{Role: "user", Content: json.RawMessage(`"current"`)},
+		}}
+		require.True(t, trimOldestCompleteTurn(req), "old multi-message tool chain should be removable")
+		require.Len(t, req.Messages, 1)
+		assert.JSONEq(t, `"current"`, string(req.Messages[0].Content))
+	})
+
+	// Split user-text + tool_result across consecutive user messages: trimmable
+	// as one complete tool chain.
+	t.Run("split tool result across user", func(t *testing.T) {
+		req := &anthropicRequest{Messages: []anthropicMessage{
+			{Role: "user", Content: json.RawMessage(`"old"`)},
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","id":"t1","name":"f","input":{}}]`)},
+			{Role: "user", Content: json.RawMessage(`"extra context"`)},
+			{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"t1","content":"x"}]`)},
+			{Role: "assistant", Content: json.RawMessage(`"done"`)},
+			{Role: "user", Content: json.RawMessage(`"current"`)},
+		}}
+		require.True(t, trimOldestCompleteTurn(req))
+		require.Len(t, req.Messages, 1)
+		assert.JSONEq(t, `"current"`, string(req.Messages[0].Content))
+	})
+
+	// Consecutive assistant prefill: old closed turn can still be removed.
+	t.Run("consecutive assistant prefill", func(t *testing.T) {
+		req := &anthropicRequest{Messages: []anthropicMessage{
+			{Role: "user", Content: json.RawMessage(`"old"`)},
+			{Role: "assistant", Content: json.RawMessage(`"answer"`)},
+			{Role: "user", Content: json.RawMessage(`"continue"`)},
+			{Role: "assistant", Content: json.RawMessage(`"prefill part 1"`)},
+			{Role: "assistant", Content: json.RawMessage(`"prefill part 2"`)},
+		}}
+		require.True(t, trimOldestCompleteTurn(req), "old closed unit before consecutive prefill is removable")
+		assert.False(t, trimOldestCompleteTurn(req), "the prefill unit must remain")
+	})
+
+	// Duplicate tool-use ID across consecutive assistant messages: rejected.
+	t.Run("duplicate across consecutive assistant", func(t *testing.T) {
+		messages := []anthropicMessage{
+			{Role: "user", Content: json.RawMessage(`"q"`)},
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","id":"t","name":"f","input":{}}]`)},
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","id":"t","name":"g","input":{}}]`)},
+			{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"t","content":"x"}]`)},
+			{Role: "assistant", Content: json.RawMessage(`"done"`)},
+			{Role: "user", Content: json.RawMessage(`"current"`)},
+		}
+		req := &anthropicRequest{Messages: append([]anthropicMessage(nil), messages...)}
+		before := append([]anthropicMessage(nil), req.Messages...)
+		assert.False(t, trimOldestCompleteTurn(req))
+		assert.Equal(t, before, req.Messages)
+	})
+
+	// Two rounds with consecutive messages in the old round: one trim per call.
+	t.Run("two rounds with consecutive", func(t *testing.T) {
+		req := &anthropicRequest{Messages: []anthropicMessage{
+			{Role: "user", Content: json.RawMessage(`"round1"`)},
+			{Role: "assistant", Content: json.RawMessage(`"thinking"`)},
+			{Role: "assistant", Content: json.RawMessage(`"answer"`)},
+			{Role: "user", Content: json.RawMessage(`"round2"`)},
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","id":"t1","name":"f","input":{}}]`)},
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","id":"t2","name":"g","input":{}}]`)},
+			{Role: "user", Content: json.RawMessage(`"note"`)},
+			{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"t1","content":"x"},{"type":"tool_result","tool_use_id":"t2","content":"y"}]`)},
+			{Role: "assistant", Content: json.RawMessage(`"final"`)},
+			{Role: "user", Content: json.RawMessage(`"current"`)},
+		}}
+		require.True(t, trimOldestCompleteTurn(req), "first round removable")
+		assert.Len(t, req.Messages, 7, "first round: user+2*assistant removed")
+		require.True(t, trimOldestCompleteTurn(req), "second round (tool chain) also removable")
+		assert.Len(t, req.Messages, 1)
+	})
 }
 
 // --- tool-call marker leak fix (strip-only) ---

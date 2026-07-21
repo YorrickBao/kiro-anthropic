@@ -471,6 +471,161 @@ func stripReasoningFromHistory(kreq *kiroRequest) bool {
 	return stripped
 }
 
+// hasReasoningInHistory reports whether any assistant history turn carries
+// reasoning content. It lets request recovery preserve a prior signature fix
+// when a trimmed Anthropic request is translated again.
+func hasReasoningInHistory(kreq *kiroRequest) bool {
+	for i := range kreq.ConversationState.History {
+		am := kreq.ConversationState.History[i].AssistantResponseMessage
+		if am != nil && am.ReasoningContent != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// trimOldestCompleteTurn removes the oldest closed conversation unit while
+// preserving the current turn. A tool-calling unit includes every
+// assistant(tool_use) -> user(tool_result) exchange through the first terminal
+// assistant response. Malformed or still-active chains are left untouched.
+func trimOldestCompleteTurn(areq *anthropicRequest) bool {
+	end, ok := oldestCompleteTurnEnd(areq.Messages)
+	if !ok {
+		return false
+	}
+	areq.Messages = areq.Messages[end:]
+	return true
+}
+
+// oldestCompleteTurnEnd returns the exclusive end of the oldest removable
+// conversation unit. At least one later message must remain so an assistant
+// prefill or the current user turn is never discarded. Consecutive same-role
+// messages (allowed by the Anthropic API) are treated as a single logical turn.
+func oldestCompleteTurnEnd(messages []anthropicMessage) (int, bool) {
+	if len(messages) < 3 {
+		return 0, false
+	}
+
+	end, uses, results, ok := logicalTurnEnd(messages, 0)
+	if !ok || messages[0].Role != "user" || len(uses) != 0 || len(results) != 0 {
+		// A leading tool result belongs to a tool use outside the removable
+		// history, so its chain cannot be proven closed.
+		return 0, false
+	}
+
+	for i := end; ; {
+		if i >= len(messages) {
+			return 0, false
+		}
+		end, uses, results, ok = logicalTurnEnd(messages, i)
+		if !ok || messages[i].Role != "assistant" || len(results) != 0 {
+			return 0, false
+		}
+		i = end
+
+		if len(uses) == 0 {
+			// Terminal assistant with no tool calls. The next turn must be
+			// a fresh user turn (no tool results) that begins a new unit.
+			if i >= len(messages) {
+				return 0, false
+			}
+			_, nextUses, nextResults, valid := logicalTurnEnd(messages, i)
+			if !valid || messages[i].Role != "user" || len(nextUses) != 0 || len(nextResults) != 0 {
+				return 0, false
+			}
+			return i, true
+		}
+
+		// Assistant has tool use(s). The next turn must be a user with
+		// matching tool results.
+		if i >= len(messages) {
+			return 0, false
+		}
+		end, resultUses, toolResults, valid := logicalTurnEnd(messages, i)
+		if !valid || messages[i].Role != "user" || len(resultUses) != 0 || !sameToolIDs(uses, toolResults) {
+			return 0, false
+		}
+		i = end
+	}
+}
+
+// logicalTurnEnd scans consecutive same-role messages starting at start,
+// returning the exclusive end index and the union of all tool_use / tool_result
+// IDs across the merged turn. Empty or duplicate IDs make the turn invalid.
+func logicalTurnEnd(messages []anthropicMessage, start int) (end int, uses, results map[string]struct{}, valid bool) {
+	if start >= len(messages) {
+		return start, nil, nil, true
+	}
+	role := messages[start].Role
+	uses = make(map[string]struct{})
+	results = make(map[string]struct{})
+	for i := start; i < len(messages); i++ {
+		if messages[i].Role != role {
+			return i, uses, results, true
+		}
+		u, r, ok := messageToolIDs(messages[i])
+		if !ok {
+			return 0, nil, nil, false
+		}
+		for id := range u {
+			if _, exists := uses[id]; exists {
+				return 0, nil, nil, false // duplicate across merged messages
+			}
+			uses[id] = struct{}{}
+		}
+		for id := range r {
+			if _, exists := results[id]; exists {
+				return 0, nil, nil, false
+			}
+			results[id] = struct{}{}
+		}
+	}
+	return len(messages), uses, results, true
+}
+
+// messageToolIDs extracts and validates tool IDs from one message. Duplicate or
+// empty IDs make the message unsafe to use as a trimming boundary.
+func messageToolIDs(message anthropicMessage) (uses, results map[string]struct{}, valid bool) {
+	blocks, err := parseContentBlocks(message.Content)
+	if err != nil {
+		return nil, nil, false
+	}
+	uses = make(map[string]struct{})
+	results = make(map[string]struct{})
+	for _, block := range blocks {
+		var id string
+		var ids map[string]struct{}
+		switch block.Type {
+		case "tool_use":
+			id, ids = block.ID, uses
+		case "tool_result":
+			id, ids = block.ToolUseID, results
+		default:
+			continue
+		}
+		if id == "" {
+			return nil, nil, false
+		}
+		if _, exists := ids[id]; exists {
+			return nil, nil, false
+		}
+		ids[id] = struct{}{}
+	}
+	return uses, results, true
+}
+
+func sameToolIDs(want, got map[string]struct{}) bool {
+	if len(want) != len(got) {
+		return false
+	}
+	for id := range want {
+		if _, ok := got[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // sanitizeHistory drops leading assistant turns and collapses so history begins
 // with a user turn, which the CodeWhisperer API expects.
 func sanitizeHistory(history []kiroMessage) []kiroMessage {

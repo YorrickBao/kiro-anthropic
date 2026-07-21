@@ -101,7 +101,7 @@ func TestOpenStreamFailsOverToHealthyAccount(t *testing.T) {
 	s := serverWithPool(t, rt, "good1", "good2")
 
 	kreq := &kiroRequest{}
-	stream, err := s.openStream(context.Background(), kreq)
+	stream, err := s.openStream(context.Background(), kreq, nil)
 	require.NoError(t, err, "should fail over to the healthy account")
 	require.NotNil(t, stream)
 	stream.Close()
@@ -115,7 +115,7 @@ func TestOpenStreamAllAccountsFail(t *testing.T) {
 	rt := newFakeRuntime(t, "Bearer a", "Bearer b")
 	s := serverWithPool(t, rt, "a", "b")
 
-	_, err := s.openStream(context.Background(), &kiroRequest{})
+	_, err := s.openStream(context.Background(), &kiroRequest{}, nil)
 	require.Error(t, err, "no healthy account -> error surfaces")
 	he, ok := err.(*kiroHTTPError)
 	require.True(t, ok)
@@ -134,7 +134,7 @@ func TestOpenStreamFailsOverOnFirstFrameException(t *testing.T) {
 	rt.bodies["Bearer good"] = contentFrame("hi")
 	s := serverWithPool(t, rt, "bad", "good")
 
-	stream, err := s.openStream(context.Background(), &kiroRequest{})
+	stream, err := s.openStream(context.Background(), &kiroRequest{}, nil)
 	require.NoError(t, err, "first-frame exception should fail over to healthy account")
 	require.NotNil(t, stream)
 	defer stream.Close()
@@ -158,7 +158,7 @@ func TestOpenStreamAllFirstFrameExceptions(t *testing.T) {
 	rt.bodies["Bearer b"] = body
 	s := serverWithPool(t, rt, "a", "b")
 
-	_, err := s.openStream(context.Background(), &kiroRequest{})
+	_, err := s.openStream(context.Background(), &kiroRequest{}, nil)
 	require.Error(t, err)
 	he, ok := err.(*kiroHTTPError)
 	require.True(t, ok, "want kiroHTTPError, got %T", err)
@@ -172,7 +172,7 @@ func TestDispatchFairnessTwoAccounts(t *testing.T) {
 	s := serverWithPool(t, rt, "a", "b")
 
 	for i := 0; i < 6; i++ {
-		stream, err := s.openStream(context.Background(), &kiroRequest{})
+		stream, err := s.openStream(context.Background(), &kiroRequest{}, nil)
 		require.NoError(t, err)
 		stream.Close()
 	}
@@ -187,7 +187,7 @@ func TestDispatchFairnessTwoAccounts(t *testing.T) {
 func TestOpenStreamEmptyPool(t *testing.T) {
 	rt := newFakeRuntime(t)
 	s := serverWithPool(t, rt) // no accounts
-	_, err := s.openStream(context.Background(), &kiroRequest{})
+	_, err := s.openStream(context.Background(), &kiroRequest{}, nil)
 	require.ErrorIs(t, err, errNoAccount)
 }
 
@@ -202,7 +202,7 @@ func TestOpenStreamRequestErrorDoesNotBurnAccounts(t *testing.T) {
 	t.Cleanup(rt.srv.Close)
 	s := serverWithPool(t, rt, "a", "b", "c")
 
-	_, err := s.openStream(context.Background(), &kiroRequest{})
+	_, err := s.openStream(context.Background(), &kiroRequest{}, nil)
 	require.Error(t, err)
 	assert.Len(t, rt.seen, 1, "a 400 should not try further accounts")
 }

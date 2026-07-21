@@ -565,7 +565,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	// Open the upstream stream, dispatching across accounts with pre-stream
 	// failover. Once streaming begins (headers sent) no further retry is possible.
-	stream, err := s.openStream(r.Context(), kreq)
+	stream, err := s.openStream(r.Context(), kreq, &areq)
 	if err != nil {
 		if errors.Is(err, errNoAccount) {
 			writeAnthropicError(w, r, http.StatusServiceUnavailable, "api_error", err.Error())
@@ -593,24 +593,31 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 // giving up, bounding worst-case latency when many accounts are unhealthy.
 const maxAccountAttempts = 8
 
+// maxPromptTooLongRetries caps request-level recovery. The initial send is not
+// counted, so a request can make at most six context-size attempts.
+const maxPromptTooLongRetries = 5
+
 // errNoAccount is returned when the account pool is empty. It maps to a 503 so
-// the caller knows to sign in or import an account via the admin page.
+// the caller knows to sign in or import one via the admin page.
 var errNoAccount = fmt.Errorf("no account available; sign in or import one via the admin page")
 
 // openStream opens the upstream stream, dispatching across stored accounts with
 // pre-stream failover. The per-account profileArn is set on kreq before each
 // attempt. An empty pool returns errNoAccount (mapped to 503).
 //
-// Failover happens only before streaming begins: an account failure (auth,
-// quota, 5xx, transport) moves on to the next account, while a request-level
-// error (e.g. a 400 that is not a thinking-signature issue) surfaces at once.
-func (s *Server) openStream(ctx context.Context, kreq *kiroRequest) (*kiroStream, error) {
+// A prompt-too-long rejection removes one oldest closed conversation unit and
+// retries on the same account, up to maxPromptTooLongRetries. Other request-level
+// errors surface at once; account failures continue through the pool.
+func (s *Server) openStream(ctx context.Context, kreq *kiroRequest, areq *anthropicRequest) (*kiroStream, error) {
 	if s.selector == nil || len(s.accounts.List()) == 0 {
 		return nil, errNoAccount
 	}
 
 	tried := map[string]bool{}
 	var lastErr error
+	promptTooLongRetries := 0
+	reasoningStripped := false
+
 	for attempt := 0; attempt < maxAccountAttempts; attempt++ {
 		creds, ok := s.selector.pick(tried)
 		if !ok {
@@ -620,38 +627,76 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest) (*kiroStream
 
 		arn, err := creds.profileArn(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			lastErr = err
 			s.selector.recordFailure(creds.id)
 			continue
 		}
 		kreq.ProfileArn = arn
 
-		stream, err := s.sendWithReasoningRetry(ctx, creds, kreq)
-		if err == nil {
-			// Peek the first frame before committing. Some upstream failures
-			// arrive after a 200 as the very first event (e.g. a generic
-			// "unexpected error, please try again"). Since no content has been
-			// produced yet, we can still fail over to another account instead of
-			// surfacing it mid-stream.
-			if perr := firstFrameFailure(stream); perr != nil {
+		for {
+			hadReasoning := hasReasoningInHistory(kreq)
+			stream, sendErr := s.sendWithReasoningRetry(ctx, creds, kreq)
+			if hadReasoning && !hasReasoningInHistory(kreq) {
+				reasoningStripped = true
+			}
+
+			if sendErr == nil {
+				// Peek the first frame before committing. Some upstream failures
+				// arrive after a 200 as the very first event, while successful peeks
+				// are replayed by the first Recv call.
+				perr := firstFrameFailure(stream)
+				if perr == nil {
+					s.selector.recordSuccess(creds.id)
+					return stream, nil
+				}
 				stream.Close()
-				lastErr = perr
+				sendErr = perr
 				if ctx.Err() != nil {
 					// Client went away while peeking: stop, don't burn accounts.
 					return nil, perr
 				}
-				s.selector.recordFailure(creds.id)
+			}
+			lastErr = sendErr
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+
+			if isPromptTooLongError(sendErr) {
+				if areq == nil || promptTooLongRetries >= maxPromptTooLongRetries || !trimOldestCompleteTurn(areq) {
+					return nil, sendErr
+				}
+
+				next, buildErr := buildKiroRequest(s.cfg, areq)
+				if buildErr != nil {
+					return nil, fmt.Errorf("rebuild trimmed request: %w", buildErr)
+				}
+				// These fields depend on the model request, not its history. Reuse
+				// the already-resolved settings instead of repeating a model lookup.
+				next.AdditionalModelRequestFields = kreq.AdditionalModelRequestFields
+				next.ProfileArn = arn
+				if reasoningStripped {
+					stripReasoningFromHistory(next)
+				}
+				kreq = next
+				promptTooLongRetries++
 				continue
 			}
-			s.selector.recordSuccess(creds.id)
-			return stream, nil
+
+			if isThinkingSignatureError(sendErr) && !reasoningStripped && stripReasoningFromHistory(kreq) {
+				reasoningStripped = true
+				continue
+			}
+
+			if !isAccountFailure(sendErr) {
+				// A problem with the request itself: don't burn other accounts.
+				return nil, sendErr
+			}
+			s.selector.recordFailure(creds.id)
+			break
 		}
-		lastErr = err
-		if !isAccountFailure(err) {
-			// A problem with the request itself: don't burn other accounts.
-			return nil, err
-		}
-		s.selector.recordFailure(creds.id)
 	}
 	if lastErr == nil {
 		lastErr = errNoAccount
@@ -668,7 +713,8 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest) (*kiroStream
 //   - a transport error (other than a clean io.EOF) reading that first frame.
 //
 // A clean io.EOF is an empty-but-valid stream and passes through unchanged.
-// Failures are wrapped so isAccountFailure treats them as account failures.
+// ValidationException (including THINKING_SIGNATURE_INVALID, PROMPT_TOO_LONG) is
+// a request-level error; other exceptions remain account failures.
 func firstFrameFailure(stream *kiroStream) error {
 	ev, err := stream.peekFirst()
 	if err != nil {
@@ -678,7 +724,11 @@ func firstFrameFailure(stream *kiroStream) error {
 		return fmt.Errorf("upstream stream failed before any content: %w", err)
 	}
 	if ev != nil && ev.Kind == evError {
-		return &kiroHTTPError{Status: http.StatusBadGateway, Body: upstreamEventError(ev)}
+		status := http.StatusBadGateway
+		if ev.ErrKind == "ValidationException" {
+			status = http.StatusBadRequest
+		}
+		return &kiroHTTPError{Status: status, Body: upstreamEventError(ev), ReasonCode: ev.ErrReason}
 	}
 	return nil
 }
@@ -713,6 +763,14 @@ func withReasoningRetry(kreq *kiroRequest, send func(*kiroRequest) (*kiroStream,
 		return send(kreq)
 	}
 	return nil, err
+}
+
+// isPromptTooLongError reports an exact machine-coded context-size rejection.
+// Text matching is intentionally avoided so unrelated validation errors cannot
+// silently discard conversation history.
+func isPromptTooLongError(err error) bool {
+	he, ok := err.(*kiroHTTPError)
+	return ok && he.Status == http.StatusBadRequest && he.reason() == "PROMPT_TOO_LONG"
 }
 
 // isThinkingSignatureError reports whether err is a request-validation failure

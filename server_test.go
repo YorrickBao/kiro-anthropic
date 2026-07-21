@@ -277,3 +277,28 @@ func TestIsThinkingSignatureError(t *testing.T) {
 	assert.False(t, isThinkingSignatureError(context.Canceled),
 		"non-http error should not match")
 }
+
+func TestIsPromptTooLongError(t *testing.T) {
+	assert.True(t, isPromptTooLongError(&kiroHTTPError{
+		Status: http.StatusBadRequest,
+		Body:   `{"message":"too long","reason":"PROMPT_TOO_LONG"}`,
+	}), "HTTP body reason should match")
+	assert.True(t, isPromptTooLongError(&kiroHTTPError{
+		Status:     http.StatusBadRequest,
+		Body:       "prompt exceeds context",
+		ReasonCode: "PROMPT_TOO_LONG",
+	}), "explicit event reason should match")
+	assert.False(t, isPromptTooLongError(&kiroHTTPError{
+		Status: http.StatusBadRequest,
+		Body:   `{"reason":"OTHER_VALIDATION_ERROR"}`,
+	}), "other validation errors must not trim history")
+	assert.False(t, isPromptTooLongError(&kiroHTTPError{
+		Status: http.StatusBadRequest,
+		Body:   "prompt too long",
+	}), "human-readable text alone must not match")
+	assert.False(t, isPromptTooLongError(&kiroHTTPError{
+		Status:     http.StatusBadGateway,
+		ReasonCode: "PROMPT_TOO_LONG",
+	}), "only request-level 400 errors should match")
+	assert.False(t, isPromptTooLongError(context.Canceled))
+}

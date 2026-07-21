@@ -152,6 +152,10 @@ func TestExtractMessageAndReason(t *testing.T) {
 func TestKiroHTTPErrorReason(t *testing.T) {
 	e := &kiroHTTPError{Status: 400, Body: `{"message":"m","reason":"THINKING_SIGNATURE_INVALID"}`}
 	assert.Equal(t, "THINKING_SIGNATURE_INVALID", e.reason())
+	assert.Equal(t, "PROMPT_TOO_LONG", (&kiroHTTPError{
+		Body:       `{"reason":"OTHER"}`,
+		ReasonCode: "PROMPT_TOO_LONG",
+	}).reason(), "explicit stream reason should take precedence")
 	assert.Empty(t, (&kiroHTTPError{Body: "not json"}).reason(), "non-json reason should be empty")
 }
 

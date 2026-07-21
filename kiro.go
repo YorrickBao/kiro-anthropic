@@ -291,10 +291,16 @@ func (s *kiroStream) recvRaw() (*kiroEvent, error) {
 	return parseKiroMessage(msg), nil
 }
 
+// Close releases the underlying response body. It closes directly rather than
+// draining first: closing a still-streaming event-stream early, draining to EOF
+// could block until the server sends more bytes. The cost is that this HTTP/1.1
+// connection is not reused, an acceptable trade for not stalling failover and
+// context-size retries, which close a stream before it completes.
 func (s *kiroStream) Close() error {
 	if s.resp != nil && s.resp.Body != nil {
-		_, _ = io.Copy(io.Discard, io.LimitReader(s.resp.Body, 4096))
-		return s.resp.Body.Close()
+		if err := s.resp.Body.Close(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -413,6 +419,9 @@ func extractMessageAndReason(payload []byte) (message, reason string) {
 // body (a ValidationException is {"message":...,"reason":...}). Returns "" when
 // the body is not JSON or carries no reason.
 func (e *kiroHTTPError) reason() string {
+	if e.ReasonCode != "" {
+		return e.ReasonCode
+	}
 	var p struct {
 		Reason string `json:"reason"`
 	}
@@ -422,10 +431,11 @@ func (e *kiroHTTPError) reason() string {
 	return ""
 }
 
-// kiroHTTPError carries a non-2xx runtime response.
+// kiroHTTPError carries a non-2xx runtime response or a pre-stream exception.
 type kiroHTTPError struct {
-	Status int
-	Body   string
+	Status     int
+	Body       string
+	ReasonCode string
 }
 
 func (e *kiroHTTPError) Error() string {

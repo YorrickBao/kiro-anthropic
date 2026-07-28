@@ -310,28 +310,35 @@ func modelInfoJSON(m kiroModelInfo, now string) map[string]any {
 }
 
 // ensureModels fetches one account's model list, caching it per-account for
-// modelsCacheTTL. A failed fetch is not cached (it retries next call).
-func (s *Server) ensureModels(ctx context.Context, creds *accountCreds) []kiroModelInfo {
+// modelsCacheTTL. A failed fetch is not cached (it retries next call) and its
+// error is returned so per-account callers (modelsByAccount) can surface the
+// real upstream cause; "any models" callers (anyModels) ignore it.
+func (s *Server) ensureModels(ctx context.Context, creds *accountCreds) ([]kiroModelInfo, error) {
 	s.modelsMu.Lock()
 	if e, ok := s.modelsCache[creds.id]; ok && time.Since(e.fetched) < modelsCacheTTL {
 		s.modelsMu.Unlock()
-		return e.models
+		return e.models, nil
 	}
 	s.modelsMu.Unlock()
 
 	models, err := s.kiro.ListModels(ctx, creds)
-	if err != nil || len(models) == 0 {
-		return nil
+	if err != nil {
+		return nil, err
+	}
+	if len(models) == 0 {
+		return nil, fmt.Errorf("upstream returned no models")
 	}
 	s.modelsMu.Lock()
 	s.modelsCache[creds.id] = modelsCacheEntry{models: models, fetched: time.Now()}
 	s.modelsMu.Unlock()
-	return models
+	return models, nil
 }
 
 // anyModels returns the model list from any one account (model schemas are the
 // same across accounts on the same backend). Returns nil when the pool is empty
-// or no account can list models.
+// or no account can list models; the fetch error is deliberately ignored here
+// since the caller (the global model list / /v1/models fallback) degrades to the
+// static fallbackModels rather than surfacing per-account failures.
 func (s *Server) anyModels(ctx context.Context) []kiroModelInfo {
 	if s.selector == nil {
 		return nil
@@ -340,7 +347,30 @@ func (s *Server) anyModels(ctx context.Context) []kiroModelInfo {
 	if !ok {
 		return nil
 	}
-	return s.ensureModels(ctx, creds)
+	models, _ := s.ensureModels(ctx, creds)
+	return models
+}
+
+// modelsByAccount fetches the model list using one specific account's
+// credentials, bypassing the pool's "pick any" logic so the result reflects that
+// account's own tier/entitlement. It refreshes the token and resolves the
+// profileArn lazily via ensureModels/ListModels, so it works even for an account
+// that the pool would otherwise skip (disabled, cooling down, missing profile).
+// Unlike anyModels, the upstream error is surfaced so the admin can see why a
+// given account lists no models (expired token, 403, region mismatch, ...).
+func (s *Server) modelsByAccount(ctx context.Context, id string) ([]kiroModelInfo, error) {
+	if s.selector == nil {
+		return nil, fmt.Errorf("account store is not configured")
+	}
+	creds, ok := s.selector.byID(id)
+	if !ok {
+		return nil, fmt.Errorf("account not found: %s", id)
+	}
+	models, err := s.ensureModels(ctx, creds)
+	if err != nil {
+		return nil, fmt.Errorf("list models for account %s: %w", id, err)
+	}
+	return models, nil
 }
 
 // ensureUsage returns one account's usage, fetching it at most once per

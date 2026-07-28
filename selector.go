@@ -266,6 +266,19 @@ func (s *accountSelector) peekAny() (*accountCreds, bool) {
 	return nil, false
 }
 
+// byID returns credentials for one specific account by id, regardless of its
+// usability/cooldown state — used by per-account control-plane calls that the
+// admin explicitly targets (e.g. "show models for THIS account's card"). ok is
+// false when the id is unknown.
+func (s *accountSelector) byID(id string) (*accountCreds, bool) {
+	for _, a := range s.store.List() {
+		if a.ID == id {
+			return s.credsFor(a), true
+		}
+	}
+	return nil, false
+}
+
 // listAll returns credentials for every stored account, for per-account
 // control-plane calls (e.g. rendering usage for each account on the admin page).
 func (s *accountSelector) listAll() []*accountCreds {

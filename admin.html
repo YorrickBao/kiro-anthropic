@@ -209,7 +209,6 @@ const fmtCtx = (n) => {
 };
 const fmtDate = (s) => { if (!s) return "—"; const d = new Date(s); return isNaN(d) ? esc(s) : d.toLocaleString(); };
 
-let latestModels = [];
 let lastUpdateCheck = 0;
 let loaded = false; // whether the first status poll has completed successfully
 
@@ -377,7 +376,7 @@ function renderAccounts(accounts) {
       </label>
       <span style="flex:1"></span>
       <span class="acct-btns">
-        <button class="ghost" data-models type="button">模型</button>
+        <button class="ghost" data-models="${esc(a.id)}" type="button">模型</button>
         <button class="ghost" data-refresh="${esc(a.id)}" type="button">刷新令牌</button>
         <button class="ghost" data-refresh-id="${esc(a.id)}" type="button">刷新身份</button>
         <button class="danger" data-del="${esc(a.id)}" type="button">删除</button>
@@ -386,20 +385,51 @@ function renderAccounts(accounts) {
   </div>`).join("");
   el.querySelectorAll("button[data-del]").forEach(b => b.addEventListener("click", () => deleteAccount(b.dataset.del)));
   el.querySelectorAll("button[data-edit]").forEach(b => b.addEventListener("click", () => editLabel(b.dataset.edit, b.dataset.label)));
-  el.querySelectorAll("button[data-models]").forEach(b => b.addEventListener("click", openModels));
+  el.querySelectorAll("button[data-models]").forEach(b => b.addEventListener("click", () => openModels(b.dataset.models, b)));
   el.querySelectorAll("button[data-refresh]").forEach(b => b.addEventListener("click", () => refreshAccount(b.dataset.refresh, b)));
   el.querySelectorAll("button[data-refresh-id]").forEach(b => b.addEventListener("click", () => refreshIdentity(b.dataset.refreshId, b)));
   el.querySelectorAll("input[data-toggle]").forEach(b => b.addEventListener("change", () => toggleAccount(b.dataset.toggle, b.checked, b)));
 }
 
-function openModels() {
+// openModels fetches and renders the model list for ONE account, using that
+// account's own credentials (POST /api/accounts/models). It does NOT reuse the
+// global model list from the status poll, since accounts may differ by
+// tier/region/entitlement and the button must reflect the clicked card.
+async function openModels(id, btn) {
+  if (!id) return;
   const body = $("models-body");
-  if (!latestModels || !latestModels.length) {
-    body.innerHTML = '<span class="muted">无模型信息。</span>';
-  } else {
-    const hasDetail = latestModels.some(m => m.description || (m.supported_input_types && m.supported_input_types.length) || (m.prompt_caching && m.prompt_caching.supported));
-    const hasStatus = latestModels.some(m => m.status);
-    const rows = latestModels.map((m, i) => {
+  const orig = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "加载中…"; }
+  body.innerHTML = '<span class="muted">正在用该账号拉取模型列表…</span>';
+  $("models-modal").classList.add("open");
+  let models = [];
+  try {
+    const res = await fetch("/api/accounts/models", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id })
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error((d.error && d.error.message) || ("HTTP " + res.status));
+    models = d.models || [];
+  } catch (e) {
+    body.innerHTML = `<span class="err-box">拉取失败：${esc(e.message)}</span>`;
+    return;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = orig; }
+  }
+  if (!models.length) {
+    body.innerHTML = '<span class="muted">该账号无可用模型。</span>';
+    return;
+  }
+  renderModels(models, body);
+}
+
+// renderModels renders a model list (as returned by the API, in modelInfoJSON
+// shape) into the models modal body. Extracted from openModels so the rendering
+// logic stays independent of how the list was obtained.
+function renderModels(models, body) {
+  const hasDetail = models.some(m => m.description || (m.supported_input_types && m.supported_input_types.length) || (m.prompt_caching && m.prompt_caching.supported));
+  const hasStatus = models.some(m => m.status);
+  const rows = models.map((m, i) => {
       const eff = m.capabilities && m.capabilities.effort;
       let effTxt = "—";
       if (eff && eff.supported) effTxt = ["low","medium","high","xhigh","max"].filter(l => eff[l]).join(" / ") || "yes";
@@ -441,8 +471,6 @@ function openModels() {
       const c = r.querySelector(".caret");
       if (d.style.display === "none") { d.style.display = ""; c.textContent = "▼"; } else { d.style.display = "none"; c.textContent = "▶"; }
     }));
-  }
-  $("models-modal").classList.add("open");
 }
 
 async function copyText(s, btn) {
@@ -657,7 +685,6 @@ async function tick() {
     $("ver").textContent = d.version
       ? (d.version.startsWith("v") ? d.version : "v" + d.version)
       : "";
-    latestModels = d.models || [];
     renderAccounts(d.accounts);
     $("updated").textContent = "更新于 " + new Date().toLocaleTimeString();
     loaded = true;

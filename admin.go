@@ -45,6 +45,7 @@ func (s *Server) AdminHandler() http.Handler {
 	r.Post("/api/accounts/import-bundle", s.handleAccountImportBundle)
 	r.Post("/api/accounts/refresh", s.handleAccountRefresh)
 	r.Post("/api/accounts/refresh-identity", s.handleAccountRefreshIdentity)
+	r.Post("/api/accounts/models", s.handleAccountModels)
 	r.Get("/oauth/callback", s.handleLoginCallback)
 	return r
 }
@@ -465,6 +466,48 @@ func (s *Server) handleAccountRefreshIdentity(w http.ResponseWriter, r *http.Req
 		"user_id":     acct.UserID,
 		"email":       acct.Email,
 	})
+}
+
+// handleAccountModels lists the models available to ONE specific account, using
+// that account's own credentials. This differs from the global /api/status.json
+// "models" field (which is fetched via "any one" pooled account): accounts may
+// differ by tier/region/entitlement, so the card's "models" button must reflect
+// the account it was clicked on. Per accountUsable we do NOT gate here — even a
+// disabled account is queryable when it carries credentials, since the admin
+// explicitly asked for it.
+func (s *Server) handleAccountModels(w http.ResponseWriter, r *http.Request) {
+	if s.accounts == nil {
+		adminError(w, http.StatusServiceUnavailable, "account store is not configured")
+		return
+	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		adminError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	id := strings.TrimSpace(body.ID)
+	if id == "" {
+		adminError(w, http.StatusBadRequest, "id is required")
+		return
+	}
+	if _, ok := s.accounts.Get(id); !ok {
+		adminError(w, http.StatusNotFound, "account not found: "+id)
+		return
+	}
+	models, err := s.modelsByAccount(r.Context(), id)
+	if err != nil {
+		noteError(r.Context(), err.Error())
+		adminError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	ts := time.Now().UTC().Format(time.RFC3339)
+	out := make([]map[string]any, 0, len(models))
+	for _, m := range models {
+		out = append(out, modelInfoJSON(m, ts))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "models": out})
 }
 
 // handleAccountLabel updates the note (label) of a stored account.

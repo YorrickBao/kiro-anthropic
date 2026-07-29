@@ -168,7 +168,7 @@ func (m *loginManager) startLogin(ctx context.Context, startURL, region, label, 
 	base := oidcBase(region)
 	var reg registerClientResp
 	err = m.postJSON(ctx, base+"/client/register", map[string]any{
-		"clientName":   "Kiro CLI",
+		"clientName":   "Kiro IDE",
 		"clientType":   "public",
 		"scopes":       kiroOIDCScopes,
 		"grantTypes":   []string{"authorization_code", "refresh_token"},

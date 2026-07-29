@@ -198,23 +198,45 @@ func TestIsDisallowedIP(t *testing.T) {
 	}
 }
 
-func TestResolveRemoteImagesRewritesURLToBase64(t *testing.T) {
+func mustBlocks(t *testing.T, blocks []anthropicContentBlock) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(blocks)
+	if err != nil {
+		t.Fatalf("marshal blocks: %v", err)
+	}
+	return raw
+}
+
+// contentImageCount parses a message content and counts image blocks.
+func contentImageCount(t *testing.T, raw json.RawMessage) int {
+	t.Helper()
+	blocks, err := parseContentBlocks(raw)
+	if err != nil {
+		t.Fatalf("parse content: %v", err)
+	}
+	n := 0
+	for _, b := range blocks {
+		if b.Type == "image" {
+			n++
+		}
+	}
+	return n
+}
+
+func TestProcessImagesInlinesCurrentTurnURL(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		_, _ = w.Write(onePNGPixel)
 	}))
 	defer srv.Close()
 
-	areq := &anthropicRequest{
-		Messages: []anthropicMessage{
-			{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{
-				{Type: "text", Text: "look:"},
-				{Type: "image", Source: &anthropicImageSource{Type: "url", URL: srv.URL + "/x.png"}},
-			})},
-		},
-	}
-
-	testFetcher(srv).resolveRemoteImages(context.Background(), areq)
+	areq := &anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{
+			{Type: "text", Text: "look:"},
+			{Type: "image", Source: &anthropicImageSource{Type: "url", URL: srv.URL + "/x.png"}},
+		})},
+	}}
+	processImages(context.Background(), areq, testFetcher(srv))
 
 	blocks, err := parseContentBlocks(areq.Messages[0].Content)
 	if err != nil {
@@ -227,63 +249,318 @@ func TestResolveRemoteImagesRewritesURLToBase64(t *testing.T) {
 		}
 	}
 	if img == nil {
-		t.Fatal("no image block after resolve")
+		t.Fatal("current-turn url image must be inlined, not dropped")
 	}
-	if img.Source.Type != "base64" {
-		t.Errorf("source type = %q, want base64", img.Source.Type)
+	if img.Source.Type != "base64" || img.Source.MediaType != "image/png" {
+		t.Errorf("source = %+v, want base64 image/png", img.Source)
 	}
-	if img.Source.MediaType != "image/png" {
-		t.Errorf("media_type = %q, want image/png", img.Source.MediaType)
-	}
-	// The rewritten block must now convert to a Kiro image.
 	if _, ok := convertImage(*img); !ok {
-		t.Error("convertImage failed on rewritten base64 block")
+		t.Error("inlined block must convert to a Kiro image")
 	}
 }
 
-func TestResolveRemoteImagesLeavesFailedUntouched(t *testing.T) {
+func TestProcessImagesLeavesFailedURLUntouched(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "gone", http.StatusNotFound)
 	}))
 	defer srv.Close()
 
-	original := mustBlocks(t, []anthropicContentBlock{
-		{Type: "image", Source: &anthropicImageSource{Type: "url", URL: srv.URL + "/missing.png"}},
-	})
-	areq := &anthropicRequest{
-		Messages: []anthropicMessage{{Role: "user", Content: original}},
-	}
-
-	testFetcher(srv).resolveRemoteImages(context.Background(), areq)
+	areq := &anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{
+			{Type: "image", Source: &anthropicImageSource{Type: "url", URL: srv.URL + "/missing.png"}},
+		})},
+	}}
+	processImages(context.Background(), areq, testFetcher(srv))
 
 	blocks, _ := parseContentBlocks(areq.Messages[0].Content)
 	if len(blocks) != 1 || blocks[0].Source == nil || !strings.EqualFold(blocks[0].Source.Type, "url") {
 		t.Fatalf("failed download should leave url source intact, got %+v", blocks)
 	}
-	// A url source still downstream-skips (convertImage returns ok=false).
 	if _, ok := convertImage(blocks[0]); ok {
 		t.Error("convertImage should skip an unresolved url source")
 	}
 }
 
-func TestResolveRemoteImagesIgnoresStringContent(t *testing.T) {
-	areq := &anthropicRequest{
-		Messages: []anthropicMessage{
-			{Role: "user", Content: json.RawMessage(`"just text"`)},
-		},
-	}
-	f := newImageFetcher(http.DefaultClient)
-	f.resolveRemoteImages(context.Background(), areq)
+func TestProcessImagesStringContentUntouched(t *testing.T) {
+	areq := &anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: json.RawMessage(`"just text"`)},
+		{Role: "assistant", Content: json.RawMessage(`[{"type":"text","text":"reply"}]`)},
+		{Role: "user", Content: json.RawMessage(`"plain"`)},
+	}}
+	processImages(context.Background(), areq, newImageFetcher(http.DefaultClient))
 	if string(areq.Messages[0].Content) != `"just text"` {
-		t.Errorf("string content should be untouched, got %s", areq.Messages[0].Content)
+		t.Errorf("string content changed: %s", areq.Messages[0].Content)
+	}
+	if string(areq.Messages[1].Content) != `[{"type":"text","text":"reply"}]` {
+		t.Errorf("assistant content changed: %s", areq.Messages[1].Content)
 	}
 }
 
-func mustBlocks(t *testing.T, blocks []anthropicContentBlock) json.RawMessage {
-	t.Helper()
-	raw, err := json.Marshal(blocks)
-	if err != nil {
-		t.Fatalf("marshal blocks: %v", err)
+func TestProcessImagesDropsHistoryKeepsCurrent(t *testing.T) {
+	histImg := anthropicContentBlock{Type: "image", Source: &anthropicImageSource{Type: "base64", MediaType: "image/png", Data: "HISTORY-BYTES"}}
+	curImg := anthropicContentBlock{Type: "image", Source: &anthropicImageSource{Type: "base64", MediaType: "image/png", Data: "CURRENT-BYTES"}}
+	areq := &anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "first"}, histImg})},
+		{Role: "assistant", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "ok"}})},
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "now"}, curImg})},
+	}}
+	before := len(areq.Messages[0].Content)
+
+	processImages(context.Background(), areq, newImageFetcher(http.DefaultClient))
+
+	if got := contentImageCount(t, areq.Messages[0].Content); got != 0 {
+		t.Errorf("history user: got %d images, want 0", got)
 	}
-	return raw
+	if got := contentImageCount(t, areq.Messages[2].Content); got != 1 {
+		t.Errorf("current user: got %d images, want 1", got)
+	}
+	if len(areq.Messages[0].Content) >= before {
+		t.Errorf("history content did not shrink: %d -> %d", before, len(areq.Messages[0].Content))
+	}
+}
+
+// #1: consecutive same-role user messages form one turn — all keep their images.
+func TestProcessImagesConsecutiveUsersAllKept(t *testing.T) {
+	img := func(data string) anthropicContentBlock {
+		return anthropicContentBlock{Type: "image", Source: &anthropicImageSource{Type: "base64", MediaType: "image/png", Data: data}}
+	}
+	areq := &anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{img("A")})},
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{img("B")})},
+	}}
+	processImages(context.Background(), areq, newImageFetcher(http.DefaultClient))
+	if got := contentImageCount(t, areq.Messages[0].Content); got != 1 {
+		t.Errorf("first of consecutive users: got %d images, want 1", got)
+	}
+	if got := contentImageCount(t, areq.Messages[1].Content); got != 1 {
+		t.Errorf("second of consecutive users: got %d images, want 1", got)
+	}
+}
+
+// A trailing assistant prefill still protects the preceding user turn.
+func TestProcessImagesPrefillProtectsUserTurn(t *testing.T) {
+	img := func(data string) anthropicContentBlock {
+		return anthropicContentBlock{Type: "image", Source: &anthropicImageSource{Type: "base64", MediaType: "image/png", Data: data}}
+	}
+	areq := &anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{img("HIST")})},
+		{Role: "assistant", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "ok"}})},
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{img("CUR")})},
+		{Role: "assistant", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "prefill"}})},
+	}}
+	processImages(context.Background(), areq, newImageFetcher(http.DefaultClient))
+	if got := contentImageCount(t, areq.Messages[0].Content); got != 0 {
+		t.Errorf("history user: got %d images, want 0", got)
+	}
+	if got := contentImageCount(t, areq.Messages[2].Content); got != 1 {
+		t.Errorf("current user before prefill: got %d images, want 1", got)
+	}
+}
+
+// #3: images nested in a history tool_result are dropped too.
+func TestProcessImagesTrimsToolResultImages(t *testing.T) {
+	toolResult := anthropicContentBlock{
+		Type: "tool_result", ToolUseID: "t1",
+		Content: mustBlocks(t, []anthropicContentBlock{
+			{Type: "image", Source: &anthropicImageSource{Type: "base64", MediaType: "image/png", Data: "TOOL-IMG"}},
+		}),
+	}
+	areq := &anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{toolResult})},
+		{Role: "assistant", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "ok"}})},
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{
+			{Type: "image", Source: &anthropicImageSource{Type: "base64", MediaType: "image/png", Data: "CUR"}},
+		})},
+	}}
+	before := len(areq.Messages[0].Content)
+
+	processImages(context.Background(), areq, newImageFetcher(http.DefaultClient))
+
+	tr, _ := parseContentBlocks(areq.Messages[0].Content)
+	if len(tr) != 1 || tr[0].Type != "tool_result" {
+		t.Fatalf("tool_result block lost: %+v", tr)
+	}
+	nested, _ := parseContentBlocks(tr[0].Content)
+	for _, b := range nested {
+		if b.Type == "image" {
+			t.Errorf("nested tool_result image was not dropped: %+v", b)
+		}
+	}
+	if len(areq.Messages[0].Content) >= before {
+		t.Errorf("tool_result content did not shrink: %d -> %d", before, len(areq.Messages[0].Content))
+	}
+	if got := contentImageCount(t, areq.Messages[2].Content); got != 1 {
+		t.Errorf("current user image not kept: got %d", got)
+	}
+}
+
+// #2: a non-lowercase role is still treated as the current user turn.
+func TestProcessImagesRoleCaseInsensitive(t *testing.T) {
+	img := func(data string) anthropicContentBlock {
+		return anthropicContentBlock{Type: "image", Source: &anthropicImageSource{Type: "base64", MediaType: "image/png", Data: data}}
+	}
+	areq := &anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{img("HIST")})},
+		{Role: "assistant", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "ok"}})},
+		{Role: "User", Content: mustBlocks(t, []anthropicContentBlock{img("CUR")})},
+	}}
+	processImages(context.Background(), areq, newImageFetcher(http.DefaultClient))
+	if got := contentImageCount(t, areq.Messages[0].Content); got != 0 {
+		t.Errorf("history user: got %d images, want 0", got)
+	}
+	if got := contentImageCount(t, areq.Messages[2].Content); got != 1 {
+		t.Errorf("current 'User' turn: got %d images, want 1 (kept)", got)
+	}
+}
+
+// History document blocks (base64 PDFs) are dropped with their own placeholder.
+func TestProcessImagesDropsHistoryDocument(t *testing.T) {
+	doc := anthropicContentBlock{Type: "document", Source: &anthropicImageSource{Type: "base64", MediaType: "application/pdf", Data: "PDF-BYTES"}}
+	areq := &anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "see doc"}, doc})},
+		{Role: "assistant", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "ok"}})},
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "now"}})},
+	}}
+	before := len(areq.Messages[0].Content)
+
+	processImages(context.Background(), areq, newImageFetcher(http.DefaultClient))
+
+	blocks, _ := parseContentBlocks(areq.Messages[0].Content)
+	var placeholder string
+	for _, b := range blocks {
+		if b.Type == "document" {
+			t.Errorf("history document was not dropped: %+v", b)
+		}
+		if b.Type == "text" && b.Text == "\n[document omitted]\n" {
+			placeholder = b.Text
+		}
+	}
+	if placeholder != "\n[document omitted]\n" {
+		t.Errorf("document placeholder = %q, want newline-wrapped [document omitted]", placeholder)
+	}
+	if len(areq.Messages[0].Content) >= before {
+		t.Errorf("history content did not shrink: %d -> %d", before, len(areq.Messages[0].Content))
+	}
+}
+
+// A history tool_result whose content is a plain string is left untouched.
+func TestProcessImagesStringToolResultUntouched(t *testing.T) {
+	areq := &anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{
+			{Type: "tool_result", ToolUseID: "t1", Content: json.RawMessage(`"plain result"`)},
+		})},
+		{Role: "assistant", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "ok"}})},
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "now"}})},
+	}}
+	orig := string(areq.Messages[0].Content)
+	processImages(context.Background(), areq, newImageFetcher(http.DefaultClient))
+	if string(areq.Messages[0].Content) != orig {
+		t.Errorf("string tool_result changed: %s", areq.Messages[0].Content)
+	}
+}
+
+// The current turn's tool_result keeps its images (only history is trimmed).
+func TestProcessImagesCurrentTurnToolResultKept(t *testing.T) {
+	img := anthropicContentBlock{Type: "image", Source: &anthropicImageSource{Type: "base64", MediaType: "image/png", Data: "CUR"}}
+	areq := &anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "first"}})},
+		{Role: "assistant", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "ok"}})},
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{
+			{Type: "tool_result", ToolUseID: "t1", Content: mustBlocks(t, []anthropicContentBlock{img})},
+		})},
+	}}
+	processImages(context.Background(), areq, newImageFetcher(http.DefaultClient))
+	tr, _ := parseContentBlocks(areq.Messages[2].Content)
+	if len(tr) != 1 || tr[0].Type != "tool_result" {
+		t.Fatalf("current tool_result lost: %+v", tr)
+	}
+	nested, _ := parseContentBlocks(tr[0].Content)
+	if len(nested) != 1 || nested[0].Type != "image" {
+		t.Errorf("current tool_result image not kept: %+v", nested)
+	}
+}
+
+// cache_control survives re-serialization: kept on a sibling block, and migrated
+// to the placeholder when the carrying image/document is dropped.
+func TestProcessImagesPreservesCacheControl(t *testing.T) {
+	areq := &anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{
+			{Type: "text", Text: "spec", CacheControl: json.RawMessage(`{"type":"ephemeral"}`)},
+			{Type: "image", Source: &anthropicImageSource{Type: "base64", MediaType: "image/png", Data: "HIST"}, CacheControl: json.RawMessage(`{"type":"ephemeral"}`)},
+		})},
+		{Role: "assistant", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "ok"}})},
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "now"}})},
+	}}
+	processImages(context.Background(), areq, newImageFetcher(http.DefaultClient))
+	blocks, _ := parseContentBlocks(areq.Messages[0].Content)
+	var spec, placeholder *anthropicContentBlock
+	for i := range blocks {
+		if blocks[i].Type == "text" && blocks[i].Text == "spec" {
+			spec = &blocks[i]
+		}
+		if blocks[i].Type == "text" && blocks[i].Text == "\n[image omitted]\n" {
+			placeholder = &blocks[i]
+		}
+	}
+	if spec == nil {
+		t.Fatal("text block lost")
+	}
+	if string(spec.CacheControl) != `{"type":"ephemeral"}` {
+		t.Errorf("sibling cache_control dropped: %q", string(spec.CacheControl))
+	}
+	if placeholder == nil {
+		t.Fatal("placeholder block lost")
+	}
+	if string(placeholder.CacheControl) != `{"type":"ephemeral"}` {
+		t.Errorf("dropped image's cache_control not migrated to placeholder: %q", string(placeholder.CacheControl))
+	}
+}
+
+// Placeholder text is fixed exactly, distinct for image vs document.
+func TestProcessImagesPlaceholderText(t *testing.T) {
+	img := anthropicContentBlock{Type: "image", Source: &anthropicImageSource{Type: "base64", MediaType: "image/png", Data: "I"}}
+	doc := anthropicContentBlock{Type: "document", Source: &anthropicImageSource{Type: "base64", MediaType: "application/pdf", Data: "D"}}
+	areq := &anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{img, doc})},
+		{Role: "assistant", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "ok"}})},
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "now"}})},
+	}}
+	processImages(context.Background(), areq, newImageFetcher(http.DefaultClient))
+	blocks, _ := parseContentBlocks(areq.Messages[0].Content)
+	texts := map[string]bool{}
+	for _, b := range blocks {
+		if b.Type == "text" {
+			texts[b.Text] = true
+		}
+	}
+	if !texts["\n[image omitted]\n"] {
+		t.Errorf("missing [image omitted] placeholder; got %v", texts)
+	}
+	if !texts["\n[document omitted]\n"] {
+		t.Errorf("missing [document omitted] placeholder; got %v", texts)
+	}
+}
+
+// A document nested in a history tool_result (e.g. a PDF returned by a tool) is
+// dropped too — the document branch of trimToolResultImages.
+func TestProcessImagesTrimsToolResultDocument(t *testing.T) {
+	doc := anthropicContentBlock{Type: "document", Source: &anthropicImageSource{Type: "base64", MediaType: "application/pdf", Data: "TOOL-PDF"}}
+	areq := &anthropicRequest{Messages: []anthropicMessage{
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{
+			{Type: "tool_result", ToolUseID: "t1", Content: mustBlocks(t, []anthropicContentBlock{doc})},
+		})},
+		{Role: "assistant", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "ok"}})},
+		{Role: "user", Content: mustBlocks(t, []anthropicContentBlock{{Type: "text", Text: "now"}})},
+	}}
+	processImages(context.Background(), areq, newImageFetcher(http.DefaultClient))
+	tr, _ := parseContentBlocks(areq.Messages[0].Content)
+	if len(tr) != 1 || tr[0].Type != "tool_result" {
+		t.Fatalf("tool_result block lost: %+v", tr)
+	}
+	nested, _ := parseContentBlocks(tr[0].Content)
+	for _, b := range nested {
+		if b.Type == "document" {
+			t.Errorf("nested tool_result document was not dropped: %+v", b)
+		}
+	}
 }

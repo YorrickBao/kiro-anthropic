@@ -43,43 +43,145 @@ func newImageFetcher(client *http.Client) *imageFetcher {
 	return &imageFetcher{client: client, maxBytes: defaultImageMaxBytes, timeout: defaultImageTimeout}
 }
 
-// resolveRemoteImages rewrites every user image block whose source is a remote
-// http(s) URL into an inline base64 source, downloading the bytes in the
-// process. A block that cannot be fetched (bad scheme, blocked host, oversize,
-// unsupported content-type, network error) is left untouched: downstream
-// translation then emits an "[unsupported image omitted]" note for it rather
-// than failing the whole request. Only messages that actually carry a rewritten
-// image are re-serialized; all others are left byte-for-byte unchanged.
-func (f *imageFetcher) resolveRemoteImages(ctx context.Context, areq *anthropicRequest) {
-	for i := range areq.Messages {
-		msg := &areq.Messages[i]
-		blocks, err := parseContentBlocks(msg.Content)
-		if err != nil || len(blocks) == 0 {
-			continue
+// transformBlocks parses raw content (a string or []block), applies fn to every
+// block, and returns the re-serialized content plus whether any block changed.
+// Unchanged content is returned byte-for-byte (no re-marshal). It is the shared
+// parse→transform→marshal skeleton for message content at any nesting level.
+func transformBlocks(raw json.RawMessage, fn func(b *anthropicContentBlock) bool) (json.RawMessage, bool) {
+	blocks, err := parseContentBlocks(raw)
+	if err != nil || len(blocks) == 0 {
+		return raw, false
+	}
+	changed := false
+	for i := range blocks {
+		if fn(&blocks[i]) {
+			changed = true
 		}
-		changed := false
-		for j := range blocks {
-			b := &blocks[j]
-			if b.Type != "image" || b.Source == nil ||
-				!strings.EqualFold(b.Source.Type, "url") || b.Source.URL == "" {
-				continue
+	}
+	if !changed {
+		return raw, false
+	}
+	out, merr := json.Marshal(blocks)
+	if merr != nil {
+		return raw, false
+	}
+	return out, true
+}
+
+// mapContentBlocks applies fn to every block of every message. A message is
+// re-serialized only when at least one of its blocks changed, so every other
+// message is left byte-for-byte unchanged.
+func mapContentBlocks(areq *anthropicRequest, fn func(msgIdx int, b *anthropicContentBlock) bool) {
+	for i := range areq.Messages {
+		if out, changed := transformBlocks(areq.Messages[i].Content, func(b *anthropicContentBlock) bool {
+			return fn(i, b)
+		}); changed {
+			areq.Messages[i].Content = out
+		}
+	}
+}
+
+// currentTurnStart returns the index where the current turn begins: the trailing
+// run of non-assistant messages ending the request. Messages from here on keep
+// their images (the current turn the model must see); anything earlier is
+// history. Role "assistant" marks a turn boundary; any other role is treated as
+// user, matching convertMessage. Returns len(messages) when there is no
+// non-assistant message, so nothing is protected (assistant turns carry no
+// images anyway).
+func currentTurnStart(messages []anthropicMessage) int {
+	last := len(messages)
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != "assistant" {
+			last = i
+			break
+		}
+	}
+	if last == len(messages) {
+		return last
+	}
+	start := last
+	for i := last - 1; i >= 0; i-- {
+		if messages[i].Role != "assistant" {
+			start = i
+		} else {
+			break
+		}
+	}
+	return start
+}
+
+// mediaOmittedText is the placeholder used when a history image/document is
+// dropped, so the model knows content was present without paying its base64 cost.
+// It is newline-wrapped to match convertMessage's own "[unsupported image
+// omitted]" note and to keep it from fusing with adjacent text when blocks are
+// concatenated.
+func mediaOmittedText(typ string) string {
+	if typ == "document" {
+		return "\n[document omitted]\n"
+	}
+	return "\n[image omitted]\n"
+}
+
+// trimToolResultImages drops image/document blocks nested inside a tool_result's
+// content (e.g. screenshots or PDFs returned by a tool), replacing each with a
+// placeholder. It returns whether any change was made. A tool_result whose
+// content is a plain string is left untouched.
+func trimToolResultImages(b *anthropicContentBlock) bool {
+	out, changed := transformBlocks(b.Content, func(blk *anthropicContentBlock) bool {
+		if blk.Type == "image" || blk.Type == "document" {
+			cc := blk.CacheControl // preserve a caching breakpoint on the dropped block
+			*blk = anthropicContentBlock{Type: "text", Text: mediaOmittedText(blk.Type), CacheControl: cc}
+			return true
+		}
+		return false
+	})
+	if changed {
+		b.Content = out
+	}
+	return changed
+}
+
+// processImages prepares an Anthropic request's images for Kiro in a single pass
+// over the messages:
+//   - In the current turn, remote (http/https) image URLs are inlined as base64,
+//     because Kiro only accepts inline image bytes. A block that cannot be
+//     fetched is left as a url source and downstream-skipped.
+//   - In history, every image and document is dropped to a placeholder —
+//     including media nested in tool_result blocks — since stale history base64
+//     would inflate the raw-byte token estimate returned to callers.
+//
+// The current turn (the trailing run of non-assistant messages) keeps all its
+// images, so the model sees what the user just sent.
+func processImages(ctx context.Context, areq *anthropicRequest, fetcher *imageFetcher) {
+	turnStart := currentTurnStart(areq.Messages)
+	mapContentBlocks(areq, func(i int, b *anthropicContentBlock) bool {
+		if i < turnStart {
+			// History: drop images/documents, including those nested in tool_result.
+			if b.Type == "image" || b.Type == "document" {
+				cc := b.CacheControl // preserve a caching breakpoint on the dropped block
+				*b = anthropicContentBlock{Type: "text", Text: mediaOmittedText(b.Type), CacheControl: cc}
+				return true
 			}
-			mediaType, data, ferr := f.fetch(ctx, b.Source.URL)
+			if b.Type == "tool_result" {
+				return trimToolResultImages(b)
+			}
+			return false
+		}
+		// Current turn: inline remote url images only.
+		if b.Type == "image" && b.Source != nil &&
+			strings.EqualFold(b.Source.Type, "url") && b.Source.URL != "" {
+			mediaType, data, ferr := fetcher.fetch(ctx, b.Source.URL)
 			if ferr != nil {
 				if os.Getenv("KIRO_DEBUG") != "" {
 					fmt.Fprintf(os.Stderr, "[kiro-debug] image url fetch failed (%s): %v\n", b.Source.URL, ferr)
 				}
-				continue // leave the url source; convertImage will skip it.
+				return false // leave the url source; convertImage will skip it.
 			}
 			b.Source = &anthropicImageSource{Type: "base64", MediaType: mediaType, Data: data}
-			changed = true
+			return true
 		}
-		if changed {
-			if raw, merr := json.Marshal(blocks); merr == nil {
-				msg.Content = raw
-			}
-		}
-	}
+		return false
+	})
 }
 
 // fetch downloads a single remote image and returns its media type (e.g.

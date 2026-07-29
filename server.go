@@ -587,7 +587,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	// Inline any remote (http/https) image URLs as base64 before translation:
 	// Kiro only accepts inline image bytes. Failures degrade gracefully (the
 	// block is left as-is and skipped downstream) rather than aborting.
-	newImageFetcher(s.kiro.client).resolveRemoteImages(r.Context(), &areq)
+	// Prepare images in one pass: inline remote URLs in the current turn (Kiro
+	// only accepts inline bytes) and drop history images — including those
+	// nested in tool_result blocks — to a placeholder. Stale history base64
+	// would otherwise inflate the raw-byte token estimate returned to callers.
+	processImages(r.Context(), &areq, newImageFetcher(s.kiro.client))
 
 	kreq, err := buildKiroRequest(s.cfg, &areq)
 	if err != nil {

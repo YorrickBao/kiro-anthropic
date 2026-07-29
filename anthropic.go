@@ -117,6 +117,10 @@ type anthropicContentBlock struct {
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   json.RawMessage `json:"content,omitempty"` // string or []block
 	IsError   bool            `json:"is_error,omitempty"`
+
+	// cache_control (prompt-caching breakpoint) is retained verbatim so per-block
+	// transforms that re-serialize a message do not silently drop it.
+	CacheControl json.RawMessage `json:"cache_control,omitempty"`
 }
 
 type anthropicImageSource struct {

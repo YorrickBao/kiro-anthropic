@@ -388,9 +388,15 @@ func (s *Server) ensureUsage(ctx context.Context, creds *accountCreds) (*kiroUsa
 	if err != nil {
 		return nil, err
 	}
+	now := time.Now()
 	s.usageMu.Lock()
-	s.usageCache[creds.id] = usageCacheEntry{usage: u, fetched: time.Now()}
+	s.usageCache[creds.id] = usageCacheEntry{usage: u, fetched: now}
 	s.usageMu.Unlock()
+	// Reconcile the depleted state with the fresh usage so admin-page refreshes
+	// (including manual ones) recover or precisely park depleted accounts.
+	if s.selector != nil {
+		s.selector.applyUsage(creds.id, u, now, false)
+	}
 	return u, nil
 }
 
@@ -724,7 +730,13 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest, areq *anthro
 				// A problem with the request itself: don't burn other accounts.
 				return nil, sendErr
 			}
-			s.selector.recordFailure(creds.id)
+			if isAccountDepleted(sendErr) {
+				// Out of credit: park until reset_at/fallback so the account is
+				// not retried every 60s. The probe refines this to reset_at.
+				s.selector.markDepleted(creds.id, time.Now().Add(depletedFallbackTTL))
+			} else {
+				s.selector.recordFailure(creds.id)
+			}
 			break
 		}
 	}
@@ -758,7 +770,7 @@ func firstFrameFailure(stream *kiroStream) error {
 		if ev.ErrKind == "ValidationException" {
 			status = http.StatusBadRequest
 		}
-		return &kiroHTTPError{Status: status, Body: upstreamEventError(ev), ReasonCode: ev.ErrReason}
+		return &kiroHTTPError{Status: status, Body: upstreamEventError(ev), ReasonCode: ev.ErrReason, Kind: ev.ErrKind}
 	}
 	return nil
 }

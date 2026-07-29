@@ -287,6 +287,11 @@ func runServe(cfg *Config) error {
 	// when ctx is cancelled.
 	go newAccountRefresher(srv.accounts, client, logger).Run(ctx)
 
+	// Periodically re-check depleted accounts so a reset/upgrade that restores
+	// credit is picked up without waiting on real traffic. Stops when ctx is
+	// cancelled.
+	go newDepletedProbe(srv, logger).Run(ctx)
+
 	serveErr := make(chan error, 2)
 	go func() {
 		if err := httpServer.Serve(apiLn); err != nil && err != http.ErrServerClosed {

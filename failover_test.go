@@ -206,3 +206,62 @@ func TestOpenStreamRequestErrorDoesNotBurnAccounts(t *testing.T) {
 	require.Error(t, err)
 	assert.Len(t, rt.seen, 1, "a 400 should not try further accounts")
 }
+
+// quotaErrorFrame builds a single event-stream frame carrying a
+// serviceQuotaExceededError as a normal event (:message-type=event), mirroring
+// how the backend surfaces an exhausted-credit error after a 200.
+func quotaErrorFrame(message string) []byte {
+	headers := append(
+		esStringHeader(":message-type", "event"),
+		esStringHeader(":event-type", "serviceQuotaExceededError")...,
+	)
+	return esFrame(headers, []byte(`{"message":"`+message+`"}`))
+}
+
+// TestOpenStreamQuotaErrorParksDepleted verifies that a serviceQuotaExceededError
+// arriving as the first frame fails over to a healthy account AND parks the
+// exhausted one as depleted (not the short cooldown), so it is not retried
+// every 60s.
+func TestOpenStreamQuotaErrorParksDepleted(t *testing.T) {
+	rt := newFakeRuntime(t)
+	rt.bodies["Bearer bad"] = quotaErrorFrame("You have exceeded your service quota")
+	rt.bodies["Bearer good"] = contentFrame("hi")
+	s := serverWithPool(t, rt, "bad", "good")
+
+	stream, err := s.openStream(context.Background(), &kiroRequest{}, nil)
+	require.NoError(t, err, "quota error should fail over to the healthy account")
+	require.NotNil(t, stream)
+	defer stream.Close()
+
+	// The exhausted account is parked as depleted, distinct from the cooldown.
+	s.selector.mu.Lock()
+	_, depleted := s.selector.depleted["bad"]
+	_, cooling := s.selector.cooldown["bad"]
+	s.selector.mu.Unlock()
+	assert.True(t, depleted, "quota-exhausted account is parked as depleted")
+	assert.False(t, cooling, "depleted is distinct from the short cooldown")
+}
+
+// TestDepletedAccountSkippedOnNextRequest verifies the preventive effect: once
+// parked, an exhausted account is not retried on the next request (it would be
+// re-tried every time under the old reactive-only cooldown behavior).
+func TestDepletedAccountSkippedOnNextRequest(t *testing.T) {
+	rt := newFakeRuntime(t)
+	rt.bodies["Bearer bad"] = quotaErrorFrame("exceeded")
+	rt.bodies["Bearer good"] = contentFrame("hi")
+	s := serverWithPool(t, rt, "bad", "good")
+
+	// First request: tries "bad" (quota error -> depleted), then "good".
+	st1, err := s.openStream(context.Background(), &kiroRequest{}, nil)
+	require.NoError(t, err)
+	st1.Close()
+
+	rt.seen = nil
+	// Second request: "bad" is depleted -> skip straight to "good".
+	st2, err := s.openStream(context.Background(), &kiroRequest{}, nil)
+	require.NoError(t, err)
+	st2.Close()
+
+	assert.NotContains(t, rt.seen, "Bearer bad", "depleted account is not retried on the next request")
+	assert.Contains(t, rt.seen, "Bearer good")
+}

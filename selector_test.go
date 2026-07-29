@@ -279,3 +279,193 @@ func TestIsAccountFailure(t *testing.T) {
 type assertAnError struct{}
 
 func (assertAnError) Error() string { return "boom" }
+
+func TestSelectorDepletedSkip(t *testing.T) {
+	s := newTestSelector(t, "a", "b")
+	// Park "a" as depleted: it should be skipped while "b" is served.
+	s.markDepleted("a", time.Now().Add(depletedFallbackTTL))
+
+	for i := 0; i < 4; i++ {
+		creds, ok := s.pick(map[string]bool{})
+		require.True(t, ok)
+		assert.Equal(t, "b", creds.id, "depleted account is skipped")
+		s.recordSuccess(creds.id)
+	}
+}
+
+func TestSelectorDepletedFallbackToSoonest(t *testing.T) {
+	s := newTestSelector(t, "a", "b")
+	// Both depleted, "b" recovering sooner.
+	s.markDepleted("a", time.Now().Add(10*time.Minute))
+	s.markDepleted("b", time.Now().Add(time.Minute))
+
+	creds, ok := s.pick(map[string]bool{})
+	require.True(t, ok)
+	assert.Equal(t, "b", creds.id, "falls back to the soonest-recovering depleted account")
+}
+
+func TestSelectorDepletedExpiresAndReturns(t *testing.T) {
+	s := newTestSelector(t, "a", "b")
+	// "a" depleted in the past -> already recoverable, selectable again.
+	s.markDepleted("a", time.Now().Add(-time.Minute))
+	creds, ok := s.pick(map[string]bool{})
+	require.True(t, ok)
+	assert.Equal(t, "a", creds.id, "an expired depleted mark no longer skips the account")
+}
+
+func TestSelectorApplyUsageRemainingPositive(t *testing.T) {
+	s := newTestSelector(t, "a")
+	s.markDepleted("a", time.Now().Add(depletedFallbackTTL))
+
+	s.applyUsage("a", &kiroUsage{Credit: &kiroCreditUsage{Remaining: 42}}, time.Now(), false)
+
+	s.mu.Lock()
+	_, depleted := s.depleted["a"]
+	s.mu.Unlock()
+	assert.False(t, depleted, "credit remaining lifts the depleted mark")
+}
+
+func TestSelectorApplyUsageRemainingZeroWithReset(t *testing.T) {
+	s := newTestSelector(t, "a")
+	reset := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Second)
+
+	s.applyUsage("a", &kiroUsage{
+		Credit:  &kiroCreditUsage{Remaining: 0},
+		ResetAt: reset.Format(time.RFC3339),
+	}, time.Now(), false)
+
+	s.mu.Lock()
+	e, depleted := s.depleted["a"]
+	s.mu.Unlock()
+	require.True(t, depleted, "exhausted account is parked")
+	assert.WithinDuration(t, reset, e.until, time.Second, "parked until its reset_at")
+}
+
+func TestSelectorApplyUsageRemainingZeroNoReset(t *testing.T) {
+	s := newTestSelector(t, "a")
+	before := time.Now()
+
+	s.applyUsage("a", &kiroUsage{Credit: &kiroCreditUsage{Remaining: 0}}, time.Now(), false)
+
+	s.mu.Lock()
+	e, depleted := s.depleted["a"]
+	s.mu.Unlock()
+	require.True(t, depleted, "exhausted account with unknown reset is parked")
+	assert.WithinDuration(t, before.Add(depletedFallbackTTL), e.until, time.Second,
+		"parked for the fallback TTL when reset_at is unknown")
+}
+
+func TestSelectorApplyUsageNilIsNoop(t *testing.T) {
+	s := newTestSelector(t, "a")
+	s.markDepleted("a", time.Now().Add(depletedFallbackTTL))
+
+	s.applyUsage("a", nil, time.Now(), false)          // unknown usage -> stay conservative
+	s.applyUsage("a", &kiroUsage{}, time.Now(), false) // no credit line -> stay conservative
+
+	s.mu.Lock()
+	_, depleted := s.depleted["a"]
+	s.mu.Unlock()
+	assert.True(t, depleted, "nil/credit-less usage leaves the depleted mark untouched")
+}
+
+// #1: a request-path fallback deadline must not shorten a precise reset_at that
+// a probe/admin refresh already recorded.
+func TestMarkDepletedKeepsLaterDeadline(t *testing.T) {
+	s := newTestSelector(t, "a")
+	reset := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Second)
+	// Probe/admin records the precise reset_at...
+	s.applyUsage("a", &kiroUsage{
+		Credit:  &kiroCreditUsage{Remaining: 0},
+		ResetAt: reset.Format(time.RFC3339),
+	}, time.Now(), false)
+	// ...then a retry fails and the request path parks with the fallback TTL.
+	s.markDepleted("a", time.Now().Add(depletedFallbackTTL))
+
+	s.mu.Lock()
+	e, depleted := s.depleted["a"]
+	s.mu.Unlock()
+	require.True(t, depleted)
+	assert.WithinDuration(t, reset, e.until, time.Second, "precise reset_at is not shortened to the fallback")
+}
+
+// #4: a stale admin-page usage snapshot (remaining>0) must not lift a mark a
+// concurrent request failure just set.
+func TestApplyUsageStaleSnapshotDoesNotLiftMark(t *testing.T) {
+	s := newTestSelector(t, "a")
+	staleFetch := time.Now().Add(-time.Minute) // snapshot taken before the failure
+	s.markDepleted("a", time.Now().Add(depletedFallbackTTL))
+
+	// The stale snapshot (remaining>0) arrives after the failure: must not lift.
+	s.applyUsage("a", &kiroUsage{Credit: &kiroCreditUsage{Remaining: 42}}, staleFetch, false)
+
+	s.mu.Lock()
+	_, depleted := s.depleted["a"]
+	s.mu.Unlock()
+	assert.True(t, depleted, "a stale snapshot must not lift a fresher depleted mark")
+}
+
+// #3: the probe path (preciseOnly) refines existing marks but never re-parks an
+// account that recovered and served traffic since the snapshot was taken.
+func TestApplyUsagePreciseOnlyDoesNotCreate(t *testing.T) {
+	s := newTestSelector(t, "a")
+	// No existing mark (account recovered); a preciseOnly zero snapshot must not
+	// create one.
+	s.applyUsage("a", &kiroUsage{Credit: &kiroCreditUsage{Remaining: 0}}, time.Now(), true)
+
+	s.mu.Lock()
+	_, depleted := s.depleted["a"]
+	s.mu.Unlock()
+	assert.False(t, depleted, "preciseOnly applyUsage must not create a new depleted mark")
+}
+
+// #5: when every account is skipped, the fallback ranks by true recovery time
+// (the later of cooldown/depleted), not whichever skip fired first.
+func TestSkipUntilRanksByLaterDeadline(t *testing.T) {
+	s := newTestSelector(t, "a", "b")
+	now := time.Now()
+	// "a": cooldown ends soon but depleted for long; "b": depleted sooner overall.
+	s.mu.Lock()
+	s.cooldown["a"] = now.Add(30 * time.Second)
+	s.depleted["a"] = depletedEntry{until: now.Add(10 * time.Minute), basis: now}
+	s.depleted["b"] = depletedEntry{until: now.Add(5 * time.Minute), basis: now}
+	s.mu.Unlock()
+
+	creds, ok := s.pick(map[string]bool{})
+	require.True(t, ok)
+	assert.Equal(t, "b", creds.id, "fallback picks the truly sooner-recovering account")
+}
+
+func TestRecordSuccessClearsDepleted(t *testing.T) {
+	s := newTestSelector(t, "a")
+	s.markDepleted("a", time.Now().Add(depletedFallbackTTL))
+
+	s.recordSuccess("a")
+
+	s.mu.Lock()
+	_, depleted := s.depleted["a"]
+	s.mu.Unlock()
+	assert.False(t, depleted, "recordSuccess lifts the depleted mark")
+}
+
+func TestIsAccountDepleted(t *testing.T) {
+	assert.False(t, isAccountDepleted(nil))
+	assert.False(t, isAccountDepleted(assertAnError{})) // transport error -> not depleted
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"402 payment required", &kiroHTTPError{Status: http.StatusPaymentRequired}, true},
+		{"423 locked", &kiroHTTPError{Status: http.StatusLocked}, true},
+		{"quota event", &kiroHTTPError{Kind: "serviceQuotaExceededError"}, true},
+		{"429 throttle", &kiroHTTPError{Status: http.StatusTooManyRequests}, false},
+		{"500 server", &kiroHTTPError{Status: http.StatusInternalServerError}, false},
+		{"502 gateway", &kiroHTTPError{Status: http.StatusBadGateway}, false},
+		{"400 request", &kiroHTTPError{Status: http.StatusBadRequest}, false},
+		{"other event kind", &kiroHTTPError{Kind: "internalServerException"}, false},
+	}
+	for _, c := range cases {
+		assert.Equalf(t, c.want, isAccountDepleted(c.err), "%s", c.name)
+	}
+}

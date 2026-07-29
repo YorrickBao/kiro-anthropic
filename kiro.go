@@ -432,10 +432,14 @@ func (e *kiroHTTPError) reason() string {
 }
 
 // kiroHTTPError carries a non-2xx runtime response or a pre-stream exception.
+// Kind carries the upstream event/exception type (e.g. "serviceQuotaExceededError")
+// when the error originated as an in-stream event frame; it is empty for plain HTTP
+// responses, where the Status code carries the equivalent signal.
 type kiroHTTPError struct {
 	Status     int
 	Body       string
 	ReasonCode string
+	Kind       string
 }
 
 func (e *kiroHTTPError) Error() string {

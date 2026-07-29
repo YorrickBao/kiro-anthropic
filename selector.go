@@ -130,18 +130,43 @@ func (c *accountCreds) refresh(ctx context.Context) error {
 // accountCooldown is how long a failing account is skipped before it is retried.
 const accountCooldown = 60 * time.Second
 
-// accountSelector picks accounts round-robin, skipping those in cooldown.
+// depletedFallbackTTL is how long an account whose credit is exhausted is
+// skipped when the precise reset time is unknown — a request's quota error
+// carries no reset_at. It must exceed depletedProbeInterval so the background
+// probe can refine the deadline to the real reset_at before the fallback
+// expires and traffic retries the account.
+const depletedFallbackTTL = 45 * time.Minute
+
+// depletedEntry tracks one parked account. until is when credit is expected
+// back (reset_at or fallback); basis is the moment the decision is grounded in
+// (the request-failure time, or the usage snapshot's fetch time). Writes whose
+// basis predates the current entry are ignored, so a stale usage snapshot
+// cannot override a fresher request-failure signal; until never moves earlier,
+// so a fallback deadline cannot clobber a precise reset_at.
+type depletedEntry struct {
+	until time.Time
+	basis time.Time
+}
+
+// accountSelector picks accounts round-robin, skipping those in cooldown or
+// marked depleted (credit exhausted until a reset/upgrade restores it).
 type accountSelector struct {
 	store  *AccountStore
 	client *http.Client
 
 	mu       sync.Mutex
 	index    int
-	cooldown map[string]time.Time // account id -> time the cooldown ends
+	cooldown map[string]time.Time     // account id -> time the cooldown ends
+	depleted map[string]depletedEntry // account id -> when credit returns + the basis for that claim
 }
 
 func newAccountSelector(store *AccountStore, client *http.Client) *accountSelector {
-	return &accountSelector{store: store, client: client, cooldown: map[string]time.Time{}}
+	return &accountSelector{
+		store:    store,
+		client:   client,
+		cooldown: map[string]time.Time{},
+		depleted: map[string]depletedEntry{},
+	}
 }
 
 // pick returns credentials for the next eligible account, skipping ids in tried
@@ -159,7 +184,30 @@ func (s *accountSelector) pick(tried map[string]bool) (*accountCreds, bool) {
 	now := time.Now()
 	s.pruneCooldownLocked(list)
 
-	// Round-robin scan for an account that is neither tried nor cooling down.
+	// skipUntil reports whether an account is temporarily skipped right now
+	// (cooldown or depleted) and the time it recovers. Both are tracked so the
+	// request always has a fallback when every account is momentarily unusable.
+	// skipUntil reports whether an account is temporarily skipped (cooldown or
+	// depleted) and when it fully recovers — the later of the two deadlines,
+	// since both must lift before the account is usable. The fallback ranks
+	// candidates by true recovery time, not whichever skip fired first.
+	skipUntil := func(id string) (time.Time, bool) {
+		rec := time.Time{}
+		skipped := false
+		if cu, ok := s.cooldown[id]; ok && now.Before(cu) {
+			rec = cu
+			skipped = true
+		}
+		if de, ok := s.depleted[id]; ok && now.Before(de.until) {
+			if de.until.After(rec) {
+				rec = de.until
+			}
+			skipped = true
+		}
+		return rec, skipped
+	}
+
+	// Round-robin scan for an account that is neither tried nor skipped.
 	var soonest *StoredAccount
 	var soonestAt time.Time
 	n := len(list)
@@ -171,8 +219,8 @@ func (s *accountSelector) pick(tried map[string]bool) (*accountCreds, bool) {
 		if !accountUsable(a) {
 			continue // dead account: no profileArn and no way to obtain one
 		}
-		if until, ok := s.cooldown[a.ID]; ok && now.Before(until) {
-			// Track the candidate whose cooldown ends soonest as a fallback.
+		if until, skip := skipUntil(a.ID); skip {
+			// Track the candidate that recovers soonest as a fallback.
 			if soonest == nil || until.Before(soonestAt) {
 				ac := a
 				soonest, soonestAt = &ac, until
@@ -183,7 +231,7 @@ func (s *accountSelector) pick(tried map[string]bool) (*accountCreds, bool) {
 		return s.credsFor(a), true
 	}
 
-	// Everything untried is cooling down: use the soonest-recovering account.
+	// Everything untried is skipped: use the soonest-recovering account.
 	if soonest != nil {
 		return s.credsFor(*soonest), true
 	}
@@ -213,10 +261,10 @@ func accountUsable(a StoredAccount) bool {
 	return a.RefreshToken != "" && a.ClientID != "" && a.ClientSecret != ""
 }
 
-// pruneCooldownLocked drops cooldown entries for accounts no longer in the
-// store, so removed accounts do not leak entries. Caller must hold s.mu.
+// pruneCooldownLocked drops cooldown/depleted entries for accounts no longer in
+// the store, so removed accounts do not leak entries. Caller must hold s.mu.
 func (s *accountSelector) pruneCooldownLocked(list []StoredAccount) {
-	if len(s.cooldown) == 0 {
+	if len(s.cooldown) == 0 && len(s.depleted) == 0 {
 		return
 	}
 	live := make(map[string]bool, len(list))
@@ -226,6 +274,11 @@ func (s *accountSelector) pruneCooldownLocked(list []StoredAccount) {
 	for id := range s.cooldown {
 		if !live[id] {
 			delete(s.cooldown, id)
+		}
+	}
+	for id := range s.depleted {
+		if !live[id] {
+			delete(s.depleted, id)
 		}
 	}
 }
@@ -290,10 +343,13 @@ func (s *accountSelector) listAll() []*accountCreds {
 	return out
 }
 
-// recordSuccess clears any cooldown on the account.
+// recordSuccess clears any cooldown and depleted mark on the account. A depleted
+// account only reaches the success path via the all-skipped fallback; if it then
+// serves the request, it plainly has credit again.
 func (s *accountSelector) recordSuccess(id string) {
 	s.mu.Lock()
 	delete(s.cooldown, id)
+	delete(s.depleted, id)
 	s.mu.Unlock()
 }
 
@@ -302,6 +358,93 @@ func (s *accountSelector) recordFailure(id string) {
 	s.mu.Lock()
 	s.cooldown[id] = time.Now().Add(accountCooldown)
 	s.mu.Unlock()
+}
+
+// markDepleted skips an account for credit-bearing requests until the given
+// time (a fallback TTL — request errors carry no reset_at). pick consults this;
+// peekAny ignores it because schema/model lookups do not consume credit. The
+// deadline never moves earlier, so it cannot clobber a precise reset_at that a
+// probe/admin refresh already recorded.
+func (s *accountSelector) markDepleted(id string, until time.Time) {
+	s.mu.Lock()
+	s.setDepletedLocked(id, until, time.Now())
+	s.mu.Unlock()
+}
+
+// clearDepleted lifts a depleted mark immediately.
+func (s *accountSelector) clearDepleted(id string) {
+	s.mu.Lock()
+	delete(s.depleted, id)
+	s.mu.Unlock()
+}
+
+// setDepletedLocked parks id until at least deadline, grounded at basis. A
+// write whose basis predates the existing entry's basis is dropped (stale data
+// must not override fresher data); the deadline never moves earlier. Caller
+// must hold s.mu.
+func (s *accountSelector) setDepletedLocked(id string, deadline, basis time.Time) {
+	if e, ok := s.depleted[id]; ok {
+		if e.basis.After(basis) {
+			return // existing entry grounded in fresher information
+		}
+		if e.until.After(deadline) {
+			deadline = e.until // never shorten an existing deadline
+		}
+	}
+	s.depleted[id] = depletedEntry{until: deadline, basis: basis}
+}
+
+// depletedDeadline returns when credit is expected back from a usage snapshot:
+// its reset_at, or now+depletedFallbackTTL when reset_at is missing or past.
+func depletedDeadline(u *kiroUsage, now time.Time) time.Time {
+	if u.ResetAt != "" {
+		if t, err := time.Parse(time.RFC3339, u.ResetAt); err == nil && t.After(now) {
+			return t
+		}
+	}
+	return now.Add(depletedFallbackTTL)
+}
+
+// applyUsage reconciles the depleted state with a usage snapshot taken at
+// fetched. With credit remaining the account is un-parked; with none it is
+// parked until reset_at (or the fallback TTL). Overage counts as exhausted: an
+// account at zero base credit is parked even if overage would still serve it,
+// to avoid silently spending overage budget. preciseOnly (the probe path)
+// refines an existing entry but never creates one, so a stale snapshot cannot
+// re-park an account that just recovered and served traffic. Writes are
+// grounded at fetched, so a stale snapshot cannot lift a mark a concurrent
+// request failure just set. A nil usage/credit leaves the state untouched.
+func (s *accountSelector) applyUsage(id string, u *kiroUsage, fetched time.Time, preciseOnly bool) {
+	if u == nil || u.Credit == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if u.Credit.Remaining > 0 {
+		// Lift the mark only if this snapshot is at least as fresh as the mark.
+		if e, ok := s.depleted[id]; !ok || !e.basis.After(fetched) {
+			delete(s.depleted, id)
+		}
+		return
+	}
+	if preciseOnly {
+		if _, ok := s.depleted[id]; !ok {
+			return // do not re-park an account that recovered since the snapshot
+		}
+	}
+	s.setDepletedLocked(id, depletedDeadline(u, time.Now()), fetched)
+}
+
+// depletedIDs returns a snapshot of ids currently marked depleted, for the
+// background probe to re-check. Callers need not hold the lock.
+func (s *accountSelector) depletedIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ids := make([]string, 0, len(s.depleted))
+	for id := range s.depleted {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // isAccountFailure reports whether err is an upstream failure that warrants
@@ -330,4 +473,24 @@ func isAccountFailure(err error) bool {
 	default:
 		return false
 	}
+}
+
+// isAccountDepleted reports whether err signals the account is out of credit:
+// HTTP 402 (payment required) or 423 (locked/suspended), or an in-stream
+// serviceQuotaExceededError event (surfaced via the error's Kind). Such errors
+// park the account in the depleted map until reset_at/fallback rather than the
+// short cooldown, so it is not retried every 60s. It is a strict subset of
+// isAccountFailure; a 429 throttle stays on the short cooldown.
+func isAccountDepleted(err error) bool {
+	if err == nil {
+		return false
+	}
+	he, ok := err.(*kiroHTTPError)
+	if !ok {
+		return false
+	}
+	if he.Status == http.StatusPaymentRequired || he.Status == http.StatusLocked {
+		return true
+	}
+	return he.Kind == "serviceQuotaExceededError"
 }

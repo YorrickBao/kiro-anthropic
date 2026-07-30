@@ -26,6 +26,149 @@ func TestMapModel(t *testing.T) {
 	}
 }
 
+func TestVersionRank(t *testing.T) {
+	assert.Equal(t, []int{4, 8}, versionRank("claude-opus-4.8"))
+	assert.Equal(t, []int{2, 5}, versionRank("minimax-m2.5"))
+	assert.Equal(t, []int{3}, versionRank("qwen3-coder-next"))
+	assert.Empty(t, versionRank("auto"))
+}
+
+func TestResolveModel(t *testing.T) {
+	claude := []kiroModelInfo{
+		{ModelID: "claude-opus-4.5"}, {ModelID: "claude-opus-4.8"},
+		{ModelID: "claude-sonnet-4.5"}, {ModelID: "claude-haiku-4.5"},
+	}
+	gpt := []kiroModelInfo{
+		{ModelID: "gpt-5.6-sol"}, {ModelID: "gpt-5.6-terra"}, {ModelID: "gpt-5.6-luna"},
+	}
+	glm := []kiroModelInfo{
+		{ModelID: "glm-5"}, {ModelID: "deepseek-3.2"},
+		{ModelID: "minimax-m2.5"}, {ModelID: "qwen3-coder-next"},
+	}
+	mixed := append(append([]kiroModelInfo{}, claude...), gpt...)
+
+	cases := []struct {
+		name   string
+		query  string
+		models []kiroModelInfo
+		want   string // "" means ok=false
+	}{
+		{"exact id", "claude-opus-4.8", claude, "claude-opus-4.8"},
+		{"exact id case-insensitive", "CLAUDE-OPUS-4.8", claude, "claude-opus-4.8"},
+		{"model name match", "Opus 4.8", []kiroModelInfo{{ModelID: "claude-opus-4.8", ModelName: "Opus 4.8"}}, "claude-opus-4.8"},
+		{"opus keyword", "anything-opus", claude, "claude-opus-4.8"},
+		{"dated sonnet name", "claude-3-5-sonnet-20241022", claude, "claude-sonnet-4.5"},
+		{"haiku keyword", "claude-3-haiku", claude, "claude-haiku-4.5"},
+		{"bare claude picks highest", "claude", claude, "claude-opus-4.8"},
+		{"gpt exact", "gpt-5.6-sol", gpt, "gpt-5.6-sol"},
+		{"gpt keyword tie -> lexicographic", "gpt-4o", gpt, "gpt-5.6-terra"},
+		{"glm exact", "glm-5", glm, "glm-5"},
+		{"deepseek keyword", "deepseek-chat", glm, "deepseek-3.2"},
+		{"qwen keyword", "qwen-2.5", glm, "qwen3-coder-next"},
+		{"mixed claude", "claude-sonnet-4.5", mixed, "claude-sonnet-4.5"},
+		{"mixed gpt", "gpt-5.6-luna", mixed, "gpt-5.6-luna"},
+		{"claude query on gpt-only -> no match", "claude-sonnet-4.5", gpt, ""},
+		{"gpt query on claude-only -> no match", "gpt-4o", claude, ""},
+		{"unknown id never passes through", "some-bogus-9.9", claude, ""},
+		{"auto with flagged default", "auto", []kiroModelInfo{{ModelID: "a"}, {ModelID: "b", Default: true}}, "b"},
+		{"auto no default -> first", "auto", claude, "claude-opus-4.5"},
+		{"empty -> first", "", claude, "claude-opus-4.5"},
+		{"empty list -> no match", "claude-opus-4.8", nil, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, _, ok := resolveModel(c.query, c.models)
+			if c.want == "" {
+				assert.False(t, ok, "expected no match for %q", c.query)
+				return
+			}
+			require.True(t, ok, "expected match %q for %q", c.want, c.query)
+			assert.Equal(t, c.want, got)
+		})
+	}
+}
+
+// TestResolveModelTierAndLegacy covers the selection semantics added on review:
+// flagship-tier preference on version ties, LEGACY filtering, and trimmed exact
+// matching.
+func TestResolveModelTierAndLegacy(t *testing.T) {
+	// Tied versions: a bare "claude" prefers the opus flagship, not the
+	// lexicographic sonnet.
+	tied := []kiroModelInfo{
+		{ModelID: "claude-opus-4.5"}, {ModelID: "claude-sonnet-4.5"}, {ModelID: "claude-haiku-4.5"},
+	}
+	got, _, ok := resolveModel("claude", tied)
+	require.True(t, ok)
+	assert.Equal(t, "claude-opus-4.5", got, "bare claude prefers opus on a version tie")
+
+	// LEGACY models lose to active ones even at a higher version.
+	mixed := []kiroModelInfo{
+		{ModelID: "claude-opus-4.8", Status: "ACTIVE"},
+		{ModelID: "claude-opus-4.9-preview", Status: "LEGACY"},
+	}
+	got, _, ok = resolveModel("opus", mixed)
+	require.True(t, ok)
+	assert.Equal(t, "claude-opus-4.8", got, "LEGACY must not win over an active model")
+
+	// auto with no flagged default avoids a legacy models[0].
+	autoList := []kiroModelInfo{
+		{ModelID: "claude-haiku-4.5", Status: "LEGACY"},
+		{ModelID: "claude-opus-4.8", Status: "ACTIVE"},
+	}
+	got, _, ok = resolveModel("auto", autoList)
+	require.True(t, ok)
+	assert.Equal(t, "claude-opus-4.8", got, "auto avoids the legacy first entry")
+
+	// A whitespace-padded exact id matches exactly (no fallthrough to family).
+	got, _, ok = resolveModel("  claude-opus-4.8  ", []kiroModelInfo{{ModelID: "claude-opus-4.8"}, {ModelID: "claude-opus-4.9"}})
+	require.True(t, ok)
+	assert.Equal(t, "claude-opus-4.8", got, "padded exact id must match exactly")
+}
+
+// buildKiroRequestWithModel must stamp the explicit modelId on every user turn
+// (current, system preamble, each history user turn) and never use areq.Model.
+func TestBuildKiroRequestWithModel(t *testing.T) {
+	const custom = "gpt-5.6-sol"
+	areq := &anthropicRequest{
+		Model:  "claude-opus-4.8", // must be ignored in favor of the explicit id
+		System: json.RawMessage(`"sys"`),
+		Messages: []anthropicMessage{
+			{Role: "user", Content: json.RawMessage(`"hi"`)},
+			{Role: "assistant", Content: json.RawMessage(`"hello"`)},
+			{Role: "user", Content: json.RawMessage(`"again"`)},
+		},
+	}
+	k, err := buildKiroRequestWithModel(&Config{}, areq, custom)
+	require.NoError(t, err)
+
+	assert.Equal(t, custom, k.ConversationState.CurrentMessage.UserInputMessage.ModelID)
+
+	// history layout: [preamble-user, preamble-assistant, user-hi, assistant-hello]
+	hist := k.ConversationState.History
+	require.Len(t, hist, 4)
+	require.NotNil(t, hist[0].UserInputMessage)
+	assert.Equal(t, custom, hist[0].UserInputMessage.ModelID, "preamble user turn")
+	require.NotNil(t, hist[1].AssistantResponseMessage)
+	require.NotNil(t, hist[2].UserInputMessage)
+	assert.Equal(t, custom, hist[2].UserInputMessage.ModelID, "history user turn")
+	require.NotNil(t, hist[3].AssistantResponseMessage)
+}
+
+// When the last message is an assistant prefill, the synthesized current user
+// turn carries the explicit modelId.
+func TestBuildKiroRequestWithModelPrefill(t *testing.T) {
+	const custom = "glm-5"
+	areq := &anthropicRequest{
+		Messages: []anthropicMessage{
+			{Role: "user", Content: json.RawMessage(`"hi"`)},
+			{Role: "assistant", Content: json.RawMessage(`"partial"`)},
+		},
+	}
+	k, err := buildKiroRequestWithModel(&Config{}, areq, custom)
+	require.NoError(t, err)
+	assert.Equal(t, custom, k.ConversationState.CurrentMessage.UserInputMessage.ModelID)
+}
+
 func TestMediaTypeToKiroImageFormat(t *testing.T) {
 	ok := map[string]string{
 		"image/png": "png", "image/jpeg": "jpeg", "image/jpg": "jpeg",

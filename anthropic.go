@@ -246,18 +246,225 @@ func mapModel(model string) string {
 	return "auto"
 }
 
+// resolveModel maps a client-supplied model name to a concrete modelId from the
+// given account's available models, returning the matched model. ok is false
+// when no model on this account matches, so the caller skips the account rather
+// than sending a request the runtime would reject as INVALID_MODEL_ID. It is a
+// pure function over the cached list (no I/O).
+//
+// Unlike mapModel it never passes an unknown id through: an unmatched name
+// yields ok=false instead of a guess. mapModel stays as a last-resort fallback
+// when an account's list cannot be fetched.
+func resolveModel(clientModel string, models []kiroModelInfo) (string, kiroModelInfo, bool) {
+	if len(models) == 0 {
+		return "", kiroModelInfo{}, false
+	}
+	trimmed := strings.TrimSpace(clientModel)
+	q := strings.ToLower(trimmed)
+
+	// auto/default/empty: the account's flagged default, else an active model
+	// (avoiding LEGACY), else the first model.
+	if q == "" || q == "auto" || q == "default" {
+		for _, m := range models {
+			if m.Default || m.IsDefault {
+				return m.ModelID, m, true
+			}
+		}
+		if a := preferActive(models); len(a) > 0 {
+			return a[0].ModelID, a[0], true
+		}
+		return models[0].ModelID, models[0], true
+	}
+
+	// Exact id, then exact display name (case-insensitive, whitespace-trimmed).
+	for _, m := range models {
+		if strings.EqualFold(m.ModelID, trimmed) {
+			return m.ModelID, m, true
+		}
+	}
+	for _, m := range models {
+		if strings.EqualFold(m.ModelName, trimmed) {
+			return m.ModelID, m, true
+		}
+	}
+
+	// Family keyword (carrying tier, if any): best-effort for vague names like
+	// "claude-3-5-sonnet-20241022" or "gpt-4o". Picks the highest version.
+	if id, m, ok := matchByFamily(q, models); ok {
+		return id, m, true
+	}
+
+	return "", kiroModelInfo{}, false
+}
+
+// modelFamilies maps a family keyword found in the query to a predicate over a
+// candidate model id. The order matters only for the claude family, which also
+// recognizes the opus/sonnet/haiku tiers.
+func modelFamily(q string) (family, tier string) {
+	switch {
+	case strings.Contains(q, "claude") || strings.Contains(q, "opus") ||
+		strings.Contains(q, "sonnet") || strings.Contains(q, "haiku"):
+		family = "claude"
+	case strings.Contains(q, "gpt"):
+		family = "gpt"
+	case strings.Contains(q, "glm"):
+		family = "glm"
+	case strings.Contains(q, "deepseek"):
+		family = "deepseek"
+	case strings.Contains(q, "minimax"):
+		family = "minimax"
+	case strings.Contains(q, "qwen"):
+		family = "qwen"
+	}
+	for _, t := range []string{"opus", "sonnet", "haiku"} {
+		if strings.Contains(q, t) {
+			tier = t
+			break
+		}
+	}
+	return family, tier
+}
+
+// matchByFamily narrows models to the same family (and tier, if specified) as
+// the query and returns the highest-version match.
+func matchByFamily(q string, models []kiroModelInfo) (string, kiroModelInfo, bool) {
+	family, tier := modelFamily(q)
+	if family == "" {
+		return "", kiroModelInfo{}, false
+	}
+	var cands []kiroModelInfo
+	for _, m := range models {
+		id := strings.ToLower(m.ModelID)
+		if !strings.Contains(id, family) {
+			continue
+		}
+		if tier != "" && !strings.Contains(id, tier) {
+			continue
+		}
+		cands = append(cands, m)
+	}
+	cands = preferActive(cands)
+	if len(cands) == 0 {
+		return "", kiroModelInfo{}, false
+	}
+	best := cands[0]
+	for _, c := range cands[1:] {
+		if cmpVersion(c.ModelID, best.ModelID) > 0 {
+			best = c
+		}
+	}
+	return best.ModelID, best, true
+}
+
+// cmpVersion reports whether model id a is newer/preferred over b: first by
+// trailing numeric version segments, then a flagship-tier preference (so a
+// generic family query maps to opus rather than a lexicographic sibling when
+// versions tie), then the id itself.
+func cmpVersion(a, b string) int {
+	if c := compareIntSlices(versionRank(a), versionRank(b)); c != 0 {
+		return c
+	}
+	if c := tierPref(a) - tierPref(b); c != 0 {
+		return c
+	}
+	return strings.Compare(a, b)
+}
+
+// tierPref ranks flagship Claude tiers so a family query without a tier prefers
+// opus over sonnet over haiku when versions tie. Other ids score 0.
+func tierPref(id string) int {
+	id = strings.ToLower(id)
+	switch {
+	case strings.Contains(id, "opus"):
+		return 3
+	case strings.Contains(id, "sonnet"):
+		return 2
+	case strings.Contains(id, "haiku"):
+		return 1
+	}
+	return 0
+}
+
+// preferActive drops LEGACY/retired models when any active ones are present, so
+// a retired higher-version model can't win and trigger INVALID_MODEL_ID.
+func preferActive(cands []kiroModelInfo) []kiroModelInfo {
+	var active []kiroModelInfo
+	for _, c := range cands {
+		if !strings.EqualFold(c.Status, "LEGACY") {
+			active = append(active, c)
+		}
+	}
+	if len(active) > 0 {
+		return active
+	}
+	return cands
+}
+
+// versionRank extracts the numeric segments of an id in order
+// ("claude-opus-4.8" -> [4,8], "minimax-m2.5" -> [2,5], "qwen3-coder-next" -> [3]).
+func versionRank(id string) []int {
+	var ranks []int
+	num, any := 0, false
+	for _, r := range id {
+		if r >= '0' && r <= '9' {
+			num = num*10 + int(r-'0')
+			any = true
+			continue
+		}
+		if any {
+			ranks = append(ranks, num)
+			num, any = 0, false
+		}
+	}
+	if any {
+		ranks = append(ranks, num)
+	}
+	return ranks
+}
+
+func compareIntSlices(a, b []int) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		switch {
+		case a[i] < b[i]:
+			return -1
+		case a[i] > b[i]:
+			return 1
+		}
+	}
+	switch {
+	case len(a) < len(b):
+		return -1
+	case len(a) > len(b):
+		return 1
+	}
+	return 0
+}
+
 // ---------------------------------------------------------------------------
 // Request translation: Anthropic -> Kiro.
 // ---------------------------------------------------------------------------
 
 // buildKiroRequest converts an Anthropic Messages request into the Kiro
-// GenerateAssistantResponse payload.
+// GenerateAssistantResponse payload, resolving the model via the static mapModel
+// fallback. openStream instead calls buildKiroRequestWithModel with an id
+// resolved against the chosen account's actual model list.
 func buildKiroRequest(cfg *Config, areq *anthropicRequest) (*kiroRequest, error) {
+	return buildKiroRequestWithModel(cfg, areq, mapModel(areq.Model))
+}
+
+// buildKiroRequestWithModel is the per-account build entrypoint: modelID is the
+// concrete Kiro modelId stamped on every user turn (current message, prefill
+// placeholder, system preamble, and each history user turn). Assistant turns
+// carry no modelId.
+func buildKiroRequestWithModel(cfg *Config, areq *anthropicRequest, modelID string) (*kiroRequest, error) {
 	if len(areq.Messages) == 0 {
 		return nil, fmt.Errorf("messages must not be empty")
 	}
 
-	modelID := mapModel(areq.Model)
 	system := extractText(areq.System)
 
 	// Convert every Anthropic message to a Kiro message, preserving order.

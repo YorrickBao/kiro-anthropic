@@ -92,6 +92,51 @@ func TestApplyModelRequestFields(t *testing.T) {
 	assert.Nil(t, k.AdditionalModelRequestFields, "auto should be untouched")
 }
 
+// TestApplyFieldsForModel exercises the per-account free function directly (no
+// Server / anyModels lookup), the path openStream uses after resolveModel.
+func TestApplyFieldsForModel(t *testing.T) {
+	// defaults: effort tops out, max_tokens at the ceiling.
+	k := reqForModel("claude-opus-4.8")
+	applyFieldsForModel(k, testOpusModel(), "", 0)
+	assert.Equal(t, "max", effortOf(k))
+	assert.Equal(t, 128000, k.AdditionalModelRequestFields["max_tokens"])
+
+	// caller values honored within range.
+	k = reqForModel("claude-opus-4.8")
+	applyFieldsForModel(k, testOpusModel(), "low", 5000)
+	assert.Equal(t, "low", effortOf(k))
+	assert.Equal(t, 5000, k.AdditionalModelRequestFields["max_tokens"])
+
+	// below the schema minimum clamps up.
+	k = reqForModel("claude-opus-4.8")
+	applyFieldsForModel(k, testOpusModel(), "", 80)
+	assert.Equal(t, 1024, k.AdditionalModelRequestFields["max_tokens"])
+
+	// model without a schema is left untouched.
+	k = reqForModel("claude-sonnet-4.5")
+	applyFieldsForModel(k, testSonnet45Model(), "high", 1000)
+	assert.Nil(t, k.AdditionalModelRequestFields, "model without schema should be untouched")
+}
+
+func TestIsInvalidModelError(t *testing.T) {
+	// Machine reason code wins (pre-stream path sets ReasonCode).
+	assert.True(t, isInvalidModelError(&kiroHTTPError{Status: 400, ReasonCode: "INVALID_MODEL_ID"}))
+	// Body-text fallback when the reason code is absent (the plain-HTTP path).
+	assert.True(t, isInvalidModelError(&kiroHTTPError{
+		Status: 400, Body: `{"message":"Invalid model ID. Please select a different model.","reason":"X"}`}))
+
+	// Wrong status is never a model error.
+	assert.False(t, isInvalidModelError(&kiroHTTPError{Status: 500, ReasonCode: "INVALID_MODEL_ID"}))
+	// A generic 400 without the phrase is not a model error.
+	assert.False(t, isInvalidModelError(&kiroHTTPError{Status: 400, Body: `{"message":"bad input"}`}))
+	// Crucially, a 400 that merely contains "invalid model" (not "invalid model id")
+	// must NOT be misclassified and turned into failover.
+	assert.False(t, isInvalidModelError(&kiroHTTPError{Status: 400, Body: `{"message":"invalid model parameter"}`}))
+	// Sibling validation errors stay distinct.
+	assert.False(t, isInvalidModelError(&kiroHTTPError{Status: 400, ReasonCode: "PROMPT_TOO_LONG"}))
+	assert.False(t, isInvalidModelError(&kiroHTTPError{Status: 400, ReasonCode: "THINKING_SIGNATURE_INVALID"}))
+}
+
 func TestModelInfoJSON(t *testing.T) {
 	info := modelInfoJSON(testOpusModel(), "2026-01-01T00:00:00Z")
 	assert.Equal(t, "model", info["type"])

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,9 +15,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fakeRuntime stands in for runtime.<region>.kiro.dev. It returns 500 for
-// accounts whose bearer token is in badTokens, and 200 (empty stream) otherwise,
-// recording which tokens were seen.
+// fakeRuntime stands in for both runtime.<region>.kiro.dev and
+// management.<region>.kiro.dev (rewriteTransport sends both to it). It returns
+// 500 for accounts whose bearer token is in badTokens, and 200 (empty stream)
+// otherwise, recording which tokens were seen.
 type fakeRuntime struct {
 	srv       *httptest.Server
 	badTokens map[string]bool
@@ -24,17 +27,72 @@ type fakeRuntime struct {
 	// frames). When set for a token, it is served instead of an empty stream,
 	// letting tests exercise post-200 in-stream outcomes.
 	bodies map[string][]byte
+	// modelsFor returns a per-token model list for ListAvailableModels.
+	modelsFor map[string][]kiroModelInfo
+	// modelsError marks tokens whose ListAvailableModels should fail, forcing the
+	// mapModel fallback path.
+	modelsError map[string]bool
+	// invalidModel marks tokens whose GenerateAssistantResponse Send returns a
+	// 400 INVALID_MODEL_ID (simulating a stale cached model list).
+	invalidModel map[string]bool
+	// Recorded on each Send: the bearer token and the modelId that was sent.
+	sendTokens []string
+	sentModels []string
 }
 
 func newFakeRuntime(t *testing.T, bad ...string) *fakeRuntime {
 	t.Helper()
-	f := &fakeRuntime{badTokens: map[string]bool{}, bodies: map[string][]byte{}}
+	f := &fakeRuntime{
+		badTokens:    map[string]bool{},
+		bodies:       map[string][]byte{},
+		modelsFor:    map[string][]kiroModelInfo{},
+		modelsError:  map[string]bool{},
+		invalidModel: map[string]bool{},
+	}
 	for _, b := range bad {
 		f.badTokens[b] = true
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tok := r.Header.Get("Authorization")
 		f.seen = append(f.seen, tok)
+
+		// management endpoint: ListAvailableModels.
+		if r.Header.Get("X-Amz-Target") == "KiroControlPlaneBearerService.ListAvailableModels" {
+			if f.modelsError[tok] {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"message":"models down"}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			out, _ := json.Marshal(map[string]any{"models": f.modelsFor[tok]})
+			_, _ = w.Write(out)
+			return
+		}
+
+		// runtime endpoint: GenerateAssistantResponse — record the sent modelId.
+		if raw, err := io.ReadAll(r.Body); err == nil {
+			var body struct {
+				ConversationState struct {
+					CurrentMessage struct {
+						UserInputMessage struct {
+							ModelID string `json:"modelId"`
+						} `json:"userInputMessage"`
+					} `json:"currentMessage"`
+				} `json:"conversationState"`
+			}
+			if json.Unmarshal(raw, &body) == nil {
+				if mid := body.ConversationState.CurrentMessage.UserInputMessage.ModelID; mid != "" {
+					f.sendTokens = append(f.sendTokens, tok)
+					f.sentModels = append(f.sentModels, mid)
+				}
+			}
+		}
+
+		if f.invalidModel[tok] {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"__type":"com.amazon.kiro.runtimeservice#ValidationException","message":"Invalid model ID. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}`))
+			return
+		}
 		if f.badTokens[tok] {
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte(`{"message":"boom"}`))
@@ -90,7 +148,7 @@ func serverWithPool(t *testing.T, rt *fakeRuntime, accessTokens ...string) *Serv
 	}
 
 	cfg := &Config{}
-	s := &Server{cfg: cfg, kiro: NewKiroClient(cfg, client)}
+	s := &Server{cfg: cfg, kiro: NewKiroClient(cfg, client), modelsCache: map[string]modelsCacheEntry{}}
 	s.setAccounts(store, client)
 	return s
 }
@@ -264,4 +322,85 @@ func TestDepletedAccountSkippedOnNextRequest(t *testing.T) {
 
 	assert.NotContains(t, rt.seen, "Bearer bad", "depleted account is not retried on the next request")
 	assert.Contains(t, rt.seen, "Bearer good")
+}
+
+// msgAreq builds a minimal non-nil Anthropic request so openStream takes the
+// per-account model-resolution path (areq != nil).
+func msgAreq(model string) *anthropicRequest {
+	return &anthropicRequest{
+		Model:     model,
+		MaxTokens: 16,
+		Messages:  []anthropicMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+	}
+}
+
+// TestOpenStreamRoutesToAccountServingModel: a "gpt-4o" request must skip the
+// Claude-only account and land on the GPT account, sending its concrete modelId.
+func TestOpenStreamRoutesToAccountServingModel(t *testing.T) {
+	rt := newFakeRuntime(t)
+	rt.modelsFor["Bearer claude"] = []kiroModelInfo{{ModelID: "claude-opus-4.8"}}
+	rt.modelsFor["Bearer gpt"] = []kiroModelInfo{{ModelID: "gpt-5.6-sol"}}
+	s := serverWithPool(t, rt, "claude", "gpt")
+
+	stream, err := s.openStream(context.Background(), &kiroRequest{}, msgAreq("gpt-4o"))
+	require.NoError(t, err)
+	require.NotNil(t, stream)
+	stream.Close()
+
+	require.Len(t, rt.sentModels, 1, "exactly one Send should occur")
+	assert.Equal(t, "gpt-5.6-sol", rt.sentModels[0], "resolved to the account's concrete model")
+	assert.Equal(t, []string{"Bearer gpt"}, rt.sendTokens, "routed to the gpt account only")
+}
+
+// TestOpenStreamSkipsAllAccountsMissingModel: when no account serves the model,
+// nothing is sent and errModelUnavailable surfaces (mapped to 400 by the handler).
+func TestOpenStreamSkipsAllAccountsMissingModel(t *testing.T) {
+	rt := newFakeRuntime(t)
+	rt.modelsFor["Bearer a"] = []kiroModelInfo{{ModelID: "claude-opus-4.8"}}
+	rt.modelsFor["Bearer b"] = []kiroModelInfo{{ModelID: "claude-sonnet-4.5"}}
+	s := serverWithPool(t, rt, "a", "b")
+
+	_, err := s.openStream(context.Background(), &kiroRequest{}, msgAreq("gpt-4o"))
+	require.ErrorIs(t, err, errModelUnavailable)
+	assert.Empty(t, rt.sentModels, "no Send should occur when no account serves the model")
+}
+
+// TestOpenStreamInvalidModelFailsOver: a stale cached list that causes an
+// INVALID_MODEL_ID is invalidated and the request fails over to a good account.
+func TestOpenStreamInvalidModelFailsOver(t *testing.T) {
+	rt := newFakeRuntime(t)
+	rt.modelsFor["Bearer stale"] = []kiroModelInfo{{ModelID: "gpt-5.6-sol"}}
+	rt.modelsFor["Bearer good"] = []kiroModelInfo{{ModelID: "gpt-5.6-sol"}}
+	rt.invalidModel["Bearer stale"] = true
+	rt.bodies["Bearer good"] = contentFrame("hi")
+	s := serverWithPool(t, rt, "stale", "good")
+
+	stream, err := s.openStream(context.Background(), &kiroRequest{}, msgAreq("gpt-5.6-sol"))
+	require.NoError(t, err, "INVALID_MODEL_ID should fail over to the good account")
+	require.NotNil(t, stream)
+	stream.Close()
+
+	assert.Contains(t, rt.sendTokens, "Bearer stale")
+	assert.Contains(t, rt.sendTokens, "Bearer good")
+	s.modelsMu.Lock()
+	_, present := s.modelsCache["stale"]
+	s.modelsMu.Unlock()
+	assert.False(t, present, "stale model cache should be invalidated after INVALID_MODEL_ID")
+}
+
+// TestOpenStreamColdCacheFallsBackToMapModel: when an account's model list can't
+// be fetched, the static mapModel guess is sent so a transient failure can't
+// regress behavior.
+func TestOpenStreamColdCacheFallsBackToMapModel(t *testing.T) {
+	rt := newFakeRuntime(t)
+	rt.modelsError["Bearer a"] = true
+	s := serverWithPool(t, rt, "a")
+
+	stream, err := s.openStream(context.Background(), &kiroRequest{}, msgAreq("claude-opus-4-8-20260101"))
+	require.NoError(t, err)
+	require.NotNil(t, stream)
+	stream.Close()
+
+	require.Len(t, rt.sentModels, 1)
+	assert.Equal(t, "claude-opus-4.8", rt.sentModels[0], "dated name maps to claude-opus-4.8 via the static fallback")
 }

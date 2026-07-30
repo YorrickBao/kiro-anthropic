@@ -35,6 +35,16 @@ func newScriptedPromptRuntime(t *testing.T, respond func(int, *kiroRequest, *htt
 		bodies:    map[string][]byte{},
 	}}
 	scripted.fake.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Serve the model list without consuming a scripted call; the test's
+		// respond() is only concerned with GenerateAssistantResponse sends.
+		// Opus carries a schema so effort/max_tokens fields are exercised; the
+		// bare sonnet matches the other models these tests request.
+		if r.Header.Get("X-Amz-Target") == "KiroControlPlaneBearerService.ListAvailableModels" {
+			out, _ := json.Marshal(map[string]any{"models": []kiroModelInfo{testOpusModel(), {ModelID: "claude-sonnet-4.5"}}})
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(out)
+			return
+		}
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("read request body: %v", err)
@@ -128,6 +138,43 @@ func historyLengths(requests []kiroRequest) []int {
 
 func requestHasReasoning(request kiroRequest) bool {
 	return hasReasoningInHistory(&request)
+}
+
+// TestOpenStreamPromptTooLongRebuildKeepsAccountModel guards the per-account
+// rebuild: after a PROMPT_TOO_LONG trim, the retry must still carry the resolved
+// modelId AND the clamped AdditionalModelRequestFields (not the stale global
+// copy, and not dropped).
+func TestOpenStreamPromptTooLongRebuildKeepsAccountModel(t *testing.T) {
+	runtime := newScriptedPromptRuntime(t, func(call int, _ *kiroRequest, _ *http.Request) scriptedRuntimeReply {
+		if call == 1 {
+			return promptTooLongReply()
+		}
+		return successfulEmptyStreamReply()
+	})
+	s := serverWithPool(t, runtime.fake, "a", "b")
+	areq := &anthropicRequest{Model: "claude-opus-4.8", MaxTokens: 4096, Messages: []anthropicMessage{
+		{Role: "user", Content: json.RawMessage(`"one"`)},
+		{Role: "assistant", Content: json.RawMessage(`"two"`)},
+		{Role: "user", Content: json.RawMessage(`"three"`)},
+		{Role: "assistant", Content: json.RawMessage(`"four"`)},
+		{Role: "user", Content: json.RawMessage(`"five"`)},
+	}}
+
+	stream, err := s.openStream(context.Background(), buildPromptRetryRequest(t, s, areq), areq)
+	require.NoError(t, err)
+	require.NotNil(t, stream)
+	require.NoError(t, stream.Close())
+
+	requests, tokens := runtime.snapshot()
+	require.Len(t, requests, 2, "prompt-too-long then success")
+	assertSingleAccount(t, tokens)
+	for i, r := range requests {
+		assert.Equal(t, "claude-opus-4.8", r.ConversationState.CurrentMessage.UserInputMessage.ModelID,
+			"send %d must keep the per-account resolved modelId", i)
+		// JSON round-trip makes numbers float64.
+		assert.Equal(t, float64(4096), r.AdditionalModelRequestFields["max_tokens"],
+			"send %d must keep the clamped max_tokens after rebuild", i)
+	}
 }
 
 func TestOpenStreamTrimsOneTurnUntilSuccess(t *testing.T) {

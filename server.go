@@ -488,6 +488,15 @@ func (s *Server) invalidateUsage(id string) {
 	s.usageMu.Unlock()
 }
 
+// invalidateModels drops the cached model list for one account, forcing a refetch
+// on the next encounter. Used after an INVALID_MODEL_ID rejection, which means
+// the cached list no longer matches what the runtime will accept.
+func (s *Server) invalidateModels(id string) {
+	s.modelsMu.Lock()
+	delete(s.modelsCache, id)
+	s.modelsMu.Unlock()
+}
+
 // modelInfo returns the cached info for a model id from any account. Used to
 // clamp effort/max_tokens on outgoing requests.
 func (s *Server) modelInfo(ctx context.Context, modelID string) (kiroModelInfo, bool) {
@@ -500,11 +509,9 @@ func (s *Server) modelInfo(ctx context.Context, modelID string) (kiroModelInfo, 
 }
 
 // applyModelRequestFields sets reasoning effort and max output tokens on the
-// outgoing request. Both are request-driven with a "top out" default: if the
-// client specified a value it is honored (clamped to the model), otherwise the
-// model's maximum is used. Only fields the model's schema actually declares are
-// set, so models without them (e.g. "auto", claude-sonnet-4.5) are left
-// untouched and never rejected.
+// outgoing request using the model schema resolved from the current message's
+// modelId (via the global "any account" list). openStream instead calls
+// applyFieldsForModel directly with the per-account matched model.
 func (s *Server) applyModelRequestFields(ctx context.Context, kreq *kiroRequest, reqEffort string, reqMaxTokens int) {
 	um := kreq.ConversationState.CurrentMessage.UserInputMessage
 	if um == nil || um.ModelID == "" || um.ModelID == "auto" {
@@ -514,7 +521,16 @@ func (s *Server) applyModelRequestFields(ctx context.Context, kreq *kiroRequest,
 	if !ok {
 		return
 	}
+	applyFieldsForModel(kreq, model, reqEffort, reqMaxTokens)
+}
 
+// applyFieldsForModel clamps reasoning effort and max output tokens onto
+// kreq.AdditionalModelRequestFields using the matched model's schema directly.
+// Both are request-driven with a "top out" default: a client-specified value is
+// honored (clamped to the model), otherwise the model's maximum is used. Only
+// fields the model's schema actually declares are set, so models without them
+// (e.g. "auto", claude-sonnet-4.5) are left untouched and never rejected.
+func applyFieldsForModel(kreq *kiroRequest, model kiroModelInfo, reqEffort string, reqMaxTokens int) {
 	fields := map[string]any{}
 
 	// Reasoning effort: client's requested level, defaulting to the model's
@@ -599,9 +615,9 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Effort and max output tokens: request-driven, defaulting to the model max.
-	// Independent of the account, so compute once.
-	s.applyModelRequestFields(r.Context(), kreq, requestedEffort(&areq), areq.MaxTokens)
+	// Effort, max output tokens, and the modelId itself are resolved per account
+	// inside openStream — the chosen account's model list determines both the id
+	// and its schema — so nothing model-specific is applied to this seed kreq.
 
 	// Open the upstream stream, dispatching across accounts with pre-stream
 	// failover. Once streaming begins (headers sent) no further retry is possible.
@@ -609,6 +625,10 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, errNoAccount) {
 			writeAnthropicError(w, r, http.StatusServiceUnavailable, "api_error", err.Error())
+			return
+		}
+		if errors.Is(err, errModelUnavailable) {
+			writeAnthropicError(w, r, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
 		}
 		status, errType := mapUpstreamError(err)
@@ -641,22 +661,70 @@ const maxPromptTooLongRetries = 5
 // the caller knows to sign in or import one via the admin page.
 var errNoAccount = fmt.Errorf("no account available; sign in or import one via the admin page")
 
+// errModelUnavailable is returned when every usable account's model list was
+// fetched and none serves the requested model. Mapped to 400 so the client
+// knows the model is the problem, not account availability.
+var errModelUnavailable = fmt.Errorf("requested model is not available on any account")
+
 // openStream opens the upstream stream, dispatching across stored accounts with
-// pre-stream failover. The per-account profileArn is set on kreq before each
-// attempt. An empty pool returns errNoAccount (mapped to 503).
+// pre-stream failover. For each account it resolves the requested model against
+// that account's available-model list and rebuilds the request with a modelId
+// the runtime will accept; accounts that don't serve the model are skipped
+// without sending. The per-account profileArn is set on kreq before each
+// attempt. An empty pool returns errNoAccount (mapped to 503); a model no
+// account serves returns errModelUnavailable (mapped to 400).
 //
 // A prompt-too-long rejection removes one oldest closed conversation unit and
-// retries on the same account, up to maxPromptTooLongRetries. Other request-level
-// errors surface at once; account failures continue through the pool.
+// retries on the same account, up to maxPromptTooLongRetries. An INVALID_MODEL_ID
+// rejection invalidates this account's cached model list and fails over. Other
+// request-level errors surface at once; account failures continue through the pool.
 func (s *Server) openStream(ctx context.Context, kreq *kiroRequest, areq *anthropicRequest) (*kiroStream, error) {
 	if s.selector == nil || len(s.accounts.List()) == 0 {
 		return nil, errNoAccount
+	}
+
+	// Request-driven model fields are resolved per account (the chosen account's
+	// matched model carries its own effort/token schema), so pull them from areq
+	// up front.
+	reqEffort := ""
+	var reqMaxTokens int
+	if areq != nil {
+		reqEffort = requestedEffort(areq)
+		reqMaxTokens = areq.MaxTokens
 	}
 
 	tried := map[string]bool{}
 	var lastErr error
 	promptTooLongRetries := 0
 	reasoningStripped := false
+	modelSkipped := false // an account was skipped because it doesn't serve the model
+
+	// Per-account resolved model for the current attempt, kept in outer scope so
+	// the prompt-too-long rebuild reuses it instead of re-resolving.
+	var (
+		resolved string
+		info     kiroModelInfo
+		hasInfo  bool
+	)
+
+	// rebuild re-derives the request for the current account: a concrete modelId
+	// valid on this account, the per-model request fields, the profileArn, and —
+	// if a prior turn stripped reasoning — a stripped history. It replaces kreq.
+	rebuild := func(arn string) error {
+		next, err := buildKiroRequestWithModel(s.cfg, areq, resolved)
+		if err != nil {
+			return err
+		}
+		next.ProfileArn = arn
+		if hasInfo {
+			applyFieldsForModel(next, info, reqEffort, reqMaxTokens)
+		}
+		if reasoningStripped {
+			stripReasoningFromHistory(next)
+		}
+		kreq = next
+		return nil
+	}
 
 	for attempt := 0; attempt < maxAccountAttempts; attempt++ {
 		creds, ok := s.selector.pick(tried)
@@ -674,7 +742,38 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest, areq *anthro
 			s.selector.recordFailure(creds.id)
 			continue
 		}
-		kreq.ProfileArn = arn
+
+		// Resolve the model against THIS account's available list and rebuild the
+		// request with a modelId the runtime will accept. Accounts that don't
+		// serve the model are skipped without sending.
+		if areq != nil {
+			models, merr := s.ensureModels(ctx, creds)
+			switch {
+			case merr != nil || len(models) == 0:
+				// Can't determine this account's list (cold/network): fall back to
+				// the static id guess, and — when the global model cache knows its
+				// schema — still apply effort/max_tokens so a transient fetch
+				// failure can't silently drop them (the pre-routing behavior).
+				resolved = mapModel(areq.Model)
+				if mi, ok := s.modelInfo(ctx, resolved); ok {
+					info, hasInfo = mi, true
+				} else {
+					info, hasInfo = kiroModelInfo{}, false
+				}
+			default:
+				r, mi, ok := resolveModel(areq.Model, models)
+				if !ok {
+					modelSkipped = true
+					continue // account doesn't serve this model; try another
+				}
+				resolved, info, hasInfo = r, mi, true
+			}
+			if buildErr := rebuild(arn); buildErr != nil {
+				return nil, fmt.Errorf("rebuild request for account %s: %w", creds.id, buildErr)
+			}
+		} else {
+			kreq.ProfileArn = arn // nil-areq (test) path: use the request as-is
+		}
 
 		for {
 			hadReasoning := hasReasoningInHistory(kreq)
@@ -708,19 +807,9 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest, areq *anthro
 				if areq == nil || promptTooLongRetries >= maxPromptTooLongRetries || !trimOldestCompleteTurn(areq) {
 					return nil, sendErr
 				}
-
-				next, buildErr := buildKiroRequest(s.cfg, areq)
-				if buildErr != nil {
+				if buildErr := rebuild(arn); buildErr != nil {
 					return nil, fmt.Errorf("rebuild trimmed request: %w", buildErr)
 				}
-				// These fields depend on the model request, not its history. Reuse
-				// the already-resolved settings instead of repeating a model lookup.
-				next.AdditionalModelRequestFields = kreq.AdditionalModelRequestFields
-				next.ProfileArn = arn
-				if reasoningStripped {
-					stripReasoningFromHistory(next)
-				}
-				kreq = next
 				promptTooLongRetries++
 				continue
 			}
@@ -728,6 +817,13 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest, areq *anthro
 			if isThinkingSignatureError(sendErr) && !reasoningStripped && stripReasoningFromHistory(kreq) {
 				reasoningStripped = true
 				continue
+			}
+
+			if isInvalidModelError(sendErr) {
+				// Cached list is stale for this account: drop it and fail over to
+				// another account that serves the model.
+				s.invalidateModels(creds.id)
+				break
 			}
 
 			if !isAccountFailure(sendErr) {
@@ -745,6 +841,9 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest, areq *anthro
 		}
 	}
 	if lastErr == nil {
+		if modelSkipped {
+			return nil, errModelUnavailable
+		}
 		lastErr = errNoAccount
 	}
 	return nil, lastErr
@@ -832,6 +931,25 @@ func isThinkingSignatureError(err error) bool {
 	// Fallback when the machine reason is absent: sniff the message text.
 	body := strings.ToLower(he.Body)
 	return strings.Contains(body, "thinking") && strings.Contains(body, "signature")
+}
+
+// isInvalidModelError reports whether the runtime rejected the request because
+// the modelId is not served (by this account/region). Unlike other 400s this is
+// recoverable: the cached model list may be stale, so the caller invalidates it
+// and fails over to another account that serves the model.
+func isInvalidModelError(err error) bool {
+	he, ok := err.(*kiroHTTPError)
+	if !ok || he.Status != http.StatusBadRequest {
+		return false
+	}
+	if he.reason() == "INVALID_MODEL_ID" {
+		return true
+	}
+	// Text fallback only when the machine reason is absent. Require the specific
+	// phrase so an unrelated 400 that merely says "invalid model …" isn't
+	// misclassified and turned into account failover.
+	body := strings.ToLower(he.Body)
+	return strings.Contains(body, "invalid model id")
 }
 
 // aggregateMessages handles non-streaming requests: collect all events, then

@@ -363,20 +363,20 @@ func convertMessage(m anthropicMessage, modelID string) (kiroMessage, error) {
 					am.ReasoningContent = &kiroReasoningContent{RedactedContent: b.Data}
 				}
 			case "tool_use":
-				input := b.Input
-				if len(input) == 0 {
-					input = json.RawMessage(`{}`)
-				}
+				// The Kiro runtime requires toolUse.input to be a JSON object;
+				// a null or non-object value is rejected as "Invalid tool use
+				// format". Coerce to {} unless it is already an object.
 				am.ToolUses = append(am.ToolUses, kiroToolUse{
 					ToolUseID: b.ID,
 					Name:      b.Name,
-					Input:     input,
+					Input:     objectToolInput(b.Input),
 				})
 			}
 		}
 		am.Content = text.String()
-		// CodeWhisperer expects some content; keep a placeholder if empty but
-		// tool uses exist so the turn is well-formed.
+		// An assistant turn carrying tool uses is well-formed with empty
+		// content; only a degenerate turn with neither text nor tool uses
+		// needs a placeholder so the message is not empty.
 		if am.Content == "" && len(am.ToolUses) == 0 {
 			am.Content = " "
 		}
@@ -972,6 +972,24 @@ func (a *blockAssembler) outputChars() int {
 		n += len(b.Text) + len(b.Thinking) + len(b.Data) + len(b.Input)
 	}
 	return n
+}
+
+// objectToolInput coerces a request-side tool_use "input" to a JSON object,
+// which the Kiro runtime (CodeWhisperer) requires. Missing, null, or any
+// non-object value (array, string, number, or malformed JSON) is replaced with
+// {}, so the upstream never answers with "Invalid tool use format". A
+// well-formed object passes through untouched.
+func objectToolInput(raw json.RawMessage) json.RawMessage {
+	s := strings.TrimSpace(string(raw))
+	if s == "" {
+		return json.RawMessage(`{}`)
+	}
+	// The only JSON value that begins with '{' is an object; anything else
+	// (null, array, scalar, or malformed) is not a valid object input.
+	if strings.HasPrefix(s, "{") && json.Valid([]byte(s)) {
+		return json.RawMessage(s)
+	}
+	return json.RawMessage(`{}`)
 }
 
 // normalizeToolInput ensures tool input is valid JSON, defaulting to {}.

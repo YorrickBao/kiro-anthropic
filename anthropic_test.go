@@ -80,6 +80,47 @@ func TestNormalizeToolInput(t *testing.T) {
 	assert.Equal(t, "not json", m["_raw"], "invalid json should be wrapped")
 }
 
+// objectToolInput must keep real objects and coerce anything else to {} so the
+// Kiro runtime never sees "Invalid tool use format".
+func TestObjectToolInput(t *testing.T) {
+	cases := map[string]string{
+		"":              `{}`,
+		"null":          `{}`,
+		"{}":            `{}`,
+		`{"a":1}`:       `{"a":1}`,
+		"  {\"a\":1}  ": `{"a":1}`,
+		"[]":            `{}`, // array is not an object
+		`"str"`:         `{}`, // scalar string
+		"42":            `{}`, // number
+		"true":          `{}`,
+		"not json":      `{}`,
+		`{"a":}`:        `{}`, // malformed object
+	}
+	for in, want := range cases {
+		assert.Equal(t, want, string(objectToolInput(json.RawMessage(in))), "input %q", in)
+	}
+}
+
+// A tool_use echoed back with a null/missing input must still serialize as a
+// valid object input on the way to Kiro.
+func TestBuildKiroRequestToolUseInputCoerced(t *testing.T) {
+	areq := &anthropicRequest{
+		Model: "claude-opus-4.8",
+		Messages: []anthropicMessage{
+			{Role: "user", Content: json.RawMessage(`"go"`)},
+			{Role: "assistant", Content: json.RawMessage(`[{"type":"tool_use","id":"tu1","name":"noargs","input":null}]`)},
+			{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"tu1","content":"ok"}]`)},
+		},
+	}
+	k, err := buildKiroRequest(&Config{}, areq)
+	require.NoError(t, err)
+	require.Len(t, k.ConversationState.History, 2)
+	am := k.ConversationState.History[1].AssistantResponseMessage
+	require.NotNil(t, am)
+	require.Len(t, am.ToolUses, 1)
+	assert.Equal(t, `{}`, string(am.ToolUses[0].Input), "null input must be coerced to {}")
+}
+
 func TestExtractText(t *testing.T) {
 	assert.Equal(t, "hi", extractText(json.RawMessage(`"hi"`)))
 	assert.Equal(t, "ab", extractText(json.RawMessage(`[{"type":"text","text":"a"},{"type":"text","text":"b"}]`)))

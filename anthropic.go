@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -504,7 +506,7 @@ func buildKiroRequestWithModel(cfg *Config, areq *anthropicRequest, modelID stri
 			current.UserInputMessage.UserInputMessageContext.Tools = append(
 				current.UserInputMessage.UserInputMessageContext.Tools,
 				kiroTool{ToolSpecification: kiroToolSpecification{
-					Name:        t.Name,
+					Name:        shortenToolName(t.Name),
 					Description: t.Description,
 					InputSchema: kiroInputSchema{JSON: schema},
 				}},
@@ -575,7 +577,7 @@ func convertMessage(m anthropicMessage, modelID string) (kiroMessage, error) {
 				// format". Coerce to {} unless it is already an object.
 				am.ToolUses = append(am.ToolUses, kiroToolUse{
 					ToolUseID: b.ID,
-					Name:      b.Name,
+					Name:      shortenToolName(b.Name),
 					Input:     objectToolInput(b.Input),
 				})
 			}
@@ -924,6 +926,11 @@ type blockAssembler struct {
 	toolName     string
 	toolInputBuf strings.Builder
 
+	// toolNameMap restores original tool names on tool_use responses when the
+	// request side shortened an over-long name (shortened -> original). Nil when
+	// no tool name needed shortening.
+	toolNameMap map[string]string
+
 	blocks     []anthropicRespBlock
 	sawToolUse bool
 
@@ -938,8 +945,8 @@ type blockAssembler struct {
 	leakCarry string
 }
 
-func newBlockAssembler(emit emitFunc) *blockAssembler {
-	return &blockAssembler{emit: emit, emitThinking: true}
+func newBlockAssembler(emit emitFunc, toolNameMap map[string]string) *blockAssembler {
+	return &blockAssembler{emit: emit, emitThinking: true, toolNameMap: toolNameMap}
 }
 
 // addReasoning folds a Kiro reasoningContentEvent into a thinking (or
@@ -1048,6 +1055,12 @@ func (a *blockAssembler) addToolUse(ev *kiroEvent) error {
 		a.openKind = "tool_use"
 		a.toolID = ev.ToolUseID
 		a.toolName = ev.ToolName
+		// Restore the original tool name if the request side shortened it.
+		if a.toolNameMap != nil {
+			if orig, ok := a.toolNameMap[a.toolName]; ok {
+				a.toolName = orig
+			}
+		}
 		a.toolInputBuf.Reset()
 		a.sawToolUse = true
 		if err := a.send("content_block_start", map[string]any{
@@ -1179,6 +1192,50 @@ func (a *blockAssembler) outputChars() int {
 		n += len(b.Text) + len(b.Thinking) + len(b.Data) + len(b.Input)
 	}
 	return n
+}
+
+// maxKiroToolName is the longest tool name the Kiro runtime accepts; longer
+// names are rejected as "Invalid tool use format".
+const maxKiroToolName = 64
+
+// shortenToolName returns a Kiro-safe tool name (<= maxKiroToolName bytes). Names
+// at or under the limit pass through unchanged. A longer name is shortened to a
+// stable prefix plus a hash of the full name: the same input always shortens the
+// same way (so the proxy can map a returned name back to the original) and
+// distinct long names stay distinct.
+func shortenToolName(name string) string {
+	if len(name) <= maxKiroToolName {
+		return name
+	}
+	h := toolNameHash(name)
+	prefix := maxKiroToolName - 1 - len(h) // 1 byte for the '_' separator
+	if prefix < 0 {
+		prefix = 0
+	}
+	return name[:prefix] + "_" + h
+}
+
+func toolNameHash(s string) string {
+	h := fnv.New64a()
+	h.Write([]byte(s))
+	return strconv.FormatUint(h.Sum64(), 16)
+}
+
+// toolNameMapFor builds shortened-name -> original-name entries for every tool
+// whose name shortenToolName changes. The response assembler uses it to restore
+// the original name on tool_use blocks so the client still recognizes the tool.
+func toolNameMapFor(tools []anthropicTool) map[string]string {
+	var m map[string]string
+	for _, t := range tools {
+		s := shortenToolName(t.Name)
+		if s != t.Name {
+			if m == nil {
+				m = map[string]string{}
+			}
+			m[s] = t.Name
+		}
+	}
+	return m
 }
 
 // objectToolInput coerces a request-side tool_use "input" to a JSON object,

@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 	"unicode/utf8"
 
@@ -167,6 +169,69 @@ func TestBuildKiroRequestWithModelPrefill(t *testing.T) {
 	k, err := buildKiroRequestWithModel(&Config{}, areq, custom)
 	require.NoError(t, err)
 	assert.Equal(t, custom, k.ConversationState.CurrentMessage.UserInputMessage.ModelID)
+}
+
+func TestShortenToolName(t *testing.T) {
+	short := "do_thing"
+	assert.Equal(t, short, shortenToolName(short), "short name unchanged")
+
+	long := strings.Repeat("mcp_long_tool_name_", 6) // > 64 chars
+	assert.Greater(t, len(long), maxKiroToolName)
+	got := shortenToolName(long)
+	assert.LessOrEqual(t, len(got), maxKiroToolName, "shortened fits the limit")
+	assert.Equal(t, got, shortenToolName(long), "deterministic")
+	assert.NotEqual(t, got, shortenToolName(long+"_different"), "distinct long names shorten distinctly")
+	assert.Equal(t, got, shortenToolName(got), "idempotent on already-short names")
+
+	m := toolNameMapFor([]anthropicTool{{Name: long}, {Name: short}})
+	assert.Equal(t, long, m[got], "map restores the original")
+	_, present := m[short]
+	assert.False(t, present, "short names are not in the map")
+}
+
+func TestBuildKiroRequestShortensToolNames(t *testing.T) {
+	long := strings.Repeat("mcp_tool_name_", 6) // > 64 chars
+	areq := &anthropicRequest{
+		Model: "auto",
+		Tools: []anthropicTool{{Name: long, InputSchema: json.RawMessage(`{"type":"object"}`)}},
+		Messages: []anthropicMessage{
+			{Role: "user", Content: json.RawMessage(`"go"`)},
+			{Role: "assistant", Content: json.RawMessage(fmt.Sprintf(`[{"type":"tool_use","id":"tu1","name":%q,"input":{}}]`, long))},
+			{Role: "user", Content: json.RawMessage(`[{"type":"tool_result","tool_use_id":"tu1","content":"ok"}]`)},
+		},
+	}
+	k, err := buildKiroRequest(&Config{}, areq)
+	require.NoError(t, err)
+
+	cur := k.ConversationState.CurrentMessage.UserInputMessage
+	require.NotNil(t, cur.UserInputMessageContext)
+	require.Len(t, cur.UserInputMessageContext.Tools, 1)
+	defName := cur.UserInputMessageContext.Tools[0].ToolSpecification.Name
+	assert.NotEqual(t, long, defName, "tool definition name shortened")
+	assert.LessOrEqual(t, len(defName), maxKiroToolName)
+
+	// The history assistant tool_use name is shortened to the same value.
+	am := k.ConversationState.History[1].AssistantResponseMessage
+	require.NotNil(t, am)
+	require.Len(t, am.ToolUses, 1)
+	assert.Equal(t, defName, am.ToolUses[0].Name, "history tool_use name shortened consistently")
+}
+
+func TestBlockAssemblerRestoresShortenedToolName(t *testing.T) {
+	long := strings.Repeat("mcp_tool_", 9) // > 64 chars
+	short := shortenToolName(long)
+	require.Less(t, len(short), len(long))
+
+	a := newBlockAssembler(nil, map[string]string{short: long})
+	_ = a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t1", ToolName: short, ToolInput: `{}`})
+	_ = a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t1", ToolStop: true})
+	for _, b := range a.blocks {
+		if b.Type == "tool_use" {
+			assert.Equal(t, long, b.Name, "assembler restored the original tool name")
+			return
+		}
+	}
+	t.Fatal("no tool_use block produced")
 }
 
 func TestMediaTypeToKiroImageFormat(t *testing.T) {
@@ -413,7 +478,7 @@ func TestBuildKiroRequestAssistantLast(t *testing.T) {
 // --- blockAssembler ---
 
 func TestBlockAssemblerText(t *testing.T) {
-	a := newBlockAssembler(nil)
+	a := newBlockAssembler(nil, nil)
 	_ = a.addText("Hello")
 	_ = a.addText(" world")
 	_ = a.closeOpen()
@@ -424,7 +489,7 @@ func TestBlockAssemblerText(t *testing.T) {
 }
 
 func TestBlockAssemblerToolUse(t *testing.T) {
-	a := newBlockAssembler(nil)
+	a := newBlockAssembler(nil, nil)
 	_ = a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t1", ToolName: "get_weather", ToolInput: `{"city":`})
 	_ = a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t1", ToolInput: `"NYC"}`, ToolStop: true})
 	require.Len(t, a.blocks, 1)
@@ -437,7 +502,7 @@ func TestBlockAssemblerToolUse(t *testing.T) {
 }
 
 func TestBlockAssemblerTextThenTool(t *testing.T) {
-	a := newBlockAssembler(nil)
+	a := newBlockAssembler(nil, nil)
 	_ = a.addText("Answer:")
 	_ = a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t9", ToolName: "f", ToolInput: `{}`, ToolStop: true})
 	_ = a.closeOpen()
@@ -452,7 +517,7 @@ func TestBlockAssemblerSSEEvents(t *testing.T) {
 		events = append(events, event)
 		return nil
 	}
-	a := newBlockAssembler(emit)
+	a := newBlockAssembler(emit, nil)
 	_ = a.addText("hi")
 	_ = a.closeOpen()
 	assert.Equal(t, []string{"content_block_start", "content_block_delta", "content_block_stop"}, events)
@@ -468,7 +533,7 @@ func TestBlockAssemblerToolUseSSE(t *testing.T) {
 		got = append(got, rec{name, data.(map[string]any)})
 		return nil
 	}
-	a := newBlockAssembler(emit)
+	a := newBlockAssembler(emit, nil)
 	_ = a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t1", ToolName: "get_weather",
 		ToolInput: `{"city":"NYC"}`, ToolStop: true})
 
@@ -520,7 +585,7 @@ func TestRequestedEffortThinking(t *testing.T) {
 }
 
 func TestBlockAssemblerReasoning(t *testing.T) {
-	a := newBlockAssembler(nil)
+	a := newBlockAssembler(nil, nil)
 	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningText: "let me "})
 	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningText: "think"})
 	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningSignature: "SIG=="})
@@ -538,7 +603,7 @@ func TestBlockAssemblerReasoning(t *testing.T) {
 
 func TestBlockAssemblerStopReason(t *testing.T) {
 	// 1. tool_use inferred from sawToolUse when no authoritative reason.
-	a := newBlockAssembler(nil)
+	a := newBlockAssembler(nil, nil)
 	_ = a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t", ToolName: "f"})
 	_ = a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t", ToolStop: true})
 	_ = a.closeOpen()
@@ -549,7 +614,7 @@ func TestBlockAssemblerStopReason(t *testing.T) {
 	assert.Equal(t, "max_tokens", a.stopReason(), "authoritative should win")
 
 	// 3. unknown backend value is ignored -> fallback still applies.
-	a2 := newBlockAssembler(nil)
+	a2 := newBlockAssembler(nil, nil)
 	_ = a2.addText("hi")
 	_ = a2.closeOpen()
 	a2.setStopReason("WHATEVER")
@@ -566,7 +631,7 @@ func TestBlockAssemblerReasoningSSE(t *testing.T) {
 		got = append(got, rec{name, data.(map[string]any)})
 		return nil
 	}
-	a := newBlockAssembler(emit)
+	a := newBlockAssembler(emit, nil)
 	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningText: "hmm"})
 	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningSignature: "SIG=="})
 	_ = a.closeOpen()
@@ -590,7 +655,7 @@ func TestBlockAssemblerReasoningSSE(t *testing.T) {
 }
 
 func TestBlockAssemblerReasoningSuppressed(t *testing.T) {
-	a := newBlockAssembler(nil)
+	a := newBlockAssembler(nil, nil)
 	a.emitThinking = false
 	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningText: "secret"})
 	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningSignature: "SIG=="})
@@ -603,7 +668,7 @@ func TestBlockAssemblerReasoningSuppressed(t *testing.T) {
 func TestBlockAssemblerRedactedThinking(t *testing.T) {
 	var events []string
 	emit := func(name string, _ any) error { events = append(events, name); return nil }
-	a := newBlockAssembler(emit)
+	a := newBlockAssembler(emit, nil)
 	_ = a.addReasoning(&kiroEvent{Kind: evReasoning, ReasoningRedacted: "REDACTED=="})
 	_ = a.closeOpen()
 	require.Len(t, a.blocks, 1)
@@ -928,7 +993,7 @@ func countToolUse(blocks []anthropicRespBlock) int {
 // deepseek leaks only the opening marker as trailing text; the tool itself
 // arrives structured. The marker must be stripped, the tool kept.
 func TestToolLeakDeepSeekTrailingMarker(t *testing.T) {
-	a := newBlockAssembler(nil)
+	a := newBlockAssembler(nil, nil)
 	require.NoError(t, a.ingestText("I'll get the weather.\n\n<｜DSML｜function_calls"))
 	require.NoError(t, a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t1",
 		ToolName: "get_weather", ToolInput: `{"city":"Paris"}`, ToolStop: true}))
@@ -944,7 +1009,7 @@ func TestToolLeakDeepSeekTrailingMarker(t *testing.T) {
 
 // The opening marker split across frames must still be stripped.
 func TestToolLeakCrossFrameSplitMarker(t *testing.T) {
-	a := newBlockAssembler(nil)
+	a := newBlockAssembler(nil, nil)
 	require.NoError(t, a.ingestText("Answer.\n\n<｜DSML｜function_c"))
 	require.NoError(t, a.ingestText("alls"))
 	require.NoError(t, a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t1",
@@ -960,7 +1025,7 @@ func TestToolLeakCrossFrameSplitMarker(t *testing.T) {
 
 // The Anthropic-style "<function_calls>" opener is stripped too.
 func TestToolLeakAnthropicMarker(t *testing.T) {
-	a := newBlockAssembler(nil)
+	a := newBlockAssembler(nil, nil)
 	require.NoError(t, a.ingestText("Done.\n<function_calls>"))
 	require.NoError(t, a.finish())
 	assert.Equal(t, "Done.\n", firstText(a.blocks))
@@ -980,7 +1045,7 @@ func TestToolLeakSplitInsideMultibyteRune(t *testing.T) {
 		}
 		return nil
 	}
-	a := newBlockAssembler(emit)
+	a := newBlockAssembler(emit, nil)
 	// Split the marker mid-"｜": "<\xef" ends the first frame, "\xbd\x9c..." the next.
 	full := "Hi.\n\n" + dsmlFunctionCalls
 	mid := len("Hi.\n\n<") + 1 // one byte into the first ｜
@@ -996,7 +1061,7 @@ func TestToolLeakSplitInsideMultibyteRune(t *testing.T) {
 
 // A dangling marker with no following tool (pure leak) is stripped at flush.
 func TestToolLeakTrailingMarkerOnlyStripped(t *testing.T) {
-	a := newBlockAssembler(nil)
+	a := newBlockAssembler(nil, nil)
 	require.NoError(t, a.ingestText("Here you go.\n\n<｜DSML｜function_calls"))
 	require.NoError(t, a.finish())
 	assert.Equal(t, "Here you go.\n\n", firstText(a.blocks))
@@ -1006,7 +1071,7 @@ func TestToolLeakTrailingMarkerOnlyStripped(t *testing.T) {
 // Leaked tool-call BODY is NOT parsed into a phantom tool: strip-only leaves the
 // markup as text and never invents a tool_use. (No parse/rescue by design.)
 func TestToolLeakBodyNotParsedIntoPhantomTool(t *testing.T) {
-	a := newBlockAssembler(nil)
+	a := newBlockAssembler(nil, nil)
 	require.NoError(t, a.ingestText(`x <invoke name="f"><parameter name="a">1</parameter></invoke>`))
 	require.NoError(t, a.finish())
 	assert.Equal(t, 0, countToolUse(a.blocks), "no phantom tool synthesized")
@@ -1015,7 +1080,7 @@ func TestToolLeakBodyNotParsedIntoPhantomTool(t *testing.T) {
 
 // Legitimate text ending in "count" must not be eaten (no count-corruption rule).
 func TestToolLeakCountNotEaten(t *testing.T) {
-	a := newBlockAssembler(nil)
+	a := newBlockAssembler(nil, nil)
 	require.NoError(t, a.ingestText("The final word count"))
 	require.NoError(t, a.finish())
 	assert.Equal(t, "The final word count", firstText(a.blocks))
@@ -1025,12 +1090,12 @@ func TestToolLeakCountNotEaten(t *testing.T) {
 // Prose mentioning "function" or a lone '<' is untouched, and a mid-text
 // "<function_calls>" (not at the end) is not stripped.
 func TestToolLeakNoFalsePositiveOnProse(t *testing.T) {
-	a := newBlockAssembler(nil)
+	a := newBlockAssembler(nil, nil)
 	require.NoError(t, a.ingestText("Use the function foo() when a < b holds"))
 	require.NoError(t, a.finish())
 	assert.Equal(t, "Use the function foo() when a < b holds", firstText(a.blocks))
 
-	b := newBlockAssembler(nil)
+	b := newBlockAssembler(nil, nil)
 	require.NoError(t, b.ingestText("The <function_calls> tag opens a call."))
 	require.NoError(t, b.finish())
 	assert.Equal(t, "The <function_calls> tag opens a call.", firstText(b.blocks))
@@ -1039,7 +1104,7 @@ func TestToolLeakNoFalsePositiveOnProse(t *testing.T) {
 // A held trailing fragment that turns out to be normal text is emitted intact
 // once more text arrives (no data loss from cross-frame hold).
 func TestToolLeakHeldFragmentReleased(t *testing.T) {
-	a := newBlockAssembler(nil)
+	a := newBlockAssembler(nil, nil)
 	require.NoError(t, a.ingestText("ends with <")) // '<' could start a marker
 	require.NoError(t, a.ingestText("b so a<b"))    // ...but it was just prose
 	require.NoError(t, a.finish())
@@ -1065,7 +1130,7 @@ func TestToolLeakStreamingNoMarkerInDeltas(t *testing.T) {
 		}
 		return nil
 	}
-	a := newBlockAssembler(emit)
+	a := newBlockAssembler(emit, nil)
 	require.NoError(t, a.ingestText("Weather:\n\n<｜DSML｜function_c"))
 	require.NoError(t, a.ingestText("alls"))
 	require.NoError(t, a.addToolUse(&kiroEvent{Kind: evToolUse, ToolUseID: "t1",

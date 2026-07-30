@@ -955,7 +955,7 @@ func isInvalidModelError(err error) bool {
 // aggregateMessages handles non-streaming requests: collect all events, then
 // return a single Anthropic message.
 func (s *Server) aggregateMessages(w http.ResponseWriter, r *http.Request, areq *anthropicRequest, stream *kiroStream, inputChars int) {
-	asm := newBlockAssembler(nil)
+	asm := newBlockAssembler(nil, toolNameMapFor(areq.Tools))
 	asm.emitThinking = !thinkingSuppressed(areq)
 
 	for {
@@ -1060,7 +1060,7 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, areq *an
 	}
 	_ = emit("ping", map[string]any{"type": "ping"})
 
-	asm := newBlockAssembler(emit)
+	asm := newBlockAssembler(emit, toolNameMapFor(areq.Tools))
 	asm.emitThinking = !thinkingSuppressed(areq)
 
 	for {

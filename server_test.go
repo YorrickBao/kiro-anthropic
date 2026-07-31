@@ -36,6 +36,39 @@ func testServerWithModels() *Server {
 	return s
 }
 
+func TestAggregateModelUsageExcludesReactivelyDepletedOverage(t *testing.T) {
+	s := testServerWithModels()
+	require.NoError(t, s.accounts.SetOverageEnabled("acc", true))
+
+	// This is the ambiguous snapshot the selector explicitly handles: upstream
+	// clamps currentUsage at the base limit, so the arithmetic heuristic still
+	// sees the full overage cap even after a real request has exhausted it.
+	s.usageCache["acc"] = usageCacheEntry{
+		usage: &kiroUsage{
+			OverageStatus: "ENABLED",
+			Credit: &kiroCreditUsage{
+				Used: 100, Limit: 100, Remaining: 0, OverageCap: 100,
+			},
+		},
+		fetched: time.Now(),
+	}
+
+	before := s.aggregateModelUsage(context.Background(), "claude-opus-4.8")
+	require.Len(t, before.Accounts, 1)
+	assert.True(t, before.Accounts[0].OnOverage)
+	assert.Equal(t, float64(100), before.Totals.OverageCap)
+
+	// A real depletion response is more authoritative than the optimistic
+	// snapshot. Once parked, the account must disappear from the aggregate just
+	// as it does from normal selector routing.
+	s.selector.markDepleted("acc", time.Now().Add(depletedFallbackTTL))
+	after := s.aggregateModelUsage(context.Background(), "claude-opus-4.8")
+	assert.Empty(t, after.Accounts)
+	assert.Equal(t, 0, after.Totals.Accounts)
+	assert.Equal(t, float64(0), after.Totals.OverageCap)
+	assert.Equal(t, 1, after.Excluded)
+}
+
 func reqForModel(model string) *kiroRequest {
 	return &kiroRequest{ConversationState: kiroConversationState{
 		CurrentMessage: kiroMessage{UserInputMessage: &kiroUserInputMessage{ModelID: model}}}}

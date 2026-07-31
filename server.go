@@ -440,13 +440,24 @@ func (s *Server) ensureUsageReadOnly(ctx context.Context, creds *accountCreds) (
 //
 // An account is excluded when it is disabled or credentialless (accountUsable),
 // when its model-list or usage fetch fails (token expired, 403, transport —
-// recorded in Errors), when it does not serve the model, or when its credit is
-// exhausted (Credit nil or Remaining <= 0). It is a READ-ONLY query: usage is
-// read via ensureUsageReadOnly so it does not park accounts in the selector's
-// depleted map (unlike the admin status page, which intentionally reconciles).
-// Each per-account call is cache-backed (ensureModels 5m / usage 60s); accounts
-// are fanned out concurrently under a cap. The "serves this model" test reuses
-// resolveModel (the router's definition) so routing and this view agree.
+// recorded in Errors), when it does not serve the model, or when its base
+// credit is exhausted with no overage fallback (Credit nil, or Remaining <= 0
+// unless the account opts in via OverageEnabled, upstream has overage active
+// (overageActive), it still has overage budget, and the selector has not parked
+// it after a real depletion response). An account serving on overage alone
+// (base spent, overage active, opt-in, budget left) is INCLUDED and flagged
+// OnOverage, so this view matches what applyUsage and the selector's depleted
+// state actually route. It is a
+// READ-ONLY query: usage is read via ensureUsageReadOnly so it does not park
+// accounts in the selector's depleted map (unlike the admin status page, which
+// intentionally reconciles). Each per-account call is cache-backed (ensureModels
+// 5m / usage 60s); accounts are fanned out concurrently under a cap. The
+// "serves this model" test reuses resolveModel (the router's definition) so
+// routing and this view agree.
+//
+// Overage is surfaced as raw upstream fields only (cap/rate/status) plus the
+// local opt-in flag and the OnOverage state; no overage "remaining" is derived,
+// since getUsageLimits never reports overage used or remaining.
 func (s *Server) aggregateModelUsage(ctx context.Context, modelID string) *modelAggregate {
 	modelID = strings.TrimSpace(modelID)
 	agg := &modelAggregate{Model: modelID, Accounts: []modelAggregateAccount{}}
@@ -496,23 +507,45 @@ func (s *Server) aggregateModelUsage(ctx context.Context, modelID string) *model
 				recordErr(err)
 				return nil
 			}
-			if u.Credit == nil || u.Credit.Remaining <= 0 {
+			if u.Credit == nil {
 				return nil
+			}
+			// Base exhausted: include only when the account opts in via
+			// OverageEnabled, still has overage budget, and has not been parked
+			// after a real depletion response. The last check is essential when
+			// upstream clamps currentUsage at the base limit: overageRemaining is
+			// then optimistic, while the selector's reactive mark is authoritative.
+			// Flag included accounts so the UI can identify overage-only service.
+			onOverage := false
+			if u.Credit.Remaining <= 0 {
+				if !c.acct.OverageEnabled || !overageActive(u) || overageRemaining(u.Credit) <= 0 || s.selector.isDepleted(c.id) {
+					return nil
+				}
+				onOverage = true
 			}
 			mu.Lock()
 			agg.Accounts = append(agg.Accounts, modelAggregateAccount{
-				ID:        c.id,
-				Label:     c.acct.Label,
-				Region:    c.acct.Region,
-				Limit:     u.Credit.Limit,
-				Used:      u.Credit.Used,
-				Remaining: u.Credit.Remaining,
-				ResetAt:   u.ResetAt,
+				ID:            c.id,
+				Label:         c.acct.Label,
+				Region:        c.acct.Region,
+				Limit:         u.Credit.Limit,
+				Used:          u.Credit.Used,
+				Remaining:     u.Credit.Remaining,
+				ResetAt:       u.ResetAt,
+				OverageCap:    u.Credit.OverageCap,
+				OverageRate:   u.Credit.OverageRate,
+				OverageStatus: u.OverageStatus,
+				OverageOn:     c.acct.OverageEnabled,
+				OnOverage:     onOverage,
 			})
 			agg.Totals.Accounts++
 			agg.Totals.Limit += u.Credit.Limit
 			agg.Totals.Used += u.Credit.Used
 			agg.Totals.Remaining += u.Credit.Remaining
+			if c.acct.OverageEnabled && overageActive(u) && u.Credit.OverageCap > 0 {
+				agg.Totals.OverageCap += u.Credit.OverageCap
+				agg.Totals.OverageAccts++
+			}
 			mu.Unlock()
 			return nil
 		})
@@ -545,20 +578,27 @@ type modelAggregate struct {
 }
 
 type modelAggregateTotals struct {
-	Accounts  int     `json:"accounts"`
-	Limit     float64 `json:"limit"`
-	Used      float64 `json:"used"`
-	Remaining float64 `json:"remaining"`
+	Accounts     int     `json:"accounts"`
+	Limit        float64 `json:"limit"`
+	Used         float64 `json:"used"`
+	Remaining    float64 `json:"remaining"`
+	OverageCap   float64 `json:"overage_cap,omitempty"`      // opt-in accounts' overage cap sum (raw field sum, not remaining)
+	OverageAccts int     `json:"overage_accounts,omitempty"` // how many of them opted into overage
 }
 
 type modelAggregateAccount struct {
-	ID        string  `json:"id"`
-	Label     string  `json:"label,omitempty"`
-	Region    string  `json:"region,omitempty"`
-	Limit     float64 `json:"limit"`
-	Used      float64 `json:"used"`
-	Remaining float64 `json:"remaining"`
-	ResetAt   string  `json:"reset_at,omitempty"`
+	ID            string  `json:"id"`
+	Label         string  `json:"label,omitempty"`
+	Region        string  `json:"region,omitempty"`
+	Limit         float64 `json:"limit"`
+	Used          float64 `json:"used"`
+	Remaining     float64 `json:"remaining"`
+	ResetAt       string  `json:"reset_at,omitempty"`
+	OverageCap    float64 `json:"overage_cap,omitempty"`     // raw upstream field
+	OverageRate   float64 `json:"overage_rate,omitempty"`    // raw upstream field
+	OverageStatus string  `json:"overage_status,omitempty"`  // raw upstream enum
+	OverageOn     bool    `json:"overage_enabled,omitempty"` // local opt-in toggle
+	OnOverage     bool    `json:"on_overage,omitempty"`      // base spent, serving on overage (matches applyUsage)
 }
 
 type modelAggregateError struct {

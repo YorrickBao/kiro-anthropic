@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -408,8 +409,9 @@ func depletedDeadline(u *kiroUsage, now time.Time) time.Time {
 // applyUsage reconciles the depleted state with a usage snapshot taken at
 // fetched. An account with budget left is un-parked; one without is parked
 // until reset_at (or the fallback TTL). Budget means base credit remaining, or
-// — only when the account opts in via OverageEnabled — base exhausted but
-// overage still available. The overage opt-in only lifts on an authoritative
+// — only when the account opts in via OverageEnabled AND upstream has actually
+// switched overage on (overageStatus ENABLED/ACTIVE, checked by overageActive)
+// — base exhausted but overage still available. The overage opt-in only lifts on an authoritative
 // path (preciseOnly=false: ensureUsage / admin toggle); the probe path ignores
 // it, since an optimistic overage budget under upstream currentUsage clamping
 // would lift a fresher reactive 402 mark and loop (probe un-park -> fail ->
@@ -434,10 +436,11 @@ func (s *accountSelector) applyUsage(id string, u *kiroUsage, fetched time.Time,
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	budget := u.Credit.Remaining > 0
-	if !budget && !preciseOnly && overage && overageRemaining(u.Credit) > 0 {
+	if !budget && !preciseOnly && overage && overageActive(u) && overageRemaining(u.Credit) > 0 {
 		// Base exhausted: overage may still serve, but only if the account opts
-		// in. Skipped on the probe path (preciseOnly), where an optimistic
-		// overage budget must not lift a fresher reactive 402 mark.
+		// in locally AND upstream has overage active. Skipped on the probe path
+		// (preciseOnly), where an optimistic overage budget must not lift a
+		// fresher reactive 402 mark.
 		budget = true
 	}
 	if budget {
@@ -472,6 +475,34 @@ func overageRemaining(c *kiroCreditUsage) float64 {
 		return r
 	}
 	return 0
+}
+
+// overageActive reports whether upstream has actually switched overage on for
+// this account. overageStatus is the authoritative toggle (ENABLED/ACTIVE); a
+// positive overageCap alone is NOT enough, since a DISABLED account still
+// reports the cap it would have if enabled. This gates both routing
+// (applyUsage) and the per-model aggregate, so an account whose overage is off
+// at AWS never counts as having overage budget — even when the local opt-in is
+// on and the cap is non-zero.
+func overageActive(u *kiroUsage) bool {
+	if u == nil {
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(u.OverageStatus)) {
+	case "ENABLED", "ACTIVE":
+		return true
+	}
+	return false
+}
+
+// isDepleted reports whether id is currently parked for exhausted credit.
+// Expired entries are treated as inactive; cleanup remains the responsibility
+// of the normal selector path so this read-only query has no side effects.
+func (s *accountSelector) isDepleted(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.depleted[id]
+	return ok && time.Now().Before(e.until)
 }
 
 // depletedIDs returns a snapshot of ids currently marked depleted, for the

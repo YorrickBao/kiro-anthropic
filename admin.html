@@ -41,11 +41,6 @@
   .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
   .stat { background: #12151c; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
   .stat .lbl { color: var(--muted); font-size: 12px; }
-  /* overage is a second credit pool, shown as a peer block (not a footnote to base). */
-  .overage { margin-top: 10px; padding: 9px 12px; background: #0e1117; border: 1px solid var(--line); border-radius: 8px; }
-  .overage .ov-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-  .overage .ov-label { color: var(--muted); font-size: 12px; }
-  .overage .ov-body { display: flex; align-items: baseline; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
   th { color: var(--muted); font-weight: 500; }
@@ -81,7 +76,7 @@
   tr.detail .kv { grid-template-columns: 90px 1fr; }
   /* account cards */
   .accounts { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
-  .acct { position: relative; background: #12151c; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .acct { position: relative; background: #12151c; border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; }
   @property --flow-angle { syntax: "<angle>"; initial-value: 0deg; inherits: false; }
   .acct.enabled { border-color: transparent; }
   .acct.enabled::before {
@@ -105,7 +100,10 @@
   .switch input:disabled { opacity: .5; cursor: default; }
   .acct .top { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
   .acct .email { font-weight: 600; word-break: break-all; }
-  .acct .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
+  /* margin-top:auto pins the action bar to the card bottom so a short card
+     (e.g. usage fetch failed → one-line error) keeps its buttons aligned with
+     taller peers in the same grid row, which stretch to equal height. */
+  .acct .actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; padding-top: 12px; }
   .acct .meta { display: grid; grid-template-columns: 88px 1fr; gap: 4px 10px; font-size: 12.5px; }
   .acct .meta dt { color: var(--muted); }
   .acct .meta dd { margin: 0; word-break: break-all; }
@@ -360,20 +358,21 @@ function usageHtml(u) {
   if (c) {
     const pct = c.limit > 0 ? Math.max(0, (c.used / c.limit) * 100) : 0;
     const barPct = Math.min(100, pct);
+    // Overage sits beside the base usage card (not below it). cap/status are raw
+    // upstream fields; "remaining" is never derived (getUsageLimits omits it).
+    const os = String(u.overage_status || "").toUpperCase();
+    const enabled = os === "ENABLED" || os === "ACTIVE";
+    const oStatus = enabled ? "已启用" : os === "DISABLED" ? "已禁用" : (u.overage_status || "未知");
+    const overageStat = (u.overage_status || c.overage_cap > 0) ? `
+      <div class="stat">
+        <div class="lbl" style="display:flex;justify-content:space-between"><span>overage 上限</span><span class="pill ${enabled ? "ok" : ""}">${esc(oStatus)}</span></div>
+        <div class="big">${c.overage_cap > 0 ? fmtNum(c.overage_cap) : "—"}</div>
+        <div class="muted" style="font-size:12px;margin-top:6px">base 耗尽后可用</div>
+      </div>` : "";
     html += `<div class="grid2">
-      <div class="stat"><div class="lbl">剩余</div><div class="big">${fmtNum(c.remaining)}</div><div class="muted">credits</div></div>
       <div class="stat"><div class="lbl" style="display:flex;justify-content:space-between"><span>已用 / 总</span><span>${Math.round(pct)}%</span></div><div class="big">${fmtNum(c.used)} <span class="muted">/ ${fmtNum(c.limit)}</span></div>
-        <div class="bar"><span style="width:${barPct.toFixed(1)}%"></span></div></div>
+        <div class="bar"><span style="width:${barPct.toFixed(1)}%"></span></div></div>${overageStat}
     </div>`;
-    if (u.overage_status || c.overage_cap > 0) {
-      const os = String(u.overage_status || "").toUpperCase();
-      const enabled = os === "ENABLED" || os === "ACTIVE";
-      const oStatus = enabled ? "已启用" : os === "DISABLED" ? "已禁用" : (u.overage_status || "未知");
-      html += `<div class="overage">
-        <div class="ov-head"><span class="ov-label">超额额度 overage</span><span class="pill ${enabled ? "ok" : ""}">${esc(oStatus)}</span></div>
-        <div class="ov-body"><span class="big">${c.overage_cap > 0 ? fmtNum(c.overage_cap) : "—"}</span><span class="muted" style="font-size:12px">上限 · base 耗尽后可用</span></div>
-      </div>`;
-    }
     html += `<div class="muted" style="font-size:12px;margin-top:8px">重置：${fmtDate(u.reset_at)}${c.free_trial_active ? " · 试用生效中" : ""}</div>`;
   }
   return html;
@@ -409,7 +408,7 @@ function renderAccounts(accounts) {
       </label>
       <label class="switch" title="base 额度耗尽后是否允许使用 overage">
         <input type="checkbox" data-overage="${esc(a.id)}" ${a.overage_enabled ? "checked" : ""} />
-        <span>overage</span>
+        <span>允许超额</span>
       </label>
       <span style="flex:1"></span>
       <span class="acct-btns">
@@ -783,10 +782,14 @@ function renderAggregate(d) {
   const rows = (d.accounts || []).map(a => {
     const p = a.limit > 0 ? Math.min(100, (a.used / a.limit) * 100) : 0;
     const col = barColor(p);
+    const ovPill = a.on_overage ? ` <span class="pill warn">overage 中</span>` : "";
+    const osOn = (() => { const s = String(a.overage_status || "").toUpperCase(); return s === "ENABLED" || s === "ACTIVE"; })();
+    const ovCap = (a.overage_enabled && a.overage_cap > 0)
+      ? `<div class="muted" style="font-size:11px;margin-top:2px">overage 上限 ${fmtNum(a.overage_cap)}${osOn ? "" : " · AWS 未启用"}</div>` : "";
     return `<tr>
-      <td>${esc(a.label || a.id)}</td>
+      <td>${esc(a.label || a.id)}${ovPill}</td>
       <td class="muted">${esc(a.region || "—")}</td>
-      <td class="num">${fmtNum(a.remaining)}</td>
+      <td class="num">${fmtNum(a.remaining)}${ovCap}</td>
       <td style="min-width:200px"><div style="display:flex;align-items:center;gap:8px">
         <div class="bar" style="margin:0;flex:1">${bar(p, col)}</div>
         <span class="muted" style="font-size:11px;white-space:nowrap">${Math.round(p)}% · ${fmtNum(a.used)}/${fmtNum(a.limit)}</span>
@@ -802,9 +805,10 @@ function renderAggregate(d) {
   $("agg-result").innerHTML = `
     <div class="grid2" style="margin-bottom:12px">
       <div class="stat">
-        <div class="lbl" style="display:flex;justify-content:space-between"><span>总计 已用 / 总量</span><span>${Math.round(tpct)}%</span></div>
-        <div class="big">${fmtNum(t.used)} <span class="muted" style="font-size:13px">/ ${fmtNum(t.limit)}</span></div>
+        <div class="lbl" style="display:flex;justify-content:space-between"><span>总计 已用 / 总量${t.overage_cap > 0 ? ` <span class="th-hint">+overage 上限</span>` : ""}</span><span>${Math.round(tpct)}%</span></div>
+        <div class="big">${fmtNum(t.used)} <span class="muted" style="font-size:13px">/ ${fmtNum(t.limit)}${t.overage_cap > 0 ? ` (+${fmtNum(t.overage_cap)})` : ""}</span></div>
         <div class="bar">${bar(tpct, barColor(tpct))}</div>
+        ${t.overage_cap > 0 ? `<div class="muted" style="font-size:12px;margin-top:6px">${t.overage_accounts || 0} 个账户启用 overage · base 耗尽后可用</div>` : ""}
       </div>
       <div class="stat">
         <div class="lbl">可用账户剩余合计</div>

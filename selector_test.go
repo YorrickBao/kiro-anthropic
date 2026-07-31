@@ -304,6 +304,19 @@ func TestSelectorDepletedFallbackToSoonest(t *testing.T) {
 	assert.Equal(t, "b", creds.id, "falls back to the soonest-recovering depleted account")
 }
 
+func TestSelectorIsDepletedOnlyWhileMarkIsActive(t *testing.T) {
+	s := newTestSelector(t, "a")
+
+	s.markDepleted("a", time.Now().Add(time.Minute))
+	assert.True(t, s.isDepleted("a"))
+
+	s.mu.Lock()
+	s.depleted["a"] = depletedEntry{until: time.Now().Add(-time.Minute)}
+	s.mu.Unlock()
+	assert.False(t, s.isDepleted("a"), "expired marks must not affect read-only queries")
+	assert.False(t, s.isDepleted("missing"))
+}
+
 func TestSelectorDepletedExpiresAndReturns(t *testing.T) {
 	s := newTestSelector(t, "a", "b")
 	// "a" depleted in the past -> already recoverable, selectable again.
@@ -488,6 +501,24 @@ func TestOverageRemaining(t *testing.T) {
 	}
 }
 
+func TestOverageActive(t *testing.T) {
+	cases := []struct {
+		name string
+		u    *kiroUsage
+		want bool
+	}{
+		{"nil", nil, false},
+		{"empty status", &kiroUsage{}, false},
+		{"disabled with cap", &kiroUsage{OverageStatus: "DISABLED", Credit: &kiroCreditUsage{OverageCap: 100}}, false},
+		{"enabled", &kiroUsage{OverageStatus: "ENABLED"}, true},
+		{"active lowercase", &kiroUsage{OverageStatus: "active"}, true},
+		{"enabled with whitespace", &kiroUsage{OverageStatus: " ENABLED "}, true},
+	}
+	for _, c := range cases {
+		assert.Equalf(t, c.want, overageActive(c.u), "%s", c.name)
+	}
+}
+
 // Overage disabled (default): zero base credit is parked even with overage left.
 func TestSelectorApplyUsageOverageDisabledParks(t *testing.T) {
 	s := newTestSelector(t, "a")
@@ -505,7 +536,7 @@ func TestSelectorApplyUsageOverageEnabledKeeps(t *testing.T) {
 	s := newTestSelector(t, "a")
 	require.NoError(t, s.store.SetOverageEnabled("a", true))
 
-	s.applyUsage("a", &kiroUsage{Credit: &kiroCreditUsage{Remaining: 0, Used: 120, Limit: 100, OverageCap: 100}}, time.Now(), false)
+	s.applyUsage("a", &kiroUsage{OverageStatus: "ENABLED", Credit: &kiroCreditUsage{Remaining: 0, Used: 120, Limit: 100, OverageCap: 100}}, time.Now(), false)
 
 	s.mu.Lock()
 	_, depleted := s.depleted["a"]
@@ -539,11 +570,26 @@ func TestSelectorApplyUsageOverageEnabledNoCap(t *testing.T) {
 	assert.True(t, depleted, "overage enabled but no cap configured is parked")
 }
 
+// Local overage opt-in alone is not enough: when upstream has overage DISABLED
+// the account is parked on base exhaustion (AWS would reject it). A DISABLED
+// account still reports a would-be cap, so cap>0 must not lift it.
+func TestSelectorApplyUsageOverageAwsDisabledParks(t *testing.T) {
+	s := newTestSelector(t, "a")
+	require.NoError(t, s.store.SetOverageEnabled("a", true))
+
+	s.applyUsage("a", &kiroUsage{OverageStatus: "DISABLED", Credit: &kiroCreditUsage{Remaining: 0, Used: 120, Limit: 100, OverageCap: 100}}, time.Now(), false)
+
+	s.mu.Lock()
+	_, depleted := s.depleted["a"]
+	s.mu.Unlock()
+	assert.True(t, depleted, "AWS overage disabled -> parked despite local opt-in and cap")
+}
+
 // Overage-enabled, base-exhausted account stays selectable end-to-end.
 func TestSelectorPickOverageEnabledNotSkipped(t *testing.T) {
 	s := newTestSelector(t, "a")
 	require.NoError(t, s.store.SetOverageEnabled("a", true))
-	s.applyUsage("a", &kiroUsage{Credit: &kiroCreditUsage{Remaining: 0, Used: 120, Limit: 100, OverageCap: 100}}, time.Now(), false)
+	s.applyUsage("a", &kiroUsage{OverageStatus: "ENABLED", Credit: &kiroCreditUsage{Remaining: 0, Used: 120, Limit: 100, OverageCap: 100}}, time.Now(), false)
 
 	creds, ok := s.pick(map[string]bool{})
 	require.True(t, ok)
@@ -561,7 +607,7 @@ func TestSelectorApplyUsageProbeDoesNotLiftClampedOverage(t *testing.T) {
 	s.markDepleted("a", time.Now().Add(depletedFallbackTTL))
 	// Upstream clamps currentUsage at the limit: Remaining=0 but OverageCap>0,
 	// so overageRemaining is optimistically positive even with overage gone.
-	clamped := &kiroUsage{Credit: &kiroCreditUsage{Remaining: 0, Used: 100, Limit: 100, OverageCap: 100}}
+	clamped := &kiroUsage{OverageStatus: "ENABLED", Credit: &kiroCreditUsage{Remaining: 0, Used: 100, Limit: 100, OverageCap: 100}}
 
 	// Probe (preciseOnly=true) with a newer fetched time must NOT lift.
 	s.applyUsage("a", clamped, time.Now().Add(time.Minute), true)

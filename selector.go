@@ -221,6 +221,13 @@ func (s *accountSelector) pick(tried map[string]bool) (*accountCreds, bool) {
 			continue // dead account: no profileArn and no way to obtain one
 		}
 		if until, skip := skipUntil(a.ID); skip {
+			// Depleted with OverageEnabled=false: base credit exhausted and
+			// admin explicitly forbids overage. This account must never receive
+			// traffic, not even from the all-skipped fallback. Recovery can
+			// only be detected via ensureUsage (periodic or admin-triggered).
+			if de, ok := s.depleted[a.ID]; ok && now.Before(de.until) && !a.OverageEnabled {
+				continue // hard skip — not eligible for fallback
+			}
 			// Track the candidate that recovers soonest as a fallback.
 			if soonest == nil || until.Before(soonestAt) {
 				ac := a

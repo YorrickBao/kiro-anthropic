@@ -295,6 +295,10 @@ func TestSelectorDepletedSkip(t *testing.T) {
 
 func TestSelectorDepletedFallbackToSoonest(t *testing.T) {
 	s := newTestSelector(t, "a", "b")
+	// Enable overage on both so they are eligible for depleted fallback
+	// (an account depleted with OverageEnabled=false is a hard skip).
+	require.NoError(t, s.store.SetOverageEnabled("a", true))
+	require.NoError(t, s.store.SetOverageEnabled("b", true))
 	// Both depleted, "b" recovering sooner.
 	s.markDepleted("a", time.Now().Add(10*time.Minute))
 	s.markDepleted("b", time.Now().Add(time.Minute))
@@ -435,6 +439,9 @@ func TestApplyUsagePreciseOnlyDoesNotCreate(t *testing.T) {
 // (the later of cooldown/depleted), not whichever skip fired first.
 func TestSkipUntilRanksByLaterDeadline(t *testing.T) {
 	s := newTestSelector(t, "a", "b")
+	// Enable overage on both so they are eligible for depleted fallback.
+	require.NoError(t, s.store.SetOverageEnabled("a", true))
+	require.NoError(t, s.store.SetOverageEnabled("b", true))
 	now := time.Now()
 	// "a": cooldown ends soon but depleted for long; "b": depleted sooner overall.
 	s.mu.Lock()

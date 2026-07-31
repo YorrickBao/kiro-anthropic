@@ -621,17 +621,20 @@ func (s *Server) handleAccountOverage(w http.ResponseWriter, r *http.Request) {
 	// Re-evaluate with the cached usage so the toggle takes effect without
 	// waiting for the next usage refresh. Ground at the snapshot's own fetch
 	// time, not now: a stale snapshot must not lift a fresher request-failure
-	// mark (applyUsage's contract). If the cache is older than the mark the
-	// un-park simply waits for the next refresh (ensureUsage/probe), which is
-	// safer than un-parking on stale data.
-	s.usageMu.Lock()
-	entry, hasUsage := s.usageCache[body.ID]
-	s.usageMu.Unlock()
-	switch {
-	case hasUsage && s.selector != nil:
-		s.selector.applyUsage(body.ID, entry.usage, entry.fetched, false)
-	case body.OverageEnabled && s.selector != nil:
-		s.selector.clearDepleted(body.ID)
+	// mark (applyUsage's contract). With no usable snapshot (no cache, or one
+	// without a CREDIT line) and overage just enabled, clear the mark so the
+	// account is retried — the reactive path re-parks it if overage is actually
+	// gone. Turning off with no snapshot leaves any existing mark (off is
+	// stricter).
+	if s.selector != nil {
+		s.usageMu.Lock()
+		entry, hasUsage := s.usageCache[body.ID]
+		s.usageMu.Unlock()
+		if hasUsage && entry.usage != nil && entry.usage.Credit != nil {
+			s.selector.applyUsage(body.ID, entry.usage, entry.fetched, false)
+		} else if body.OverageEnabled {
+			s.selector.clearDepleted(body.ID)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "overage_enabled": body.OverageEnabled})
 }

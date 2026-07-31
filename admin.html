@@ -343,9 +343,7 @@ function usageHtml(u) {
     </div>
     <div class="muted" style="font-size:12px;margin-top:6px">重置：${fmtDate(u.reset_at)}${c.free_trial_active ? " · 试用生效中" : ""}</div>`;
     if (c.overage_cap > 0) {
-      const ospent = Math.max(0, c.used - c.limit);
-      const oleft = Math.max(0, c.overage_cap - ospent);
-      html += `<div class="muted" style="font-size:12px">overage：${fmtNum(oleft)} / ${fmtNum(c.overage_cap)}</div>`;
+      html += `<div class="muted" style="font-size:12px">overage：${fmtNum(c.overage_remaining ?? 0)} / ${fmtNum(c.overage_cap)}</div>`;
     }
   }
   return html;

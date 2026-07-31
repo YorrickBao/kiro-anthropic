@@ -424,16 +424,21 @@ func (s *accountSelector) applyUsage(id string, u *kiroUsage, fetched time.Time,
 	if u == nil || u.Credit == nil {
 		return
 	}
+	// Read the overage opt-in outside s.mu so selector.mu never nests store.mu
+	// (store.Get takes store.mu). A toggle racing in here is fine: this is a
+	// best-effort reconcile and the next refresh re-evaluates.
+	overage := false
+	if a, ok := s.store.Get(id); ok {
+		overage = a.OverageEnabled
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	budget := u.Credit.Remaining > 0
-	if !budget && !preciseOnly {
+	if !budget && !preciseOnly && overage && overageRemaining(u.Credit) > 0 {
 		// Base exhausted: overage may still serve, but only if the account opts
 		// in. Skipped on the probe path (preciseOnly), where an optimistic
 		// overage budget must not lift a fresher reactive 402 mark.
-		if a, ok := s.store.Get(id); ok && a.OverageEnabled && overageRemaining(u.Credit) > 0 {
-			budget = true
-		}
+		budget = true
 	}
 	if budget {
 		// Lift the mark only if this snapshot is at least as fresh as the mark.

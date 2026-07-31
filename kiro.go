@@ -616,17 +616,18 @@ type kiroUsage struct {
 // kiroCreditUsage is the CREDIT line of usageBreakdownList, with free-trial
 // allowances merged in (matching how Kiro presents the combined balance).
 type kiroCreditUsage struct {
-	DisplayName     string  `json:"display_name,omitempty"`
-	Unit            string  `json:"unit,omitempty"`
-	Currency        string  `json:"currency,omitempty"`
-	Used            float64 `json:"used"`
-	Limit           float64 `json:"limit"`
-	Remaining       float64 `json:"remaining"`
-	OverageCap      float64 `json:"overage_cap,omitempty"`
-	OverageRate     float64 `json:"overage_rate,omitempty"`
-	FreeTrialActive bool    `json:"free_trial_active,omitempty"`
-	FreeTrialUsed   float64 `json:"free_trial_used,omitempty"`
-	FreeTrialLimit  float64 `json:"free_trial_limit,omitempty"`
+	DisplayName      string  `json:"display_name,omitempty"`
+	Unit             string  `json:"unit,omitempty"`
+	Currency         string  `json:"currency,omitempty"`
+	Used             float64 `json:"used"`
+	Limit            float64 `json:"limit"`
+	Remaining        float64 `json:"remaining"`
+	OverageCap       float64 `json:"overage_cap,omitempty"`
+	OverageRate      float64 `json:"overage_rate,omitempty"`
+	OverageRemaining float64 `json:"overage_remaining,omitempty"` // computed in parseKiroUsage
+	FreeTrialActive  bool    `json:"free_trial_active,omitempty"`
+	FreeTrialUsed    float64 `json:"free_trial_used,omitempty"`
+	FreeTrialLimit   float64 `json:"free_trial_limit,omitempty"`
 }
 
 // usageLimitsWire mirrors the fields of a GetUsageLimits response we care about.
@@ -775,6 +776,7 @@ func parseKiroUsage(raw []byte) (*kiroUsage, error) {
 		if c.Remaining < 0 {
 			c.Remaining = 0
 		}
+		c.OverageRemaining = overageRemaining(c)
 		u.Credit = c
 		break
 	}

@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
+	"golang.org/x/sync/errgroup"
 )
 
 // Server wires the Anthropic-facing HTTP API to the Kiro backend. All requests
@@ -59,6 +60,14 @@ const usageCacheTTL = 60 * time.Second
 
 // modelsCacheTTL is how long a per-account model list is reused.
 const modelsCacheTTL = 5 * time.Minute
+
+// aggregateConcurrency caps how many accounts a per-model aggregation fans out
+// to in parallel, so a large pool does not stampede the control plane at once.
+const aggregateConcurrency = 8
+
+// aggregateTimeout bounds the whole per-model aggregation so one slow or stuck
+// account cannot hang the admin query (every per-account call is cache-backed).
+const aggregateTimeout = 30 * time.Second
 
 // updateCacheTTL is how long a GitHub release check is reused. It is long
 // because the admin page polls periodically and GitHub's unauthenticated rate
@@ -398,6 +407,163 @@ func (s *Server) ensureUsage(ctx context.Context, creds *accountCreds) (*kiroUsa
 		s.selector.applyUsage(creds.id, u, now, false)
 	}
 	return u, nil
+}
+
+// ensureUsageReadOnly returns one account's usage without reconciling the
+// selector's depleted state — the read-only path for queries (e.g. the
+// per-model aggregate) that must not park accounts as a side effect of
+// inspection. It shares ensureUsage's cache; a miss fetches once and fills the
+// cache but skips applyUsage, so inspection leaves routing untouched.
+func (s *Server) ensureUsageReadOnly(ctx context.Context, creds *accountCreds) (*kiroUsage, error) {
+	s.usageMu.Lock()
+	if e, ok := s.usageCache[creds.id]; ok && time.Since(e.fetched) < usageCacheTTL {
+		u := e.usage
+		s.usageMu.Unlock()
+		return u, nil
+	}
+	s.usageMu.Unlock()
+
+	u, err := s.kiro.GetUsage(ctx, creds)
+	if err != nil {
+		return nil, err
+	}
+	s.usageMu.Lock()
+	s.usageCache[creds.id] = usageCacheEntry{usage: u, fetched: time.Now()}
+	s.usageMu.Unlock()
+	return u, nil
+}
+
+// aggregateModelUsage sums the remaining credit across every account in the
+// pool that is currently usable AND serves the given model. It answers "how
+// much headroom does this model still have across all accounts" for pools
+// whose accounts differ by region/tier entitlement.
+//
+// An account is excluded when it is disabled or credentialless (accountUsable),
+// when its model-list or usage fetch fails (token expired, 403, transport —
+// recorded in Errors), when it does not serve the model, or when its credit is
+// exhausted (Credit nil or Remaining <= 0). It is a READ-ONLY query: usage is
+// read via ensureUsageReadOnly so it does not park accounts in the selector's
+// depleted map (unlike the admin status page, which intentionally reconciles).
+// Each per-account call is cache-backed (ensureModels 5m / usage 60s); accounts
+// are fanned out concurrently under a cap. The "serves this model" test reuses
+// resolveModel (the router's definition) so routing and this view agree.
+func (s *Server) aggregateModelUsage(ctx context.Context, modelID string) *modelAggregate {
+	modelID = strings.TrimSpace(modelID)
+	agg := &modelAggregate{Model: modelID, Accounts: []modelAggregateAccount{}}
+	if s.selector == nil {
+		return agg
+	}
+	all := s.selector.listAll()
+
+	ctx, cancel := context.WithTimeout(ctx, aggregateTimeout)
+	defer cancel()
+	g, gctx := errgroup.WithContext(ctx)
+
+	var mu sync.Mutex
+	sem := make(chan struct{}, aggregateConcurrency)
+	for _, c := range all {
+		c := c
+		if !accountUsable(c.acct) {
+			continue
+		}
+		g.Go(func() error {
+			select {
+			case sem <- struct{}{}:
+			case <-gctx.Done():
+				return nil
+			}
+			defer func() { <-sem }()
+
+			recordErr := func(err error) {
+				noteError(gctx, fmt.Sprintf("aggregate %s: account %s: %s", modelID, c.id, err))
+				mu.Lock()
+				agg.Errors = append(agg.Errors, modelAggregateError{ID: c.id, Error: err.Error()})
+				mu.Unlock()
+			}
+
+			// Fetch the model list first so a non-serving account short-circuits
+			// before the usage fetch — avoids a wasted control-plane round trip.
+			models, err := s.ensureModels(gctx, c)
+			if err != nil {
+				recordErr(err)
+				return nil
+			}
+			if _, _, ok := resolveModel(modelID, models); !ok {
+				return nil
+			}
+			u, err := s.ensureUsageReadOnly(gctx, c)
+			if err != nil {
+				recordErr(err)
+				return nil
+			}
+			if u.Credit == nil || u.Credit.Remaining <= 0 {
+				return nil
+			}
+			mu.Lock()
+			agg.Accounts = append(agg.Accounts, modelAggregateAccount{
+				ID:        c.id,
+				Label:     c.acct.Label,
+				Region:    c.acct.Region,
+				Limit:     u.Credit.Limit,
+				Used:      u.Credit.Used,
+				Remaining: u.Credit.Remaining,
+				ResetAt:   u.ResetAt,
+			})
+			agg.Totals.Accounts++
+			agg.Totals.Limit += u.Credit.Limit
+			agg.Totals.Used += u.Credit.Used
+			agg.Totals.Remaining += u.Credit.Remaining
+			mu.Unlock()
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	// excluded is derivable: every pooled account is either summed into
+	// Accounts or excluded (unusable / not serving / exhausted / failed / not
+	// reached before the deadline). Computing it post-hoc avoids a shared
+	// counter and the data race a concurrent counter caused.
+	agg.Excluded = len(all) - len(agg.Accounts)
+	// Signal an incomplete fan-out so callers don't mistake a deadline-cut
+	// result for the full pool.
+	if ctx.Err() != nil {
+		agg.Truncated = true
+	}
+	return agg
+}
+
+// modelAggregate is the per-model credit summary returned by the aggregate
+// admin endpoint: summed totals across usable accounts that serve the model,
+// plus a per-account breakdown for debugging.
+type modelAggregate struct {
+	Model     string                  `json:"model"`
+	Totals    modelAggregateTotals    `json:"totals"`
+	Accounts  []modelAggregateAccount `json:"accounts"`
+	Excluded  int                     `json:"excluded"`
+	Truncated bool                    `json:"truncated,omitempty"`
+	Errors    []modelAggregateError   `json:"errors,omitempty"`
+}
+
+type modelAggregateTotals struct {
+	Accounts  int     `json:"accounts"`
+	Limit     float64 `json:"limit"`
+	Used      float64 `json:"used"`
+	Remaining float64 `json:"remaining"`
+}
+
+type modelAggregateAccount struct {
+	ID        string  `json:"id"`
+	Label     string  `json:"label,omitempty"`
+	Region    string  `json:"region,omitempty"`
+	Limit     float64 `json:"limit"`
+	Used      float64 `json:"used"`
+	Remaining float64 `json:"remaining"`
+	ResetAt   string  `json:"reset_at,omitempty"`
+}
+
+type modelAggregateError struct {
+	ID    string `json:"id"`
+	Error string `json:"error"`
 }
 
 // ensureUpdateStatus returns the version-update view, querying GitHub at most

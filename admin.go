@@ -46,6 +46,7 @@ func (s *Server) AdminHandler() http.Handler {
 	r.Post("/api/accounts/refresh", s.handleAccountRefresh)
 	r.Post("/api/accounts/refresh-identity", s.handleAccountRefreshIdentity)
 	r.Post("/api/accounts/models", s.handleAccountModels)
+	r.Post("/api/models/aggregate", s.handleModelAggregate)
 	r.Get("/oauth/callback", s.handleLoginCallback)
 	return r
 }
@@ -508,6 +509,31 @@ func (s *Server) handleAccountModels(w http.ResponseWriter, r *http.Request) {
 		out = append(out, modelInfoJSON(m, ts))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "models": out})
+}
+
+// handleModelAggregate sums the remaining credit across every usable account
+// that serves the requested model, returning per-model totals with a
+// per-account breakdown for debugging. Disabled, credential-failing,
+// non-serving, and credit-exhausted accounts are excluded; see
+// aggregateModelUsage for the exact rules.
+func (s *Server) handleModelAggregate(w http.ResponseWriter, r *http.Request) {
+	if s.accounts == nil || s.selector == nil {
+		adminError(w, http.StatusServiceUnavailable, "account store is not configured")
+		return
+	}
+	var body struct {
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		adminError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(body.Model) == "" {
+		adminError(w, http.StatusBadRequest, "model is required")
+		return
+	}
+	agg := s.aggregateModelUsage(r.Context(), body.Model)
+	writeJSON(w, http.StatusOK, agg)
 }
 
 // handleAccountLabel updates the note (label) of a stored account.

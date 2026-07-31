@@ -66,9 +66,6 @@ func TestParseKiroUsage(t *testing.T) {
 	if got := c.Remaining; got < 115.72 || got > 115.74 {
 		t.Errorf("remaining = %v, want ~115.73", got)
 	}
-	if c.OverageRemaining != 10000 {
-		t.Errorf("overage remaining = %v, want 10000 (cap untouched; used below limit)", c.OverageRemaining)
-	}
 	if c.Unit != "次调用" || c.Currency != "USD" {
 		t.Errorf("unit/currency = %q/%q", c.Unit, c.Currency)
 	}

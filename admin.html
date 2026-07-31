@@ -361,8 +361,12 @@ function usageHtml(u) {
         <div class="bar"><span style="width:${barPct.toFixed(1)}%"></span></div></div>
     </div>
     <div class="muted" style="font-size:12px;margin-top:6px">重置：${fmtDate(u.reset_at)}${c.free_trial_active ? " · 试用生效中" : ""}</div>`;
-    if (c.overage_cap > 0) {
-      html += `<div class="muted" style="font-size:12px">overage：${fmtNum(c.overage_remaining ?? 0)} / ${fmtNum(c.overage_cap)}</div>`;
+    if (u.overage_status || c.overage_cap > 0) {
+      const os = String(u.overage_status || "").toUpperCase();
+      const oStatus = (os === "ENABLED" || os === "ACTIVE") ? "已启用"
+        : os === "DISABLED" ? "已禁用"
+        : (u.overage_status || "未知");
+      html += `<div class="muted" style="font-size:12px">overage：${esc(oStatus)}${c.overage_cap > 0 ? " · 上限 " + fmtNum(c.overage_cap) : ""}</div>`;
     }
   }
   return html;

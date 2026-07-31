@@ -133,6 +133,7 @@ func (s *Server) Handler() http.Handler {
 	r.Handle("/health", http.HandlerFunc(s.handleHealth))
 	r.Handle("/v1/models", http.HandlerFunc(s.handleModels))
 	r.Handle("/v1/messages", http.HandlerFunc(s.handleMessages))
+	r.Post("/api/models/aggregate", s.handleAPIModelAggregate)
 	return r
 }
 

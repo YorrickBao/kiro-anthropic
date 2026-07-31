@@ -537,6 +537,16 @@ func (s *Server) handleModelAggregate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, agg)
 }
 
+// handleAPIModelAggregate is the API-port (17890) variant of handleModelAggregate.
+// It enforces the optional API key before delegating to the shared handler.
+func (s *Server) handleAPIModelAggregate(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeAnthropicError(w, r, http.StatusUnauthorized, "authentication_error", "invalid api key")
+		return
+	}
+	s.handleModelAggregate(w, r)
+}
+
 // handleAccountLabel updates the note (label) of a stored account.
 func (s *Server) handleAccountLabel(w http.ResponseWriter, r *http.Request) {
 	if s.accounts == nil {

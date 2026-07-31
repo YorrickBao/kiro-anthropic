@@ -1105,8 +1105,11 @@ func firstFrameFailure(stream *kiroStream) error {
 	}
 	if ev != nil && ev.Kind == evError {
 		status := http.StatusBadGateway
-		if ev.ErrKind == "ValidationException" {
+		switch ev.ErrKind {
+		case "ValidationException":
 			status = http.StatusBadRequest
+		case "serviceQuotaExceededError":
+			status = http.StatusPaymentRequired // 402 – credit exhausted
 		}
 		return &kiroHTTPError{Status: status, Body: upstreamEventError(ev), ReasonCode: ev.ErrReason, Kind: ev.ErrKind}
 	}
@@ -1402,9 +1405,13 @@ func mapUpstreamError(err error) (int, string) {
 		case http.StatusTooManyRequests:
 			return http.StatusTooManyRequests, "rate_limit_error"
 		case http.StatusBadRequest:
-			return http.StatusBadRequest, "invalid_request_error"
-		default:
-			return http.StatusBadGateway, "api_error"
+		return http.StatusBadRequest, "invalid_request_error"
+	case http.StatusPaymentRequired: // 402 – credit exhausted
+		return http.StatusPaymentRequired, "api_error"
+	case http.StatusLocked: // 423 – account suspended
+		return http.StatusLocked, "api_error"
+	default:
+		return http.StatusBadGateway, "api_error"
 		}
 	}
 	return http.StatusBadGateway, "api_error"

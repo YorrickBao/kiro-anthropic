@@ -434,6 +434,34 @@ func (s *Server) ensureUsageReadOnly(ctx context.Context, creds *accountCreds) (
 	return u, nil
 }
 
+// warmAccount non-blockingly pre-fetches models and usage for one account so the
+// first real request to that account does not pay the fetch latency. Best-effort:
+// failures are silently ignored (caches stay cold, the request path fetches).
+func (s *Server) warmAccount(id string) {
+	if s.selector == nil || s.kiro == nil {
+		return
+	}
+	creds, ok := s.selector.byID(id)
+	if !ok {
+		return
+	}
+	go func() { s.ensureModels(context.Background(), creds) }()
+	go func() { s.ensureUsage(context.Background(), creds) }()
+}
+
+// warmAllAccounts non-blockingly pre-fetches models and usage for every usable
+// account so the first request to a cold pool does not pay the fetch latency.
+func (s *Server) warmAllAccounts() {
+	if s.accounts == nil {
+		return
+	}
+	for _, a := range s.accounts.List() {
+		if accountUsable(a) {
+			s.warmAccount(a.ID)
+		}
+	}
+}
+
 // aggregateModelUsage sums the remaining credit across every account in the
 // pool that is currently usable AND serves the given model. It answers "how
 // much headroom does this model still have across all accounts" for pools

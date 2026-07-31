@@ -267,8 +267,10 @@ func (s *Server) handleLoginCallback(w http.ResponseWriter, r *http.Request) {
 	// If this AWS account is already stored (e.g. previously imported), refresh
 	// its credentials in place instead of adding a duplicate.
 	saveErr := error(nil)
+	warmID := acct.ID
 	if id, ok := s.accounts.FindDuplicate(*acct); ok {
 		saveErr = s.accounts.ReplaceCredentials(id, acct)
+		warmID = id // warm the stored id, not the transient one from login
 	} else {
 		saveErr = s.accounts.Add(acct)
 	}
@@ -277,6 +279,8 @@ func (s *Server) handleLoginCallback(w http.ResponseWriter, r *http.Request) {
 		renderCallbackPage(w, false, "Signed in but could not save the account: "+saveErr.Error())
 		return
 	}
+	// Pre-warm models and usage for the newly signed-in (or refreshed) account.
+	go s.warmAccount(warmID)
 	renderCallbackPage(w, true, "Signed in successfully. You can close this window and return to the admin page.")
 }
 
@@ -311,6 +315,8 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		adminError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Pre-warm models and usage for the newly imported account.
+	go s.warmAccount(acct.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": acct.ID, "already_present": false})
 }
 
@@ -371,6 +377,10 @@ func (s *Server) handleAccountImportBundle(w http.ResponseWriter, r *http.Reques
 		noteError(r.Context(), err.Error())
 		adminError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	// Pre-warm models and usage for all accounts after a bundle import.
+	if res.Added > 0 || res.Replaced > 0 {
+		go s.warmAllAccounts()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "added": res.Added, "replaced": res.Replaced, "total": len(bundle.Accounts),
@@ -595,6 +605,10 @@ func (s *Server) handleAccountDisable(w http.ResponseWriter, r *http.Request) {
 	if err := s.accounts.SetDisabled(body.ID, body.Disabled); err != nil {
 		adminError(w, http.StatusNotFound, err.Error())
 		return
+	}
+	// When re-enabling, pre-warm models and usage so the account is ready.
+	if !body.Disabled {
+		go s.warmAccount(body.ID)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "disabled": body.Disabled})
 }

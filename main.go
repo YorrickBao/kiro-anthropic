@@ -247,6 +247,10 @@ func runServe(cfg *Config) error {
 		}
 	}
 
+	// Pre-warm models and usage caches for all usable accounts so the first
+	// request does not pay the control-plane fetch latency.
+	go srv.warmAllAccounts()
+
 	logger, closeLog, logNote, err := setupRequestLog(cfg.Log, cfg.LogFile)
 	if err != nil {
 		return fmt.Errorf("could not open --log-file %q: %w", cfg.LogFile, err)

@@ -177,6 +177,25 @@
     <div class="status-bar" id="acct-status"><span class="spinner"></span><span id="acct-status-text">正在加载账号额度…</span></div>
     <div class="accounts" id="accounts"></div>
   </section>
+
+  <section class="card">
+    <h2>按模型查询剩余额度</h2>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <input id="agg-model" type="text" placeholder="claude-opus-4.8" list="agg-models"
+             style="background:#12151c;border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:7px 10px;font-size:13px;min-width:220px" />
+      <datalist id="agg-models">
+        <option value="claude-opus-4.8"></option>
+        <option value="claude-sonnet-4.5"></option>
+        <option value="claude-haiku-4.5"></option>
+        <option value="gpt-5.6-sol"></option>
+        <option value="gpt-5.6-terra"></option>
+        <option value="gpt-5.6-luna"></option>
+      </datalist>
+      <button id="agg-btn" type="button">查询</button>
+      <span id="agg-msg" class="muted" style="font-size:12px"></span>
+    </div>
+    <div id="agg-result" style="margin-top:12px"></div>
+  </section>
 </div>
 
 <div class="modal-backdrop" id="models-modal">
@@ -701,6 +720,95 @@ async function importBundle(file) {
   }
 }
 
+// runAggregate queries the per-model credit aggregate (POST
+// /api/models/aggregate) and renders it as progress bars: a totals summary
+// plus one row per serving account. Bars are colored by consumption — red
+// near the limit, amber mid, accent gradient otherwise — matching the usage
+// panel's semantics (bar fill = used/limit).
+async function runAggregate() {
+  const model = $("agg-model").value.trim();
+  const msg = $("agg-msg"), result = $("agg-result"), btn = $("agg-btn");
+  msg.classList.remove("err"); msg.textContent = "";
+  if (!model) { msg.textContent = "请输入模型 id"; return; }
+  msg.textContent = "查询中…";
+  result.innerHTML = "";
+  btn.disabled = true;
+  try {
+    const res = await fetch("/api/models/aggregate", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({model}),
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      msg.textContent = "查询失败: " + (t || ("HTTP " + res.status));
+      msg.classList.add("err");
+      return;
+    }
+    renderAggregate(await res.json());
+  } catch (e) {
+    msg.textContent = "查询失败: " + e.message;
+    msg.classList.add("err");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// barColor returns an inline background for high-consumption bars (>=85% red,
+// >=60% amber); empty falls back to the .bar > span accent gradient.
+function barColor(pct) {
+  if (pct >= 85) return "var(--err)";
+  if (pct >= 60) return "var(--warn)";
+  return "";
+}
+
+function renderAggregate(d) {
+  const t = d.totals || {};
+  const tpct = t.limit > 0 ? Math.max(0, Math.min(100, (t.used / t.limit) * 100)) : 0;
+  const bar = (pct, col) =>
+    `<span style="width:${pct.toFixed(1)}%;${col ? `background:${col};` : ""}"></span>`;
+
+  const rows = (d.accounts || []).map(a => {
+    const p = a.limit > 0 ? Math.min(100, (a.used / a.limit) * 100) : 0;
+    const col = barColor(p);
+    return `<tr>
+      <td>${esc(a.label || a.id)}</td>
+      <td class="muted">${esc(a.region || "—")}</td>
+      <td class="num">${fmtNum(a.remaining)}</td>
+      <td style="min-width:200px"><div style="display:flex;align-items:center;gap:8px">
+        <div class="bar" style="margin:0;flex:1">${bar(p, col)}</div>
+        <span class="muted" style="font-size:11px;white-space:nowrap">${Math.round(p)}% · ${fmtNum(a.used)}/${fmtNum(a.limit)}</span>
+      </div></td>
+    </tr>`;
+  }).join("");
+
+  const errs = (d.errors && d.errors.length)
+    ? `<div class="muted" style="font-size:12px;margin-top:8px">${d.errors.length} 个账户查询失败: ${d.errors.map(e => esc(e.id)).join(", ")}</div>`
+    : "";
+
+  $("agg-msg").textContent = "";
+  $("agg-result").innerHTML = `
+    <div class="grid2" style="margin-bottom:12px">
+      <div class="stat">
+        <div class="lbl" style="display:flex;justify-content:space-between"><span>总计 已用 / 总量</span><span>${Math.round(tpct)}%</span></div>
+        <div class="big">${fmtNum(t.used)} <span class="muted" style="font-size:13px">/ ${fmtNum(t.limit)}</span></div>
+        <div class="bar">${bar(tpct, barColor(tpct))}</div>
+      </div>
+      <div class="stat">
+        <div class="lbl">可用账户剩余合计</div>
+        <div class="big" style="color:var(--ok)">${fmtNum(t.remaining)}</div>
+        <div class="muted" style="font-size:12px;margin-top:6px">${t.accounts || 0} 个账户 · 排除 ${d.excluded || 0}${d.truncated ? ` · <span class="pill warn">结果被超时截断</span>` : ""}</div>
+      </div>
+    </div>
+    ${(t.accounts > 0) ? `
+    <table>
+      <thead><tr><th>账户</th><th>区域</th><th class="num">剩余</th><th>已用 / 总量</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>` : `<div class="muted">没有可用账户支持 ${esc(d.model)}（额度已耗尽 / 被排除 / 不支持）。</div>`}
+    ${errs}`;
+}
+
 async function tick() {
   // On the very first load, paint a skeleton + loading bar immediately so the
   // panel is never blank while usage is fetched. Subsequent (background) polls
@@ -733,6 +841,8 @@ async function tick() {
 $("login-btn").addEventListener("click", startLogin);
 $("import-btn").addEventListener("click", importLocal);
 $("refresh-all-btn").addEventListener("click", refreshAllAccounts);
+$("agg-btn").addEventListener("click", runAggregate);
+$("agg-model").addEventListener("keydown", (e) => { if (e.key === "Enter") runAggregate(); });
 $("export-btn").addEventListener("click", exportAccounts);
 $("import-file-btn").addEventListener("click", () => $("import-file-input").click());
 $("import-file-input").addEventListener("change", (e) => {

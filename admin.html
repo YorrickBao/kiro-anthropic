@@ -41,6 +41,11 @@
   .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
   .stat { background: #12151c; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
   .stat .lbl { color: var(--muted); font-size: 12px; }
+  /* overage is a second credit pool, shown as a peer block (not a footnote to base). */
+  .overage { margin-top: 10px; padding: 9px 12px; background: #0e1117; border: 1px solid var(--line); border-radius: 8px; }
+  .overage .ov-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .overage .ov-label { color: var(--muted); font-size: 12px; }
+  .overage .ov-body { display: flex; align-items: baseline; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
   th { color: var(--muted); font-weight: 500; }
@@ -359,15 +364,17 @@ function usageHtml(u) {
       <div class="stat"><div class="lbl">剩余</div><div class="big">${fmtNum(c.remaining)}</div><div class="muted">credits</div></div>
       <div class="stat"><div class="lbl" style="display:flex;justify-content:space-between"><span>已用 / 总</span><span>${Math.round(pct)}%</span></div><div class="big">${fmtNum(c.used)} <span class="muted">/ ${fmtNum(c.limit)}</span></div>
         <div class="bar"><span style="width:${barPct.toFixed(1)}%"></span></div></div>
-    </div>
-    <div class="muted" style="font-size:12px;margin-top:6px">重置：${fmtDate(u.reset_at)}${c.free_trial_active ? " · 试用生效中" : ""}</div>`;
+    </div>`;
     if (u.overage_status || c.overage_cap > 0) {
       const os = String(u.overage_status || "").toUpperCase();
-      const oStatus = (os === "ENABLED" || os === "ACTIVE") ? "已启用"
-        : os === "DISABLED" ? "已禁用"
-        : (u.overage_status || "未知");
-      html += `<div class="muted" style="font-size:12px">overage：${esc(oStatus)}${c.overage_cap > 0 ? " · 上限 " + fmtNum(c.overage_cap) : ""}</div>`;
+      const enabled = os === "ENABLED" || os === "ACTIVE";
+      const oStatus = enabled ? "已启用" : os === "DISABLED" ? "已禁用" : (u.overage_status || "未知");
+      html += `<div class="overage">
+        <div class="ov-head"><span class="ov-label">超额额度 overage</span><span class="pill ${enabled ? "ok" : ""}">${esc(oStatus)}</span></div>
+        <div class="ov-body"><span class="big">${c.overage_cap > 0 ? fmtNum(c.overage_cap) : "—"}</span><span class="muted" style="font-size:12px">上限 · base 耗尽后可用</span></div>
+      </div>`;
     }
+    html += `<div class="muted" style="font-size:12px;margin-top:8px">重置：${fmtDate(u.reset_at)}${c.free_trial_active ? " · 试用生效中" : ""}</div>`;
   }
   return html;
 }

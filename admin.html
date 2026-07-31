@@ -501,7 +501,7 @@ function renderModels(models, body) {
     }).join("");
     const statusHdr = hasStatus ? '<th class="ctr">状态</th>' : "";
     body.innerHTML = `<table><thead><tr><th>模型 ID</th><th>名称</th><th class="num">上下文窗口 <span class="th-hint">输入 / 输出</span></th><th class="ctr">倍率</th><th>Effort</th>${statusHdr}</tr></thead><tbody>${rows}</tbody></table>`;
-    body.querySelectorAll("button.copy").forEach(b => b.addEventListener("click", () => copyText(b.dataset.copy, b)));
+    body.querySelectorAll("button.copy").forEach(b => b.addEventListener("click", (e) => { e.stopPropagation(); copyText(b.dataset.copy, b); }));
     body.querySelectorAll("[data-idx]").forEach(r => r.addEventListener("click", () => {
       const idx = r.dataset.idx;
       const d = $("detail-" + idx);

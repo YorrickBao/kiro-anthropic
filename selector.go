@@ -406,21 +406,36 @@ func depletedDeadline(u *kiroUsage, now time.Time) time.Time {
 }
 
 // applyUsage reconciles the depleted state with a usage snapshot taken at
-// fetched. With credit remaining the account is un-parked; with none it is
-// parked until reset_at (or the fallback TTL). Overage counts as exhausted: an
-// account at zero base credit is parked even if overage would still serve it,
-// to avoid silently spending overage budget. preciseOnly (the probe path)
-// refines an existing entry but never creates one, so a stale snapshot cannot
-// re-park an account that just recovered and served traffic. Writes are
-// grounded at fetched, so a stale snapshot cannot lift a mark a concurrent
-// request failure just set. A nil usage/credit leaves the state untouched.
+// fetched. An account with budget left is un-parked; one without is parked
+// until reset_at (or the fallback TTL). Budget means base credit remaining, or
+// — only when the account opts in via OverageEnabled — base exhausted but
+// overage still available. The overage opt-in only lifts on an authoritative
+// path (preciseOnly=false: ensureUsage / admin toggle); the probe path ignores
+// it, since an optimistic overage budget under upstream currentUsage clamping
+// would lift a fresher reactive 402 mark and loop (probe un-park -> fail ->
+// re-park). With overage disabled (the default) zero base credit counts as
+// exhausted, preserving the legacy strictly-no-overage behaviour.
+// preciseOnly (the probe path) refines an existing entry but never creates one,
+// so a stale snapshot cannot re-park an account that just recovered and served
+// traffic. Writes are grounded at fetched, so a stale snapshot cannot lift a
+// mark a concurrent request failure just set. A nil usage/credit leaves the
+// state untouched.
 func (s *accountSelector) applyUsage(id string, u *kiroUsage, fetched time.Time, preciseOnly bool) {
 	if u == nil || u.Credit == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if u.Credit.Remaining > 0 {
+	budget := u.Credit.Remaining > 0
+	if !budget && !preciseOnly {
+		// Base exhausted: overage may still serve, but only if the account opts
+		// in. Skipped on the probe path (preciseOnly), where an optimistic
+		// overage budget must not lift a fresher reactive 402 mark.
+		if a, ok := s.store.Get(id); ok && a.OverageEnabled && overageRemaining(u.Credit) > 0 {
+			budget = true
+		}
+	}
+	if budget {
 		// Lift the mark only if this snapshot is at least as fresh as the mark.
 		if e, ok := s.depleted[id]; !ok || !e.basis.After(fetched) {
 			delete(s.depleted, id)
@@ -433,6 +448,25 @@ func (s *accountSelector) applyUsage(id string, u *kiroUsage, fetched time.Time,
 		}
 	}
 	s.setDepletedLocked(id, depletedDeadline(u, time.Now()), fetched)
+}
+
+// overageRemaining reports how much overage budget is left on a CREDIT usage
+// line. Once Used exceeds Limit the account is spending overage, so the excess
+// is overage spent. Robust to either upstream currentUsage semantics: when the
+// upstream clamps currentUsage at the limit, this stays positive and the
+// reactive markDepleted path catches a truly exhausted account instead.
+func overageRemaining(c *kiroCreditUsage) float64 {
+	if c == nil || c.OverageCap <= 0 {
+		return 0
+	}
+	spent := c.Used - c.Limit
+	if spent < 0 {
+		spent = 0
+	}
+	if r := c.OverageCap - spent; r > 0 {
+		return r
+	}
+	return 0
 }
 
 // depletedIDs returns a snapshot of ids currently marked depleted, for the

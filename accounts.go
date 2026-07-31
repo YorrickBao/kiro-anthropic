@@ -63,6 +63,11 @@ type StoredAccount struct {
 	// refreshed and shown on the admin page with usage, but never selected to
 	// serve requests. Defaults to false (opt-out), preserving legacy behaviour.
 	Disabled bool `json:"disabled,omitempty"`
+	// OverageEnabled lets the account keep serving after its base credit is
+	// exhausted, spending its configured overage budget. Defaults to false: a
+	// zero-credit account is parked (strictly no overage), preserving legacy
+	// behaviour. The selector only consults this once base credit is gone.
+	OverageEnabled bool `json:"overageEnabled,omitempty"`
 }
 
 // expiry parses ExpiresAt; zero time means unknown.
@@ -290,6 +295,20 @@ func (s *AccountStore) SetDisabled(id string, disabled bool) error {
 		return fmt.Errorf("account %s not found", id)
 	}
 	a.Disabled = disabled
+	return s.saveLocked()
+}
+
+// SetOverageEnabled toggles whether the account may keep serving after its base
+// credit is exhausted (spending its configured overage) and persists the store.
+// Returns an error if the id is unknown.
+func (s *AccountStore) SetOverageEnabled(id string, enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.accounts[id]
+	if !ok {
+		return fmt.Errorf("account %s not found", id)
+	}
+	a.OverageEnabled = enabled
 	return s.saveLocked()
 }
 
@@ -541,20 +560,21 @@ func (s *AccountStore) List() []StoredAccount {
 // masked, and an expiry state is computed.
 func (a StoredAccount) view() map[string]any {
 	m := map[string]any{
-		"id":           a.ID,
-		"label":        a.Label,
-		"email":        a.Email,
-		"provider":     a.Provider,
-		"auth_method":  a.AuthMethod,
-		"region":       a.Region,
-		"start_url":    a.StartURL,
-		"profile_arn":  a.ProfileArn,
-		"user_id":      a.UserID,
-		"created_at":   a.CreatedAt,
-		"expires_at":   a.ExpiresAt,
-		"disabled":     a.Disabled,
-		"access_token": masked(a.AccessToken),
-		"has_refresh":  a.RefreshToken != "",
+		"id":              a.ID,
+		"label":           a.Label,
+		"email":           a.Email,
+		"provider":        a.Provider,
+		"auth_method":     a.AuthMethod,
+		"region":          a.Region,
+		"start_url":       a.StartURL,
+		"profile_arn":     a.ProfileArn,
+		"user_id":         a.UserID,
+		"created_at":      a.CreatedAt,
+		"expires_at":      a.ExpiresAt,
+		"disabled":        a.Disabled,
+		"overage_enabled": a.OverageEnabled,
+		"access_token":    masked(a.AccessToken),
+		"has_refresh":     a.RefreshToken != "",
 	}
 	exp := a.expiry()
 	switch {

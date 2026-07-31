@@ -342,6 +342,11 @@ function usageHtml(u) {
         <div class="bar"><span style="width:${barPct.toFixed(1)}%"></span></div></div>
     </div>
     <div class="muted" style="font-size:12px;margin-top:6px">重置：${fmtDate(u.reset_at)}${c.free_trial_active ? " · 试用生效中" : ""}</div>`;
+    if (c.overage_cap > 0) {
+      const ospent = Math.max(0, c.used - c.limit);
+      const oleft = Math.max(0, c.overage_cap - ospent);
+      html += `<div class="muted" style="font-size:12px">overage：${fmtNum(oleft)} / ${fmtNum(c.overage_cap)}</div>`;
+    }
   }
   return html;
 }
@@ -374,6 +379,10 @@ function renderAccounts(accounts) {
         <input type="checkbox" data-toggle="${esc(a.id)}" ${a.disabled ? "" : "checked"} />
         <span>${a.disabled ? "停用" : "启用"}</span>
       </label>
+      <label class="switch" title="base 额度耗尽后是否允许使用 overage">
+        <input type="checkbox" data-overage="${esc(a.id)}" ${a.overage_enabled ? "checked" : ""} />
+        <span>overage</span>
+      </label>
       <span style="flex:1"></span>
       <span class="acct-btns">
         <button class="ghost" data-models="${esc(a.id)}" type="button">模型</button>
@@ -389,6 +398,7 @@ function renderAccounts(accounts) {
   el.querySelectorAll("button[data-refresh]").forEach(b => b.addEventListener("click", () => refreshAccount(b.dataset.refresh, b)));
   el.querySelectorAll("button[data-refresh-id]").forEach(b => b.addEventListener("click", () => refreshIdentity(b.dataset.refreshId, b)));
   el.querySelectorAll("input[data-toggle]").forEach(b => b.addEventListener("change", () => toggleAccount(b.dataset.toggle, b.checked, b)));
+  el.querySelectorAll("input[data-overage]").forEach(b => b.addEventListener("change", () => toggleOverage(b.dataset.overage, b.checked, b)));
 }
 
 // openModels fetches and renders the model list for ONE account, using that
@@ -602,6 +612,26 @@ async function toggleAccount(id, enable, cb) {
     await tick();
   } catch (e) {
     alert("切换失败: " + e.message);
+  } finally {
+    if (cb) cb.disabled = false;
+  }
+}
+
+async function toggleOverage(id, enable, cb) {
+  if (!id) return;
+  // `enable` is the checkbox's new (checked) state, sent as overageEnabled
+  // directly (not inverted, unlike the disable toggle).
+  if (cb) cb.disabled = true;
+  try {
+    const res = await fetch("/api/accounts/overage", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, overageEnabled: enable })
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error((d.error && d.error.message) || ("HTTP " + res.status));
+    await tick();
+  } catch (e) {
+    alert("切换 overage 失败: " + e.message);
   } finally {
     if (cb) cb.disabled = false;
   }

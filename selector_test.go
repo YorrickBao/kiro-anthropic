@@ -469,3 +469,113 @@ func TestIsAccountDepleted(t *testing.T) {
 		assert.Equalf(t, c.want, isAccountDepleted(c.err), "%s", c.name)
 	}
 }
+
+func TestOverageRemaining(t *testing.T) {
+	cases := []struct {
+		name string
+		c    *kiroCreditUsage
+		want float64
+	}{
+		{"nil", nil, 0},
+		{"no overage configured", &kiroCreditUsage{OverageCap: 0, Used: 5, Limit: 10}, 0},
+		{"not yet in overage", &kiroCreditUsage{OverageCap: 100, Used: 5, Limit: 10}, 100},
+		{"spending overage", &kiroCreditUsage{OverageCap: 100, Used: 120, Limit: 100}, 80},
+		{"overage exhausted", &kiroCreditUsage{OverageCap: 100, Used: 250, Limit: 100}, 0},
+		{"used clamped at limit upstream", &kiroCreditUsage{OverageCap: 100, Used: 100, Limit: 100}, 100},
+	}
+	for _, c := range cases {
+		assert.Equalf(t, c.want, overageRemaining(c.c), "%s", c.name)
+	}
+}
+
+// Overage disabled (default): zero base credit is parked even with overage left.
+func TestSelectorApplyUsageOverageDisabledParks(t *testing.T) {
+	s := newTestSelector(t, "a")
+
+	s.applyUsage("a", &kiroUsage{Credit: &kiroCreditUsage{Remaining: 0, Used: 120, Limit: 100, OverageCap: 100}}, time.Now(), false)
+
+	s.mu.Lock()
+	_, depleted := s.depleted["a"]
+	s.mu.Unlock()
+	assert.True(t, depleted, "overage disabled -> base exhausted parks despite overage budget")
+}
+
+// Overage enabled with budget left: not parked.
+func TestSelectorApplyUsageOverageEnabledKeeps(t *testing.T) {
+	s := newTestSelector(t, "a")
+	require.NoError(t, s.store.SetOverageEnabled("a", true))
+
+	s.applyUsage("a", &kiroUsage{Credit: &kiroCreditUsage{Remaining: 0, Used: 120, Limit: 100, OverageCap: 100}}, time.Now(), false)
+
+	s.mu.Lock()
+	_, depleted := s.depleted["a"]
+	s.mu.Unlock()
+	assert.False(t, depleted, "overage enabled with budget left is not parked")
+}
+
+// Overage enabled but overage also exhausted: parked.
+func TestSelectorApplyUsageOverageEnabledButExhausted(t *testing.T) {
+	s := newTestSelector(t, "a")
+	require.NoError(t, s.store.SetOverageEnabled("a", true))
+
+	s.applyUsage("a", &kiroUsage{Credit: &kiroCreditUsage{Remaining: 0, Used: 250, Limit: 100, OverageCap: 100}}, time.Now(), false)
+
+	s.mu.Lock()
+	_, depleted := s.depleted["a"]
+	s.mu.Unlock()
+	assert.True(t, depleted, "overage enabled but exhausted is parked")
+}
+
+// Overage enabled but the account has no overage configured: parked.
+func TestSelectorApplyUsageOverageEnabledNoCap(t *testing.T) {
+	s := newTestSelector(t, "a")
+	require.NoError(t, s.store.SetOverageEnabled("a", true))
+
+	s.applyUsage("a", &kiroUsage{Credit: &kiroCreditUsage{Remaining: 0, Used: 100, Limit: 100, OverageCap: 0}}, time.Now(), false)
+
+	s.mu.Lock()
+	_, depleted := s.depleted["a"]
+	s.mu.Unlock()
+	assert.True(t, depleted, "overage enabled but no cap configured is parked")
+}
+
+// Overage-enabled, base-exhausted account stays selectable end-to-end.
+func TestSelectorPickOverageEnabledNotSkipped(t *testing.T) {
+	s := newTestSelector(t, "a")
+	require.NoError(t, s.store.SetOverageEnabled("a", true))
+	s.applyUsage("a", &kiroUsage{Credit: &kiroCreditUsage{Remaining: 0, Used: 120, Limit: 100, OverageCap: 100}}, time.Now(), false)
+
+	creds, ok := s.pick(map[string]bool{})
+	require.True(t, ok)
+	assert.Equal(t, "a", creds.id, "overage-enabled account with overage left is still picked")
+}
+
+// A probe (preciseOnly) must not lift an overage-exhausted account whose upstream
+// currentUsage is clamped at the limit — that would override a fresher reactive
+// 402 mark and loop (probe un-park -> fail -> re-park). Only an authoritative
+// (non-probe) refresh lifts on the overage opt-in.
+func TestSelectorApplyUsageProbeDoesNotLiftClampedOverage(t *testing.T) {
+	s := newTestSelector(t, "a")
+	require.NoError(t, s.store.SetOverageEnabled("a", true))
+	// Park via the reactive path (a real 402), as openStream would.
+	s.markDepleted("a", time.Now().Add(depletedFallbackTTL))
+	// Upstream clamps currentUsage at the limit: Remaining=0 but OverageCap>0,
+	// so overageRemaining is optimistically positive even with overage gone.
+	clamped := &kiroUsage{Credit: &kiroCreditUsage{Remaining: 0, Used: 100, Limit: 100, OverageCap: 100}}
+
+	// Probe (preciseOnly=true) with a newer fetched time must NOT lift.
+	s.applyUsage("a", clamped, time.Now().Add(time.Minute), true)
+	s.mu.Lock()
+	_, depleted := s.depleted["a"]
+	s.mu.Unlock()
+	assert.True(t, depleted, "probe must not lift a clamped overage-exhausted account over a reactive mark")
+
+	// An authoritative refresh (preciseOnly=false) still lifts: the operator
+	// opted into overage, and outside the probe path the optimistic budget is
+	// the best signal available (the reactive path re-parks if it's wrong).
+	s.applyUsage("a", clamped, time.Now().Add(2*time.Minute), false)
+	s.mu.Lock()
+	_, depleted = s.depleted["a"]
+	s.mu.Unlock()
+	assert.False(t, depleted, "authoritative path still lifts an overage-opted account")
+}

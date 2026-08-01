@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,15 +18,18 @@ import (
 
 // fakeRuntime stands in for both runtime.<region>.kiro.dev and
 // management.<region>.kiro.dev (rewriteTransport sends both to it). It returns
-// 500 for accounts whose bearer token is in badTokens, and 200 (empty stream)
-// otherwise, recording which tokens were seen.
+// 500 for accounts whose bearer token is in badTokens, and a 200 stream with
+// one content frame otherwise, recording which tokens were seen.
 type fakeRuntime struct {
-	srv       *httptest.Server
-	badTokens map[string]bool
-	seen      []string
+	srv                *httptest.Server
+	badTokens          map[string]bool
+	unauthorizedTokens map[string]bool
+	refreshAccessToken string
+	refreshHook        func()
+	seen               []string
 	// bodies maps a bearer token to a raw 200 response body (event-stream
-	// frames). When set for a token, it is served instead of an empty stream,
-	// letting tests exercise post-200 in-stream outcomes.
+	// frames). When set for a token, it is served instead of the default content
+	// frame, letting tests exercise post-200 in-stream outcomes.
 	bodies map[string][]byte
 	// modelsFor returns a per-token model list for ListAvailableModels.
 	modelsFor map[string][]kiroModelInfo
@@ -35,6 +39,9 @@ type fakeRuntime struct {
 	// invalidModel marks tokens whose GenerateAssistantResponse Send returns a
 	// 400 INVALID_MODEL_ID (simulating a stale cached model list).
 	invalidModel map[string]bool
+	// modelsHook runs inside a model-list request before its response is written.
+	// Tests use it to mutate an account while model resolution is in flight.
+	modelsHook func(string)
 	// Recorded on each Send: the bearer token and the modelId that was sent.
 	sendTokens []string
 	sentModels []string
@@ -43,16 +50,29 @@ type fakeRuntime struct {
 func newFakeRuntime(t *testing.T, bad ...string) *fakeRuntime {
 	t.Helper()
 	f := &fakeRuntime{
-		badTokens:    map[string]bool{},
-		bodies:       map[string][]byte{},
-		modelsFor:    map[string][]kiroModelInfo{},
-		modelsError:  map[string]bool{},
-		invalidModel: map[string]bool{},
+		badTokens:          map[string]bool{},
+		unauthorizedTokens: map[string]bool{},
+		bodies:             map[string][]byte{},
+		modelsFor:          map[string][]kiroModelInfo{},
+		modelsError:        map[string]bool{},
+		invalidModel:       map[string]bool{},
 	}
 	for _, b := range bad {
 		f.badTokens[b] = true
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" && f.refreshAccessToken != "" {
+			if f.refreshHook != nil {
+				f.refreshHook()
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"accessToken": f.refreshAccessToken,
+				"expiresIn":   3600,
+			})
+			return
+		}
+
 		tok := r.Header.Get("Authorization")
 		f.seen = append(f.seen, tok)
 
@@ -62,6 +82,9 @@ func newFakeRuntime(t *testing.T, bad ...string) *fakeRuntime {
 				w.WriteHeader(http.StatusInternalServerError)
 				_, _ = w.Write([]byte(`{"message":"models down"}`))
 				return
+			}
+			if f.modelsHook != nil {
+				f.modelsHook(tok)
 			}
 			w.Header().Set("Content-Type", "application/json")
 			out, _ := json.Marshal(map[string]any{"models": f.modelsFor[tok]})
@@ -88,6 +111,11 @@ func newFakeRuntime(t *testing.T, bad ...string) *fakeRuntime {
 			}
 		}
 
+		if f.unauthorizedTokens[tok] {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"message":"expired"}`))
+			return
+		}
 		if f.invalidModel[tok] {
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write([]byte(`{"__type":"com.amazon.kiro.runtimeservice#ValidationException","message":"Invalid model ID. Please select a different model to continue.","reason":"INVALID_MODEL_ID"}`))
@@ -98,9 +126,11 @@ func newFakeRuntime(t *testing.T, bad ...string) *fakeRuntime {
 			_, _ = w.Write([]byte(`{"message":"boom"}`))
 			return
 		}
-		w.WriteHeader(http.StatusOK) // 200: a stream (empty unless a body is set)
+		w.WriteHeader(http.StatusOK)
 		if body, ok := f.bodies[tok]; ok {
 			_, _ = w.Write(body)
+		} else {
+			_, _ = w.Write(contentFrame("ok"))
 		}
 	}))
 	t.Cleanup(f.srv.Close)
@@ -143,7 +173,7 @@ func serverWithPool(t *testing.T, rt *fakeRuntime, accessTokens ...string) *Serv
 		require.NoError(t, store.Add(&StoredAccount{
 			ID: at, ClientID: "c", ClientSecret: "s", RefreshToken: "r",
 			Region: "us-east-1", AccessToken: at, ExpiresAt: future,
-			ProfileArn: "arn:x", CreatedAt: string(rune('0' + i)),
+			ProfileArn: "arn:x", OverageEnabled: true, CreatedAt: string(rune('0' + i)),
 		}))
 	}
 
@@ -223,6 +253,21 @@ func TestOpenStreamAllFirstFrameExceptions(t *testing.T) {
 	assert.Equal(t, http.StatusBadGateway, he.Status)
 }
 
+func TestOpenStreamAllFirstFrameThrottledReturns429(t *testing.T) {
+	rt := newFakeRuntime(t)
+	body := errorEventFrame("throttlingError", "slow down")
+	rt.bodies["Bearer a"] = body
+	rt.bodies["Bearer b"] = body
+	s := serverWithPool(t, rt, "a", "b")
+
+	_, err := s.openStream(context.Background(), &kiroRequest{}, nil)
+	require.Error(t, err)
+	he, ok := err.(*kiroHTTPError)
+	require.True(t, ok, "want kiroHTTPError, got %T", err)
+	assert.Equal(t, http.StatusTooManyRequests, he.Status)
+	assert.Equal(t, []string{"Bearer a", "Bearer b"}, rt.seen)
+}
+
 // TestDispatchFairnessTwoAccounts verifies that with 2 healthy accounts,
 // consecutive dispatches alternate evenly (round-robin actually rotates).
 func TestDispatchFairnessTwoAccounts(t *testing.T) {
@@ -265,15 +310,18 @@ func TestOpenStreamRequestErrorDoesNotBurnAccounts(t *testing.T) {
 	assert.Len(t, rt.seen, 1, "a 400 should not try further accounts")
 }
 
-// quotaErrorFrame builds a single event-stream frame carrying a
-// serviceQuotaExceededError as a normal event (:message-type=event), mirroring
-// how the backend surfaces an exhausted-credit error after a 200.
-func quotaErrorFrame(message string) []byte {
+// errorEventFrame builds a normal event-stream error union member.
+func errorEventFrame(kind, message string) []byte {
 	headers := append(
 		esStringHeader(":message-type", "event"),
-		esStringHeader(":event-type", "serviceQuotaExceededError")...,
+		esStringHeader(":event-type", kind)...,
 	)
 	return esFrame(headers, []byte(`{"message":"`+message+`"}`))
+}
+
+// quotaErrorFrame builds a single serviceQuotaExceededError event frame.
+func quotaErrorFrame(message string) []byte {
+	return errorEventFrame("serviceQuotaExceededError", message)
 }
 
 // TestOpenStreamQuotaErrorParksDepleted verifies that a serviceQuotaExceededError
@@ -293,11 +341,185 @@ func TestOpenStreamQuotaErrorParksDepleted(t *testing.T) {
 
 	// The exhausted account is parked as depleted, distinct from the cooldown.
 	s.selector.mu.Lock()
-	_, depleted := s.selector.depleted["bad"]
-	_, cooling := s.selector.cooldown["bad"]
+	state := s.selector.states["bad"]
+	depleted := state != nil && state.quota == quotaDepleted && state.reactive
+	cooling := state != nil && time.Now().Before(state.cooldownUntil)
 	s.selector.mu.Unlock()
 	assert.True(t, depleted, "quota-exhausted account is parked as depleted")
 	assert.False(t, cooling, "depleted is distinct from the short cooldown")
+}
+
+func TestOpenStreamLateQuotaErrorParksDepleted(t *testing.T) {
+	rt := newFakeRuntime(t)
+	body := append(contentFrame("hi"), quotaErrorFrame("late quota")...)
+	rt.bodies["Bearer acc"] = body
+	s := serverWithPool(t, rt, "acc")
+
+	stream, err := s.openStream(context.Background(), &kiroRequest{}, nil)
+	require.NoError(t, err)
+	defer stream.Close()
+
+	// firstFrameFailure primed this content event; Recv must replay and observe
+	// it once without changing quota state.
+	ev, err := stream.Recv()
+	require.NoError(t, err)
+	require.Equal(t, evText, ev.Kind)
+	assert.False(t, s.selector.isReactivelyDepleted("acc", runtimeRevision(t, s.accounts, "acc")))
+
+	ev, err = stream.Recv()
+	require.NoError(t, err)
+	require.Equal(t, evError, ev.Kind)
+	assert.Equal(t, "serviceQuotaExceededError", ev.ErrKind)
+	assert.True(t, s.selector.isReactivelyDepleted("acc", runtimeRevision(t, s.accounts, "acc")))
+}
+
+func TestMessagesLateEventPreservesErrorMapping(t *testing.T) {
+	requestBody := `{"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+	cases := []struct {
+		name    string
+		frame   []byte
+		status  int
+		errType string
+	}{
+		{"quota", quotaErrorFrame("credit exhausted"), http.StatusPaymentRequired, "api_error"},
+		{"validation", exceptionFrame("ValidationException", "bad request"), http.StatusBadRequest, "invalid_request_error"},
+		{"throttle", errorEventFrame("throttlingError", "slow down"), http.StatusTooManyRequests, "rate_limit_error"},
+		{"upstream", exceptionFrame("InternalServerException", "failed"), http.StatusBadGateway, "api_error"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := newFakeRuntime(t)
+			rt.bodies["Bearer acc"] = append(contentFrame("partial"), tc.frame...)
+			s := serverWithPool(t, rt, "acc")
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(requestBody))
+			rec := httptest.NewRecorder()
+
+			s.Handler().ServeHTTP(rec, req)
+
+			assert.Equal(t, tc.status, rec.Code)
+			var body struct {
+				Error struct {
+					Type string `json:"type"`
+				} `json:"error"`
+			}
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+			assert.Equal(t, tc.errType, body.Error.Type)
+		})
+	}
+}
+
+func TestStreamingLateEventPreservesErrorType(t *testing.T) {
+	requestBody := `{"model":"claude-sonnet-5","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	cases := []struct {
+		name    string
+		frame   []byte
+		errType string
+	}{
+		{"validation", exceptionFrame("ValidationException", "bad request"), "invalid_request_error"},
+		{"throttle", errorEventFrame("throttlingError", "slow down"), "rate_limit_error"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := newFakeRuntime(t)
+			rt.bodies["Bearer acc"] = append(contentFrame("partial"), tc.frame...)
+			s := serverWithPool(t, rt, "acc")
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(requestBody))
+			rec := httptest.NewRecorder()
+
+			s.Handler().ServeHTTP(rec, req)
+
+			assert.Equal(t, http.StatusOK, rec.Code)
+			assert.Contains(t, rec.Body.String(), `"type":"`+tc.errType+`"`)
+		})
+	}
+}
+
+func TestOpenStreamLateQuotaObservedExactlyOnce(t *testing.T) {
+	rt := newFakeRuntime(t)
+	body := append(contentFrame("hi"), quotaErrorFrame("first")...)
+	body = append(body, quotaErrorFrame("duplicate")...)
+	rt.bodies["Bearer acc"] = body
+	s := serverWithPool(t, rt, "acc")
+
+	stream, err := s.openStream(context.Background(), &kiroRequest{}, nil)
+	require.NoError(t, err)
+	defer stream.Close()
+	_, err = stream.Recv() // replay primed content
+	require.NoError(t, err)
+
+	s.selector.mu.Lock()
+	before := s.selector.states["acc"].generation
+	s.selector.mu.Unlock()
+	for range 2 {
+		ev, recvErr := stream.Recv()
+		require.NoError(t, recvErr)
+		require.Equal(t, evError, ev.Kind)
+	}
+	s.selector.mu.Lock()
+	state := s.selector.states["acc"]
+	after := state.generation
+	reactive := state.reactive
+	s.selector.mu.Unlock()
+	assert.True(t, reactive)
+	assert.Equal(t, before+1, after, "duplicate late quota events must not mutate selector twice")
+}
+
+func TestOpenStreamLateAccountErrorStartsCooldown(t *testing.T) {
+	rt := newFakeRuntime(t)
+	body := append(contentFrame("hi"), exceptionFrame("InternalServerException", "late failure")...)
+	rt.bodies["Bearer acc"] = body
+	s := serverWithPool(t, rt, "acc")
+
+	stream, err := s.openStream(context.Background(), &kiroRequest{}, nil)
+	require.NoError(t, err)
+	defer stream.Close()
+	_, err = stream.Recv()
+	require.NoError(t, err)
+	ev, err := stream.Recv()
+	require.NoError(t, err)
+	require.Equal(t, evError, ev.Kind)
+
+	s.selector.mu.Lock()
+	cooling := time.Now().Before(s.selector.states["acc"].cooldownUntil)
+	s.selector.mu.Unlock()
+	assert.True(t, cooling, "late account failure must cool the account for future routing")
+}
+
+func TestOpenStreamLateTransportErrorStartsCooldown(t *testing.T) {
+	rt := newFakeRuntime(t)
+	body := append(contentFrame("hi"), []byte{0, 0, 0, 20, 0, 0}...)
+	rt.bodies["Bearer acc"] = body
+	s := serverWithPool(t, rt, "acc")
+
+	stream, err := s.openStream(context.Background(), &kiroRequest{}, nil)
+	require.NoError(t, err)
+	defer stream.Close()
+	_, err = stream.Recv()
+	require.NoError(t, err)
+	_, err = stream.Recv()
+	require.Error(t, err)
+
+	s.selector.mu.Lock()
+	cooling := time.Now().Before(s.selector.states["acc"].cooldownUntil)
+	s.selector.mu.Unlock()
+	assert.True(t, cooling, "late decoder/transport failure must cool the account")
+}
+
+func TestOpenStreamLateQuotaUpgradesPriorCooldown(t *testing.T) {
+	rt := newFakeRuntime(t)
+	body := append(contentFrame("hi"), exceptionFrame("InternalServerException", "late failure")...)
+	body = append(body, quotaErrorFrame("quota after failure")...)
+	rt.bodies["Bearer acc"] = body
+	s := serverWithPool(t, rt, "acc")
+
+	stream, err := s.openStream(context.Background(), &kiroRequest{}, nil)
+	require.NoError(t, err)
+	defer stream.Close()
+	for range 3 {
+		_, err = stream.Recv()
+		require.NoError(t, err)
+	}
+	assert.True(t, s.selector.isReactivelyDepleted("acc", runtimeRevision(t, s.accounts, "acc")))
 }
 
 // TestDepletedAccountSkippedOnNextRequest verifies the preventive effect: once
@@ -322,6 +544,31 @@ func TestDepletedAccountSkippedOnNextRequest(t *testing.T) {
 
 	assert.NotContains(t, rt.seen, "Bearer bad", "depleted account is not retried on the next request")
 	assert.Contains(t, rt.seen, "Bearer good")
+}
+
+func TestMessagesKnownDepletedPoolReturns402WithoutRuntimeProbe(t *testing.T) {
+	var usageCalls int
+	var runtimeCalls int
+	s := newUsageBackedServer(t, true, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/getUsageLimits" {
+			usageCalls++
+			writeUsageResponse(w, 0)
+			return
+		}
+		runtimeCalls++
+		http.Error(w, "unexpected runtime request", http.StatusInternalServerError)
+	})
+	body := `{"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+
+	for range 2 {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusPaymentRequired, rec.Code)
+		assert.Contains(t, rec.Body.String(), "account pool quota exhausted")
+	}
+	assert.Equal(t, 1, usageCalls, "sticky depletion should avoid repeated request-path usage checks")
+	assert.Zero(t, runtimeCalls, "known depletion must never be verified with inference traffic")
 }
 
 // msgAreq builds a minimal non-nil Anthropic request so openStream takes the
@@ -363,6 +610,181 @@ func TestOpenStreamSkipsAllAccountsMissingModel(t *testing.T) {
 	_, err := s.openStream(context.Background(), &kiroRequest{}, msgAreq("gpt-4o"))
 	require.ErrorIs(t, err, errModelUnavailable)
 	assert.Empty(t, rt.sentModels, "no Send should occur when no account serves the model")
+}
+
+func TestOpenStreamModelSkipsDoNotConsumeRuntimeAttemptBudget(t *testing.T) {
+	rt := newFakeRuntime(t)
+	accounts := []string{"skip0", "skip1", "skip2", "skip3", "skip4", "skip5", "skip6", "skip7", "skip8", "skip9", "serve"}
+	for _, id := range accounts[:10] {
+		rt.modelsFor["Bearer "+id] = []kiroModelInfo{{ModelID: "claude-opus-4.8"}}
+	}
+	rt.modelsFor["Bearer serve"] = []kiroModelInfo{{ModelID: "gpt-5.6-sol"}}
+	rt.bodies["Bearer serve"] = contentFrame("hi")
+	s := serverWithPool(t, rt, accounts...)
+
+	stream, err := s.openStream(context.Background(), &kiroRequest{}, msgAreq("gpt-4o"))
+	require.NoError(t, err)
+	require.NotNil(t, stream)
+	stream.Close()
+	assert.Equal(t, []string{"Bearer serve"}, rt.sendTokens)
+}
+
+func TestOpenStreamCapsActualRuntimeSends(t *testing.T) {
+	accounts := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	bad := make([]string, len(accounts))
+	for i, id := range accounts {
+		bad[i] = "Bearer " + id
+	}
+	rt := newFakeRuntime(t, bad...)
+	s := serverWithPool(t, rt, accounts...)
+
+	_, err := s.openStream(context.Background(), &kiroRequest{}, nil)
+	require.Error(t, err)
+	assert.Len(t, rt.seen, maxAccountAttempts)
+	assert.Equal(t, bad[:maxAccountAttempts], rt.seen)
+}
+
+func TestOpenStreamCapsPhysicalRuntimeSendsAcrossAuthRetries(t *testing.T) {
+	accounts := []string{"a", "b", "c", "d", "e"}
+	rt := newFakeRuntime(t)
+	rt.refreshAccessToken = "refreshed"
+	rt.badTokens["Bearer refreshed"] = true
+	for _, id := range accounts {
+		rt.unauthorizedTokens["Bearer "+id] = true
+	}
+	s := serverWithPool(t, rt, accounts...)
+
+	_, err := s.openStream(context.Background(), &kiroRequest{}, nil)
+	require.Error(t, err)
+	expected := []string{
+		"Bearer a", "Bearer refreshed",
+		"Bearer b", "Bearer refreshed",
+		"Bearer c", "Bearer refreshed",
+		"Bearer d", "Bearer refreshed",
+	}
+	assert.Equal(t, expected, rt.seen, "post-refresh sends must consume the same physical-send budget")
+}
+
+func TestOpenStreamRevalidatesLeaseBeforeAuthRetry(t *testing.T) {
+	rt := newFakeRuntime(t)
+	rt.unauthorizedTokens["Bearer acc"] = true
+	rt.refreshAccessToken = "refreshed"
+	s := serverWithPool(t, rt, "acc")
+	mutated := make(chan error, 1)
+	rt.refreshHook = func() {
+		mutated <- s.accounts.SetDisabled("acc", true)
+	}
+
+	_, err := s.openStream(context.Background(), &kiroRequest{}, nil)
+	require.Error(t, err)
+	require.NoError(t, <-mutated)
+	var he *kiroHTTPError
+	require.ErrorAs(t, err, &he)
+	assert.Equal(t, http.StatusUnauthorized, he.Status, "the last physical response should be preserved")
+	assert.Equal(t, []string{"Bearer acc"}, rt.seen, "disabled lease must not issue the post-refresh request")
+}
+
+func TestOpenStreamRepicksRevisionChangedBeforeFirstSend(t *testing.T) {
+	for _, profileKnown := range []bool{true, false} {
+		name := "send token refresh"
+		if !profileKnown {
+			name = "profile token refresh"
+		}
+		t.Run(name, func(t *testing.T) {
+			rt := newFakeRuntime(t)
+			rt.refreshAccessToken = "stale-refresh-result"
+			rt.bodies["Bearer replacement"] = contentFrame("hi")
+			s := serverWithPool(t, rt, "acc")
+
+			stale, ok := s.accounts.Get("acc")
+			require.True(t, ok)
+			stale.AccessToken = ""
+			stale.ExpiresAt = time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+			if !profileKnown {
+				stale.ProfileArn = ""
+			}
+			require.NoError(t, s.accounts.ReplaceCredentials("acc", &stale))
+
+			replaced := make(chan error, 1)
+			rt.refreshHook = func() {
+				fresh, ok := s.accounts.Get("acc")
+				if !ok {
+					replaced <- errNoAccount
+					return
+				}
+				fresh.AccessToken = "replacement"
+				fresh.ExpiresAt = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+				fresh.ProfileArn = "arn:replacement"
+				replaced <- s.accounts.ReplaceCredentials("acc", &fresh)
+			}
+
+			stream, err := s.openStream(context.Background(), &kiroRequest{}, nil)
+			require.NoError(t, err)
+			require.NotNil(t, stream)
+			stream.Close()
+			require.NoError(t, <-replaced)
+			assert.Equal(t, []string{"Bearer replacement"}, rt.seen,
+				"stale refresh must not consume the replacement account or issue runtime traffic")
+		})
+	}
+}
+
+func TestOpenStreamRevalidatesLeaseAfterModelLookup(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*testing.T, *Server)
+	}{
+		{name: "disable", mutate: func(t *testing.T, s *Server) {
+			require.NoError(t, s.accounts.SetDisabled("acc", true))
+		}},
+		{name: "remove", mutate: func(t *testing.T, s *Server) {
+			require.NoError(t, s.accounts.Remove("acc"))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := newFakeRuntime(t)
+			rt.modelsFor["Bearer acc"] = []kiroModelInfo{{ModelID: "gpt-5.6-sol"}}
+			started := make(chan struct{})
+			release := make(chan struct{})
+			rt.modelsHook = func(string) {
+				close(started)
+				<-release
+			}
+			s := serverWithPool(t, rt, "acc")
+			errCh := make(chan error, 1)
+			go func() {
+				_, err := s.openStream(context.Background(), &kiroRequest{}, msgAreq("gpt-4o"))
+				errCh <- err
+			}()
+			<-started
+			tc.mutate(t, s)
+			close(release)
+			require.Error(t, <-errCh)
+			assert.Empty(t, rt.sendTokens, "stale lease must not reach runtime")
+		})
+	}
+}
+
+func TestOpenStreamRepicksFallbackLeaseAfterCooldownExpires(t *testing.T) {
+	rt := newFakeRuntime(t)
+	rt.modelsFor["Bearer acc"] = []kiroModelInfo{{ModelID: "gpt-5.6-sol"}}
+	s := serverWithPool(t, rt, "acc")
+
+	// Put the sole account in cooldown so pick returns it as the availability
+	// fallback, then expire that cooldown while model preparation is in flight.
+	initial := requireLease(t, s.selector.pick(map[string]bool{}))
+	s.selector.recordFailure(initial)
+	rt.modelsHook = func(string) {
+		s.selector.mu.Lock()
+		s.selector.states["acc"].cooldownUntil = time.Now().Add(-time.Second)
+		s.selector.mu.Unlock()
+	}
+
+	stream, err := s.openStream(context.Background(), &kiroRequest{}, msgAreq("gpt-5.6-sol"))
+	require.NoError(t, err)
+	require.NotNil(t, stream)
+	stream.Close()
+	assert.Equal(t, []string{"Bearer acc"}, rt.sendTokens)
 }
 
 // TestOpenStreamInvalidModelFailsOver: a stale cached list that causes an

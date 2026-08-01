@@ -4,14 +4,22 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
 
 // testServerWithModels builds a Server whose model lookups resolve from a
 // pre-seeded per-account cache (no network), with one account in the pool so
@@ -21,7 +29,8 @@ func testServerWithModels() *Server {
 	if err != nil {
 		panic(err)
 	}
-	_ = store.Add(&StoredAccount{ID: "acc", Region: "us-east-1", ProfileArn: "arn:test", CreatedAt: "1"})
+	_ = store.Add(&StoredAccount{ID: "acc", Region: "us-east-1", ProfileArn: "arn:test", CreatedAt: "1", OverageEnabled: true})
+	rt, _ := store.Runtime("acc")
 	s := &Server{
 		cfg:         &Config{},
 		selector:    newAccountSelector(store, &http.Client{}),
@@ -30,8 +39,9 @@ func testServerWithModels() *Server {
 		usageCache:  map[string]usageCacheEntry{},
 	}
 	s.modelsCache["acc"] = modelsCacheEntry{
-		models:  []kiroModelInfo{testOpusModel(), testSonnet45Model()},
-		fetched: time.Now(),
+		models:   []kiroModelInfo{testOpusModel(), testSonnet45Model()},
+		fetched:  time.Now(),
+		revision: rt.Revision,
 	}
 	return s
 }
@@ -50,23 +60,654 @@ func TestAggregateModelUsageExcludesReactivelyDepletedOverage(t *testing.T) {
 				Used: 100, Limit: 100, Remaining: 0, OverageCap: 100,
 			},
 		},
-		fetched: time.Now(),
+		fetched:  time.Now(),
+		revision: runtimeRevision(t, s.accounts, "acc"),
 	}
 
 	before := s.aggregateModelUsage(context.Background(), "claude-opus-4.8")
-	require.Len(t, before.Accounts, 1)
+	require.Len(t, before.Accounts, 1, "aggregate: %+v", before)
 	assert.True(t, before.Accounts[0].OnOverage)
 	assert.Equal(t, float64(100), before.Totals.OverageCap)
 
 	// A real depletion response is more authoritative than the optimistic
 	// snapshot. Once parked, the account must disappear from the aggregate just
 	// as it does from normal selector routing.
-	s.selector.markDepleted("acc", time.Now().Add(depletedFallbackTTL))
+	picked := s.selector.pick(map[string]bool{})
+	require.NotNil(t, picked.lease)
+	s.selector.recordDepleted(picked.lease)
 	after := s.aggregateModelUsage(context.Background(), "claude-opus-4.8")
 	assert.Empty(t, after.Accounts)
 	assert.Equal(t, 0, after.Totals.Accounts)
 	assert.Equal(t, float64(0), after.Totals.OverageCap)
 	assert.Equal(t, 1, after.Excluded)
+}
+
+func newUsageBackedServer(t *testing.T, strict bool, handler http.HandlerFunc) *Server {
+	t.Helper()
+	upstream := httptest.NewServer(handler)
+	t.Cleanup(upstream.Close)
+	target, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+	client := &http.Client{Transport: &rewriteTransport{host: target.Host, scheme: target.Scheme}}
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "acc", ClientID: "client", ClientSecret: "secret", RefreshToken: "refresh",
+		AccessToken: "access", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		Region: "us-east-1", ProfileArn: "arn:test", CreatedAt: "1", OverageEnabled: !strict,
+	}))
+	s := NewServer(&Config{}, client)
+	s.setAccounts(store, client)
+	return s
+}
+
+func writeUsageResponse(w http.ResponseWriter, remaining float64) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"overageConfiguration": map[string]any{"overageStatus": "DISABLED"},
+		"usageBreakdownList": []map[string]any{{
+			"resourceType": "CREDIT", "currentUsageWithPrecision": 100 - remaining,
+			"usageLimitWithPrecision": 100,
+		}},
+	})
+}
+
+func TestUsageReadOnlyFetchDoesNotActivateStrictAccount(t *testing.T) {
+	var calls atomic.Int32
+	s := newUsageBackedServer(t, true, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		writeUsageResponse(w, 50)
+	})
+	creds, ok := s.selector.byID("acc")
+	require.True(t, ok)
+
+	u, err := s.ensureUsageReadOnly(context.Background(), creds)
+	require.NoError(t, err)
+	require.Equal(t, float64(50), u.Credit.Remaining)
+	assert.Equal(t, int32(1), calls.Load())
+	picked := s.selector.pick(map[string]bool{})
+	assert.Nil(t, picked.lease)
+	assert.Equal(t, "acc", picked.verifyID)
+}
+
+func TestUsageObservedAndReadOnlyWaitersShareFetch(t *testing.T) {
+	var calls atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	s := newUsageBackedServer(t, true, func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		writeUsageResponse(w, 50)
+	})
+	creds, ok := s.selector.byID("acc")
+	require.True(t, ok)
+
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := s.ensureUsageReadOnly(context.Background(), creds)
+		readErr <- err
+	}()
+	<-started
+	observedErr := make(chan error, 1)
+	go func() {
+		_, err := s.refreshUsage(context.Background(), "acc", usageObservationAuthoritative)
+		observedErr <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	require.NoError(t, <-readErr)
+	require.NoError(t, <-observedErr)
+	assert.Equal(t, int32(1), calls.Load())
+	assert.Equal(t, quotaAvailable, selectorQuota(t, s.selector, "acc"))
+}
+
+func TestUsageWaiterCancellationDoesNotCancelSharedFetch(t *testing.T) {
+	var calls atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	s := newUsageBackedServer(t, true, func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		writeUsageResponse(w, 50)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	canceledErr := make(chan error, 1)
+	go func() {
+		_, err := s.refreshUsage(ctx, "acc", usageObservationAuthoritative)
+		canceledErr <- err
+	}()
+	<-started
+	otherErr := make(chan error, 1)
+	go func() {
+		_, err := s.refreshUsage(context.Background(), "acc", usageObservationAuthoritative)
+		otherErr <- err
+	}()
+	cancel()
+	require.ErrorIs(t, <-canceledErr, context.Canceled)
+	close(release)
+	require.NoError(t, <-otherErr)
+	assert.Equal(t, int32(1), calls.Load())
+	assert.Equal(t, quotaAvailable, selectorQuota(t, s.selector, "acc"))
+}
+
+func TestUsageFetchRetriesAfterAccountRevisionChanges(t *testing.T) {
+	var calls atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	s := newUsageBackedServer(t, true, func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+			writeUsageResponse(w, 10)
+			return
+		}
+		writeUsageResponse(w, 50)
+	})
+	unblock := cleanupTestRelease(t, release)
+
+	result := make(chan *kiroUsage, 1)
+	fetchErr := make(chan error, 1)
+	go func() {
+		u, err := s.refreshUsage(context.Background(), "acc", usageObservationAuthoritative)
+		result <- u
+		fetchErr <- err
+	}()
+	<-started
+	fresh, ok := s.accounts.Get("acc")
+	require.True(t, ok)
+	fresh.AccessToken = "replacement"
+	require.NoError(t, s.accounts.ReplaceCredentials("acc", &fresh))
+	unblock()
+	require.NoError(t, <-fetchErr)
+	u := <-result
+	require.NotNil(t, u)
+	require.NotNil(t, u.Credit)
+	assert.Equal(t, float64(50), u.Credit.Remaining)
+	assert.Equal(t, int32(2), calls.Load())
+
+	rt, ok := s.accounts.Runtime("acc")
+	require.True(t, ok)
+	s.usageMu.Lock()
+	cached, exists := s.usageCache["acc"]
+	s.usageMu.Unlock()
+	require.True(t, exists)
+	assert.Equal(t, rt.Revision, cached.revision)
+	assert.Equal(t, float64(50), cached.usage.Credit.Remaining)
+	assert.Equal(t, quotaAvailable, selectorQuota(t, s.selector, "acc"))
+}
+
+func TestAggregateModelUsageRejectsMixedAccountRevisions(t *testing.T) {
+	modelsStarted := make(chan struct{})
+	releaseModels := make(chan struct{})
+	var usageCalls atomic.Int32
+	s := newUsageBackedServer(t, false, func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Amz-Target") == "KiroControlPlaneBearerService.ListAvailableModels" {
+			close(modelsStarted)
+			<-releaseModels
+			writeJSON(w, http.StatusOK, map[string]any{
+				"models": []map[string]any{{"modelId": "claude-opus-4.8"}},
+			})
+			return
+		}
+		if r.URL.Path == "/getUsageLimits" {
+			usageCalls.Add(1)
+			writeUsageResponse(w, 0)
+			return
+		}
+		http.NotFound(w, r)
+	})
+
+	aggCh := make(chan *modelAggregate, 1)
+	go func() {
+		aggCh <- s.aggregateModelUsage(context.Background(), "claude-opus-4.8")
+	}()
+	<-modelsStarted
+	require.NoError(t, s.accounts.SetOverageEnabled("acc", false))
+	close(releaseModels)
+	agg := <-aggCh
+
+	assert.Empty(t, agg.Accounts)
+	assert.Equal(t, int32(0), usageCalls.Load(), "stale model snapshot must not fetch newer-revision usage")
+	require.Len(t, agg.Errors, 1)
+	assert.Contains(t, agg.Errors[0].Error, errAccountRevisionChanged.Error())
+}
+
+func TestUsageFetchRetriesWithNewGeneration(t *testing.T) {
+	var calls atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	s := newUsageBackedServer(t, false, func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+			writeUsageResponse(w, 50)
+			return
+		}
+		writeUsageResponse(w, 0)
+	})
+	unblock := cleanupTestRelease(t, release)
+	lease := requireLease(t, s.selector.pick(map[string]bool{}))
+	result := make(chan *kiroUsage, 1)
+	fetchErr := make(chan error, 1)
+	go func() {
+		u, err := s.refreshUsage(context.Background(), "acc", usageObservationAuthoritative)
+		result <- u
+		fetchErr <- err
+	}()
+	<-started
+	s.selector.recordDepleted(lease)
+	unblock()
+	require.NoError(t, <-fetchErr)
+	u := <-result
+	require.NotNil(t, u)
+	require.NotNil(t, u.Credit)
+	assert.Equal(t, float64(0), u.Credit.Remaining)
+	assert.Equal(t, int32(2), calls.Load())
+	assert.Equal(t, quotaDepleted, selectorQuota(t, s.selector, "acc"))
+	assert.True(t, s.selector.isReactivelyDepleted("acc", lease.revision))
+}
+
+func TestUsageCacheIgnoresOldRevision(t *testing.T) {
+	var calls atomic.Int32
+	s := newUsageBackedServer(t, true, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		writeUsageResponse(w, 40)
+	})
+	oldRevision := runtimeRevision(t, s.accounts, "acc")
+	s.usageCache["acc"] = usageCacheEntry{
+		usage:   &kiroUsage{Credit: &kiroCreditUsage{Remaining: 1}},
+		fetched: time.Now(), revision: oldRevision,
+	}
+	require.NoError(t, s.accounts.SetOverageEnabled("acc", true))
+	creds, ok := s.selector.byID("acc")
+	require.True(t, ok)
+
+	u, err := s.ensureUsageReadOnly(context.Background(), creds)
+	require.NoError(t, err)
+	assert.Equal(t, float64(40), u.Credit.Remaining)
+	assert.Equal(t, int32(1), calls.Load())
+	s.usageMu.Lock()
+	cached := s.usageCache["acc"]
+	s.usageMu.Unlock()
+	assert.Equal(t, creds.revision, cached.revision)
+}
+
+func TestUsageInvalidationRejectsInFlightWriteAndJoin(t *testing.T) {
+	var calls atomic.Int32
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	s := newUsageBackedServer(t, true, func(w http.ResponseWriter, _ *http.Request) {
+		switch calls.Add(1) {
+		case 1:
+			close(firstStarted)
+			<-releaseFirst
+			writeUsageResponse(w, 10)
+		case 2:
+			close(secondStarted)
+			writeUsageResponse(w, 60)
+		default:
+			writeUsageResponse(w, 60)
+		}
+	})
+	unblockFirst := cleanupTestRelease(t, releaseFirst)
+
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := s.refreshUsage(context.Background(), "acc", usageObservationAuthoritative)
+		firstErr <- err
+	}()
+	<-firstStarted
+	s.invalidateUsage("acc")
+	secondErr := make(chan error, 1)
+	go func() {
+		_, err := s.refreshUsage(context.Background(), "acc", usageObservationAuthoritative)
+		secondErr <- err
+	}()
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("post-invalidation refresh joined stale in-flight fetch")
+	}
+	require.NoError(t, <-secondErr)
+	unblockFirst()
+	require.NoError(t, <-firstErr)
+
+	assert.Equal(t, int32(3), calls.Load())
+	s.usageMu.Lock()
+	cached := s.usageCache["acc"]
+	s.usageMu.Unlock()
+	require.NotNil(t, cached.usage)
+	assert.Equal(t, float64(60), cached.usage.Credit.Remaining)
+}
+
+func TestUsageCacheTimestampIsFetchCompletion(t *testing.T) {
+	var completed atomic.Int64
+	s := newUsageBackedServer(t, true, func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(20 * time.Millisecond)
+		writeUsageResponse(w, 50)
+		completed.Store(time.Now().UnixNano())
+	})
+	_, err := s.refreshUsage(context.Background(), "acc", usageObservationAuthoritative)
+	require.NoError(t, err)
+	s.usageMu.Lock()
+	fetched := s.usageCache["acc"].fetched
+	s.usageMu.Unlock()
+	assert.GreaterOrEqual(t, fetched.UnixNano(), completed.Load())
+}
+
+func TestModelsCacheIgnoresOldRevision(t *testing.T) {
+	var calls atomic.Int32
+	s := newUsageBackedServer(t, true, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		writeJSON(w, http.StatusOK, map[string]any{"models": []map[string]any{{"modelId": "fresh-model"}}})
+	})
+	oldRevision := runtimeRevision(t, s.accounts, "acc")
+	s.modelsCache["acc"] = modelsCacheEntry{
+		models: []kiroModelInfo{{ModelID: "stale-model"}}, fetched: time.Now(), revision: oldRevision,
+	}
+	require.NoError(t, s.accounts.SetOverageEnabled("acc", true))
+	creds, ok := s.selector.byID("acc")
+	require.True(t, ok)
+
+	models, err := s.ensureModels(context.Background(), creds)
+	require.NoError(t, err)
+	require.Len(t, models, 1)
+	assert.Equal(t, "fresh-model", models[0].ModelID)
+	assert.Equal(t, int32(1), calls.Load())
+	s.modelsMu.Lock()
+	cached := s.modelsCache["acc"]
+	s.modelsMu.Unlock()
+	assert.Equal(t, creds.revision, cached.revision)
+}
+
+func TestModelsInvalidationRejectsInFlightWrite(t *testing.T) {
+	var calls atomic.Int32
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	s := newUsageBackedServer(t, true, func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			close(firstStarted)
+			<-releaseFirst
+			writeJSON(w, http.StatusOK, map[string]any{"models": []map[string]any{{"modelId": "stale-model"}}})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"models": []map[string]any{{"modelId": "fresh-model"}}})
+	})
+	unblockFirst := cleanupTestRelease(t, releaseFirst)
+	creds, ok := s.selector.byID("acc")
+	require.True(t, ok)
+
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := s.ensureModels(context.Background(), creds)
+		firstErr <- err
+	}()
+	<-firstStarted
+	s.invalidateModels("acc")
+	models, err := s.ensureModels(context.Background(), creds)
+	require.NoError(t, err)
+	require.Len(t, models, 1)
+	assert.Equal(t, "fresh-model", models[0].ModelID)
+	unblockFirst()
+	require.ErrorIs(t, <-firstErr, errModelResultStale)
+
+	s.modelsMu.Lock()
+	cached := s.modelsCache["acc"]
+	s.modelsMu.Unlock()
+	require.Len(t, cached.models, 1)
+	assert.Equal(t, "fresh-model", cached.models[0].ModelID)
+	assert.Equal(t, int32(2), calls.Load())
+}
+
+func TestWarmAccountRetriesModelsAfterProfileBackfill(t *testing.T) {
+	var profileCalls atomic.Int32
+	var modelCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("X-Amz-Target") {
+		case "AmazonCodeWhispererService.ListAvailableProfiles":
+			profileCalls.Add(1)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"profiles": []map[string]any{{"arn": "arn:resolved"}},
+			})
+		case "KiroControlPlaneBearerService.ListAvailableModels":
+			modelCalls.Add(1)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"models": []map[string]any{{"modelId": "claude-sonnet-5"}},
+			})
+		default:
+			writeUsageResponse(w, 50)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+	target, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+	client := &http.Client{Transport: &rewriteTransport{host: target.Host, scheme: target.Scheme}}
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "acc", ClientID: "client", ClientSecret: "secret", RefreshToken: "refresh",
+		AccessToken: "access", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		Region: "us-east-1", OverageEnabled: true, CreatedAt: "1",
+	}))
+	s := NewServer(&Config{}, client)
+	s.setAccounts(store, client)
+
+	s.warmAccountSync(context.Background(), "acc")
+
+	rt, ok := store.Runtime("acc")
+	require.True(t, ok)
+	assert.Equal(t, "arn:resolved", rt.Account.ProfileArn)
+	s.modelsMu.Lock()
+	cached, cachedOK := s.modelsCache["acc"]
+	s.modelsMu.Unlock()
+	require.True(t, cachedOK)
+	assert.Equal(t, rt.Revision, cached.revision)
+	require.Len(t, cached.models, 1)
+	assert.Equal(t, "claude-sonnet-5", cached.models[0].ModelID)
+	assert.GreaterOrEqual(t, profileCalls.Load(), int32(1))
+	assert.LessOrEqual(t, profileCalls.Load(), int32(2))
+	assert.Equal(t, int32(2), modelCalls.Load(), "stale successful fetch should retry on the current revision")
+}
+
+func TestRefreshUsageCanceledContextDoesNotStartFetch(t *testing.T) {
+	var calls atomic.Int32
+	s := newUsageBackedServer(t, false, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		http.Error(w, "unexpected usage fetch", http.StatusInternalServerError)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := s.refreshUsage(ctx, "acc", usageObservationAuthoritative)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Never(t, func() bool { return calls.Load() != 0 }, 100*time.Millisecond, 5*time.Millisecond)
+}
+
+func TestWarmAllAccountsCanceledContextStartsNoRequests(t *testing.T) {
+	var calls atomic.Int32
+	s := newUsageBackedServer(t, false, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		http.Error(w, "unexpected warmup request", http.StatusInternalServerError)
+	})
+	lifetime, cancel := context.WithCancel(context.Background())
+	cancel()
+	s.setWarmupContext(lifetime)
+
+	s.warmAllAccounts()
+	require.Never(t, func() bool { return calls.Load() != 0 }, 100*time.Millisecond, 5*time.Millisecond)
+}
+
+func TestWarmAccountBoundsAndCancelsModelFetch(t *testing.T) {
+	type observation struct {
+		deadline time.Time
+		has      bool
+	}
+	started := make(chan observation, 1)
+	done := make(chan error, 1)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Header.Get("X-Amz-Target") != "KiroControlPlaneBearerService.ListAvailableModels" {
+			return nil, context.Canceled
+		}
+		deadline, ok := r.Context().Deadline()
+		started <- observation{deadline: deadline, has: ok}
+		<-r.Context().Done()
+		done <- r.Context().Err()
+		return nil, r.Context().Err()
+	})}
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "acc", AccessToken: "access", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		ProfileArn: "arn:test", Region: "us-east-1", OverageEnabled: true, CreatedAt: "1",
+	}))
+	s := NewServer(&Config{}, client)
+	s.setAccounts(store, client)
+	lifetime, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.setWarmupContext(lifetime)
+
+	s.warmAccount("acc")
+	var observed observation
+	select {
+	case observed = <-started:
+	case <-time.After(time.Second):
+		t.Fatal("model warmup did not start")
+	}
+	require.True(t, observed.has, "model warmup request must carry a deadline")
+	remaining := time.Until(observed.deadline)
+	assert.Greater(t, remaining, time.Duration(0))
+	assert.LessOrEqual(t, remaining, modelWarmupTimeout)
+
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("model warmup did not stop with the service context")
+	}
+}
+
+func TestWarmModelsStopsWhileJoiningExistingTokenRefresh(t *testing.T) {
+	var tokenCalls atomic.Int32
+	var modelCalls atomic.Int32
+	tokenStarted := make(chan struct{})
+	releaseToken := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(releaseToken)
+		}
+	}()
+
+	s := newUsageBackedServer(t, false, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/token":
+			if tokenCalls.Add(1) != 1 {
+				http.Error(w, "unexpected second token refresh", http.StatusInternalServerError)
+				return
+			}
+			close(tokenStarted)
+			<-releaseToken
+			writeJSON(w, http.StatusOK, map[string]any{
+				"accessToken": "fresh-access", "refreshToken": "fresh-refresh",
+				"tokenType": "Bearer", "expiresIn": 3600,
+			})
+		case r.Header.Get("X-Amz-Target") == "KiroControlPlaneBearerService.ListAvailableModels":
+			modelCalls.Add(1)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"models": []map[string]any{{"modelId": "claude-sonnet-5"}},
+			})
+		default:
+			writeUsageResponse(w, 50)
+		}
+	})
+	require.NoError(t, s.accounts.UpdateTokens("acc", "", "", ""))
+
+	ownerDone := make(chan error, 1)
+	go func() {
+		_, err := s.accounts.RefreshToken(context.Background(), s.kiro.client, "acc")
+		ownerDone <- err
+	}()
+	select {
+	case <-tokenStarted:
+	case <-time.After(time.Second):
+		t.Fatal("token refresh did not start")
+	}
+
+	lifetime, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	warmDone := make(chan struct{})
+	go func() {
+		s.warmModels(lifetime, "acc")
+		close(warmDone)
+	}()
+	select {
+	case <-warmDone:
+	case <-time.After(time.Second):
+		t.Fatal("model warmup stayed blocked on an existing token refresh")
+	}
+	assert.Equal(t, int32(1), tokenCalls.Load())
+	assert.Equal(t, int32(0), modelCalls.Load(), "canceled warmup must not reach the model endpoint")
+
+	close(releaseToken)
+	released = true
+	select {
+	case err := <-ownerDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("token refresh owner did not finish after release")
+	}
+	got, ok := s.accounts.Get("acc")
+	require.True(t, ok)
+	assert.Equal(t, "fresh-access", got.AccessToken)
+}
+
+func TestOpenStreamVerifiesUnknownStrictAccount(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		remaining     float64
+		missingCredit bool
+		wantRuntime   int32
+		wantNoError   bool
+	}{
+		{name: "positive usage admits", remaining: 50, wantRuntime: 1, wantNoError: true},
+		{name: "zero usage stays blocked", remaining: 0, wantRuntime: 0, wantNoError: false},
+		{name: "missing credit stays blocked", missingCredit: true, wantRuntime: 0, wantNoError: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var usageCalls atomic.Int32
+			var runtimeCalls atomic.Int32
+			s := newUsageBackedServer(t, true, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/getUsageLimits" {
+					usageCalls.Add(1)
+					if tc.missingCredit {
+						writeJSON(w, http.StatusOK, map[string]any{})
+					} else {
+						writeUsageResponse(w, tc.remaining)
+					}
+					return
+				}
+				runtimeCalls.Add(1)
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(contentFrame("ok"))
+			})
+			stream, err := s.openStream(context.Background(), &kiroRequest{}, nil)
+			if tc.wantNoError {
+				require.NoError(t, err)
+				require.NotNil(t, stream)
+				stream.Close()
+			} else {
+				require.Error(t, err)
+			}
+			assert.Equal(t, int32(1), usageCalls.Load())
+			assert.Equal(t, tc.wantRuntime, runtimeCalls.Load())
+		})
+	}
 }
 
 func reqForModel(model string) *kiroRequest {

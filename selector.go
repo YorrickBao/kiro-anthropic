@@ -38,10 +38,12 @@ type kiroCredentials interface {
 // refresh uses the account's own client registration and is written back to the
 // account store; it never touches Kiro's on-disk cache.
 type accountCreds struct {
-	store  *AccountStore
-	client *http.Client
-	id     string
-	acct   StoredAccount
+	store      *AccountStore
+	client     *http.Client
+	id         string
+	revision   uint64
+	credential uint64
+	acct       StoredAccount
 }
 
 func (c *accountCreds) apiRegion() string {
@@ -62,9 +64,7 @@ func (c *accountCreds) profileArn(ctx context.Context) (string, error) {
 	// Resolve best-effort onto this request's account copy (accounts normally
 	// already carry a ProfileArn, so this is a rare fallback path). Use a fresh
 	// token via accessToken() rather than the possibly-stale stored one, so an
-	// account with an empty profileArn but a valid refreshToken self-heals
-	// instead of failing ListAvailableProfiles with a 401. (accessToken() does
-	// not call profileArn(), so there is no recursion.)
+	// account with an empty profileArn but a valid refreshToken self-heals.
 	tok, err := c.accessToken(ctx)
 	if err != nil {
 		return "", fmt.Errorf("resolve profileArn for account %s: %w", c.id, err)
@@ -73,25 +73,25 @@ func (c *accountCreds) profileArn(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve profileArn for account %s: %w", c.id, err)
 	}
-	c.acct.ProfileArn = arn
-	// Persist the resolved profileArn so it survives restarts and shows up on
-	// the admin page. Best-effort: a write failure does not affect this request.
-	_ = c.store.UpdateIdentity(c.id, arn, "", "")
-	// While we have a valid token, also resolve email and userId best-effort and
-	// persist them for the same reason (and to backfill userId onto older records
-	// that predate the field). fetchAccountIdentity is non-fatal on failure.
+
+	// Resolve the remaining identity before the single fenced write: filling an
+	// empty profileArn starts a new lifecycle, so a second write with this old
+	// revision would correctly be rejected.
+	var email, userID string
 	if c.acct.Email == "" || c.acct.UserID == "" {
 		ident := fetchAccountIdentity(ctx, c.client, c.apiRegion(), arn, tok)
-		if ident.Email != "" {
-			c.acct.Email = ident.Email
-		}
-		if ident.UserID != "" {
-			c.acct.UserID = ident.UserID
-		}
-		if ident.Email != "" || ident.UserID != "" {
-			_ = c.store.UpdateIdentity(c.id, "", ident.Email, ident.UserID)
-		}
+		email, userID = ident.Email, ident.UserID
 	}
+	c.acct.ProfileArn = arn
+	if email != "" {
+		c.acct.Email = email
+	}
+	if userID != "" {
+		c.acct.UserID = userID
+	}
+	// Best-effort persistence. The lifecycle bump invalidates this lease; the
+	// pre-send check requeues it with the stored identity before runtime traffic.
+	_ = c.store.updateIdentityAtRevision(c.id, c.revision, arn, email, userID)
 	return arn, nil
 }
 
@@ -116,7 +116,7 @@ func (c *accountCreds) accessToken(ctx context.Context) (string, error) {
 func (c *accountCreds) refresh(ctx context.Context) error {
 	// Route through the store so concurrent refreshes of this account (across
 	// requests and the background refresher) collapse into one CreateToken call.
-	fresh, err := c.store.RefreshToken(ctx, c.client, c.id)
+	fresh, err := c.store.refreshTokenAtCredential(ctx, c.client, c.id, c.credential)
 	if err != nil {
 		return err
 	}
@@ -125,140 +125,225 @@ func (c *accountCreds) refresh(ctx context.Context) error {
 }
 
 // ---------------------------------------------------------------------------
-// Account selector: round-robin over the store with a lightweight cooldown.
+// Account selector: revisioned, generation-stamped routing state.
 // ---------------------------------------------------------------------------
 
 // accountCooldown is how long a failing account is skipped before it is retried.
 const accountCooldown = 60 * time.Second
 
-// depletedFallbackTTL is how long an account whose credit is exhausted is
-// skipped when the precise reset time is unknown — a request's quota error
-// carries no reset_at. It must exceed depletedProbeInterval so the background
-// probe can refine the deadline to the real reset_at before the fallback
-// expires and traffic retries the account.
+// depletedFallbackTTL is retained as retry/probe metadata when upstream does not
+// provide a reset time. Depletion never expires into eligibility by wall clock.
 const depletedFallbackTTL = 45 * time.Minute
 
-// depletedEntry tracks one parked account. until is when credit is expected
-// back (reset_at or fallback); basis is the moment the decision is grounded in
-// (the request-failure time, or the usage snapshot's fetch time). Writes whose
-// basis predates the current entry are ignored, so a stale usage snapshot
-// cannot override a fresher request-failure signal; until never moves earlier,
-// so a fallback deadline cannot clobber a precise reset_at.
-type depletedEntry struct {
-	until time.Time
-	basis time.Time
+type quotaEligibility uint8
+
+const (
+	quotaUnknown quotaEligibility = iota
+	quotaAvailable
+	quotaDepleted
+)
+
+type usageObservationSource uint8
+
+const (
+	usageObservationAuthoritative usageObservationSource = iota
+	usageObservationProbe
+)
+
+// selectorAccountState is the selector-owned state for one account revision.
+// generation changes on every mutation so in-flight results can be applied with
+// compare-and-swap semantics rather than wall-clock ordering.
+type selectorAccountState struct {
+	revision      uint64
+	lifecycle     uint64
+	generation    uint64
+	quota         quotaEligibility
+	cooldownUntil time.Time
+	retryAfter    time.Time
+	reactive      bool
 }
 
-// accountSelector picks accounts round-robin, skipping those in cooldown or
-// marked depleted (credit exhausted until a reset/upgrade restores it).
+// accountLease stamps a routing decision. Success is accepted only while both
+// its account revision and selector generation are still current.
+type accountLease struct {
+	creds      *accountCreds
+	revision   uint64
+	generation uint64
+	fallback   bool
+}
+
+// usageStamp identifies the routing state observed before a GetUsage request.
+// A result from an older revision or generation is ignored.
+type usageStamp struct {
+	id             string
+	revision       uint64
+	generation     uint64
+	overageEnabled bool
+}
+
+// pickResult either carries a directly routable lease or identifies one strict
+// unknown account that must receive a fresh usage check before selection retries.
+type pickResult struct {
+	lease         *accountLease
+	verifyID      string
+	knownDepleted bool
+}
+
+// accountSelector picks accounts round-robin and owns all ephemeral routing
+// state. AccountStore.mu must be acquired before accountSelector.mu whenever
+// both are needed.
 type accountSelector struct {
 	store  *AccountStore
 	client *http.Client
 
-	mu       sync.Mutex
-	index    int
-	cooldown map[string]time.Time     // account id -> time the cooldown ends
-	depleted map[string]depletedEntry // account id -> when credit returns + the basis for that claim
+	mu             sync.Mutex
+	index          int
+	states         map[string]*selectorAccountState
+	nextGeneration uint64
 }
 
 func newAccountSelector(store *AccountStore, client *http.Client) *accountSelector {
 	return &accountSelector{
-		store:    store,
-		client:   client,
-		cooldown: map[string]time.Time{},
-		depleted: map[string]depletedEntry{},
+		store:  store,
+		client: client,
+		states: map[string]*selectorAccountState{},
 	}
 }
 
-// pick returns credentials for the next eligible account, skipping ids in tried
-// and accounts currently in cooldown. When every remaining account is in
-// cooldown it falls back to the one whose cooldown ends soonest. ok is false
-// only when there are no accounts left to try (store empty or all tried).
-func (s *accountSelector) pick(tried map[string]bool) (*accountCreds, bool) {
-	list := s.store.List()
+func (s *accountSelector) nextGenerationLocked() uint64 {
+	s.nextGeneration++
+	if s.nextGeneration == 0 {
+		s.nextGeneration++
+	}
+	return s.nextGeneration
+}
+
+// stateForRuntimeLocked returns state for rt, resetting an older revision to
+// conservative quotaUnknown. A stale store snapshot is never allowed to roll a
+// newer selector state backward.
+func (s *accountSelector) stateForRuntimeLocked(rt accountRuntime) *selectorAccountState {
+	st := s.states[rt.Account.ID]
+	if st != nil && st.revision == rt.Revision && st.lifecycle == rt.Lifecycle {
+		return st
+	}
+	if st != nil && st.revision > rt.Revision {
+		return nil
+	}
+	if st != nil && st.lifecycle == rt.Lifecycle {
+		// Disabled/overage policy mutations invalidate leases via Revision while
+		// retaining sticky depletion and cooldown for the same credentials. A
+		// quotaAvailable state may have depended only on overage, so a strict
+		// snapshot must prove positive base credit again before it can route.
+		st.revision = rt.Revision
+		if !rt.Account.OverageEnabled && st.quota == quotaAvailable {
+			st.quota = quotaUnknown
+		}
+		st.generation = s.nextGenerationLocked()
+		return st
+	}
+	st = &selectorAccountState{
+		revision:   rt.Revision,
+		lifecycle:  rt.Lifecycle,
+		generation: s.nextGenerationLocked(),
+		quota:      quotaUnknown,
+	}
+	s.states[rt.Account.ID] = st
+	return st
+}
+
+func (s *accountSelector) mutateLocked(st *selectorAccountState) {
+	st.generation = s.nextGenerationLocked()
+}
+
+func (s *accountSelector) pruneStatesLocked(list []accountRuntime) {
+	live := make(map[string]bool, len(list))
+	for _, rt := range list {
+		live[rt.Account.ID] = true
+	}
+	for id := range s.states {
+		if !live[id] {
+			delete(s.states, id)
+		}
+	}
+}
+
+// pick chooses the next immediately eligible account. Strict no-overage
+// accounts are selectable only in quotaAvailable. If no account can be routed
+// immediately, verifyID names the first strict quotaUnknown account that should
+// receive a fresh GetUsage before retrying selection. Only cooldown participates
+// in the all-skipped fallback; depleted accounts are never fallback candidates.
+func (s *accountSelector) pick(tried map[string]bool) pickResult {
+	list := s.store.RuntimeList()
 	if len(list) == 0 {
-		return nil, false
+		return pickResult{}
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.pruneStatesLocked(list)
+
 	now := time.Now()
-	s.pruneCooldownLocked(list)
-
-	// skipUntil reports whether an account is temporarily skipped right now
-	// (cooldown or depleted) and the time it recovers. Both are tracked so the
-	// request always has a fallback when every account is momentarily unusable.
-	// skipUntil reports whether an account is temporarily skipped (cooldown or
-	// depleted) and when it fully recovers — the later of the two deadlines,
-	// since both must lift before the account is usable. The fallback ranks
-	// candidates by true recovery time, not whichever skip fired first.
-	skipUntil := func(id string) (time.Time, bool) {
-		rec := time.Time{}
-		skipped := false
-		if cu, ok := s.cooldown[id]; ok && now.Before(cu) {
-			rec = cu
-			skipped = true
-		}
-		if de, ok := s.depleted[id]; ok && now.Before(de.until) {
-			if de.until.After(rec) {
-				rec = de.until
-			}
-			skipped = true
-		}
-		return rec, skipped
-	}
-
-	// Round-robin scan for an account that is neither tried nor skipped.
-	var soonest *StoredAccount
-	var soonestAt time.Time
+	var verifyID string
+	knownDepleted := false
+	var fallback *accountLease
+	var fallbackAt time.Time
 	n := len(list)
 	for i := 0; i < n; i++ {
-		a := list[(s.index+i)%n]
-		if tried[a.ID] {
+		rt := list[(s.index+i)%n]
+		a := rt.Account
+		if tried[a.ID] || !accountUsable(a) {
 			continue
 		}
-		if !accountUsable(a) {
-			continue // dead account: no profileArn and no way to obtain one
+		st := s.stateForRuntimeLocked(rt)
+		if st == nil {
+			continue
 		}
-		if until, skip := skipUntil(a.ID); skip {
-			// Depleted with OverageEnabled=false: base credit exhausted and
-			// admin explicitly forbids overage. This account must never receive
-			// traffic, not even from the all-skipped fallback. Recovery can
-			// only be detected via ensureUsage (periodic or admin-triggered).
-			if de, ok := s.depleted[a.ID]; ok && now.Before(de.until) && !a.OverageEnabled {
-				continue // hard skip — not eligible for fallback
+
+		switch st.quota {
+		case quotaDepleted:
+			knownDepleted = true
+			continue
+		case quotaUnknown:
+			if !a.OverageEnabled {
+				if verifyID == "" {
+					verifyID = a.ID
+				}
+				continue
 			}
-			// Track the candidate that recovers soonest as a fallback.
-			if soonest == nil || until.Before(soonestAt) {
-				ac := a
-				soonest, soonestAt = &ac, until
+		}
+
+		creds := s.credsFor(rt)
+		lease := &accountLease{
+			creds:      creds,
+			revision:   rt.Revision,
+			generation: st.generation,
+		}
+		if now.Before(st.cooldownUntil) {
+			lease.fallback = true
+			if fallback == nil || st.cooldownUntil.Before(fallbackAt) {
+				fallback, fallbackAt = lease, st.cooldownUntil
 			}
 			continue
 		}
+
 		s.index = (s.index + i + 1) % n
-		return s.credsFor(a), true
+		return pickResult{lease: lease, knownDepleted: knownDepleted}
 	}
-
-	// Everything untried is skipped: use the soonest-recovering account.
-	if soonest != nil {
-		return s.credsFor(*soonest), true
+	if verifyID != "" {
+		return pickResult{verifyID: verifyID, knownDepleted: knownDepleted}
 	}
-	return nil, false
+	return pickResult{lease: fallback, knownDepleted: knownDepleted}
 }
 
-// credsFor builds accountCreds for the given account snapshot.
-func (s *accountSelector) credsFor(a StoredAccount) *accountCreds {
-	return &accountCreds{store: s.store, client: s.client, id: a.ID, acct: a}
+// credsFor builds accountCreds for an atomic runtime snapshot.
+func (s *accountSelector) credsFor(rt accountRuntime) *accountCreds {
+	return &accountCreds{
+		store: s.store, client: s.client, id: rt.Account.ID,
+		revision: rt.Revision, credential: rt.Credential, acct: rt.Account,
+	}
 }
 
-// accountUsable reports whether an account can serve a request at all: it must
-// not be administratively parked (Disabled), and it must either already carry a
-// profileArn, or hold a full client registration plus refresh token so
-// accessToken()/profileArn() can refresh and resolve one. An account with
-// neither (e.g. an import whose profileArn lookup failed and that lacks
-// credentials to recover) is dead weight and is skipped during selection.
-// Disabled accounts are still stored, refreshed and shown on the admin page;
-// this gate only excludes them from selection.
+// accountUsable reports whether an account can serve a request at all.
 func accountUsable(a StoredAccount) bool {
 	if a.Disabled {
 		return false
@@ -269,143 +354,165 @@ func accountUsable(a StoredAccount) bool {
 	return a.RefreshToken != "" && a.ClientID != "" && a.ClientSecret != ""
 }
 
-// pruneCooldownLocked drops cooldown/depleted entries for accounts no longer in
-// the store, so removed accounts do not leak entries. Caller must hold s.mu.
-func (s *accountSelector) pruneCooldownLocked(list []StoredAccount) {
-	if len(s.cooldown) == 0 && len(s.depleted) == 0 {
-		return
-	}
-	live := make(map[string]bool, len(list))
-	for _, a := range list {
-		live[a.ID] = true
-	}
-	for id := range s.cooldown {
-		if !live[id] {
-			delete(s.cooldown, id)
-		}
-	}
-	for id := range s.depleted {
-		if !live[id] {
-			delete(s.depleted, id)
-		}
-	}
-}
-
-// peekAny returns credentials for one eligible account for a control-plane call
-// (model schema lookup) that is not tied to a specific request. Unlike pick it
-// does NOT advance the round-robin cursor, so schema lookups do not perturb
-// request dispatch fairness (which matters especially with few accounts). It
-// skips unusable accounts and prefers one not in cooldown, falling back to the
-// first usable account. ok is false when no usable account exists.
+// peekAny returns credentials for one usable account for control-plane calls.
+// It intentionally ignores quota state and does not advance round-robin order.
 func (s *accountSelector) peekAny() (*accountCreds, bool) {
-	list := s.store.List()
+	list := s.store.RuntimeList()
 	if len(list) == 0 {
 		return nil, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.pruneStatesLocked(list)
 	now := time.Now()
-	var firstUsable *StoredAccount
-	for i := range list {
-		a := list[i]
-		if !accountUsable(a) {
+	var first *accountCreds
+	for _, rt := range list {
+		if !accountUsable(rt.Account) {
 			continue
 		}
-		if firstUsable == nil {
-			firstUsable = &list[i]
-		}
-		if until, ok := s.cooldown[a.ID]; ok && now.Before(until) {
+		st := s.stateForRuntimeLocked(rt)
+		if st == nil {
 			continue
 		}
-		return s.credsFor(a), true
+		creds := s.credsFor(rt)
+		if first == nil {
+			first = creds
+		}
+		if !now.Before(st.cooldownUntil) {
+			return creds, true
+		}
 	}
-	// All usable accounts are cooling down: any of them serves a (cached)
-	// schema lookup. If none are usable at all, report no account.
-	if firstUsable != nil {
-		return s.credsFor(*firstUsable), true
-	}
-	return nil, false
+	return first, first != nil
 }
 
-// byID returns credentials for one specific account by id, regardless of its
-// usability/cooldown state — used by per-account control-plane calls that the
-// admin explicitly targets (e.g. "show models for THIS account's card"). ok is
-// false when the id is unknown.
+// byID returns revision-stamped credentials for one account regardless of its
+// disabled, usability, quota, or cooldown state.
 func (s *accountSelector) byID(id string) (*accountCreds, bool) {
-	for _, a := range s.store.List() {
-		if a.ID == id {
-			return s.credsFor(a), true
-		}
+	rt, ok := s.store.Runtime(id)
+	if !ok {
+		return nil, false
 	}
-	return nil, false
+	return s.credsFor(rt), true
 }
 
-// listAll returns credentials for every stored account, for per-account
-// control-plane calls (e.g. rendering usage for each account on the admin page).
+// listAll returns revision-stamped credentials for every stored account.
 func (s *accountSelector) listAll() []*accountCreds {
-	list := s.store.List()
+	list := s.store.RuntimeList()
 	out := make([]*accountCreds, 0, len(list))
-	for _, a := range list {
-		out = append(out, s.credsFor(a))
+	for _, rt := range list {
+		out = append(out, s.credsFor(rt))
 	}
 	return out
 }
 
-// recordSuccess clears any cooldown and depleted mark on the account. A depleted
-// account only reaches the success path via the all-skipped fallback; if it then
-// serves the request, it plainly has credit again.
-func (s *accountSelector) recordSuccess(id string) {
-	s.mu.Lock()
-	delete(s.cooldown, id)
-	delete(s.depleted, id)
-	s.mu.Unlock()
-}
-
-// recordFailure puts the account into cooldown.
-func (s *accountSelector) recordFailure(id string) {
-	s.mu.Lock()
-	s.cooldown[id] = time.Now().Add(accountCooldown)
-	s.mu.Unlock()
-}
-
-// markDepleted skips an account for credit-bearing requests until the given
-// time (a fallback TTL — request errors carry no reset_at). pick consults this;
-// peekAny ignores it because schema/model lookups do not consume credit. The
-// deadline never moves earlier, so it cannot clobber a precise reset_at that a
-// probe/admin refresh already recorded.
-func (s *accountSelector) markDepleted(id string, until time.Time) {
-	s.mu.Lock()
-	s.setDepletedLocked(id, until, time.Now())
-	s.mu.Unlock()
-}
-
-// clearDepleted lifts a depleted mark immediately.
-func (s *accountSelector) clearDepleted(id string) {
-	s.mu.Lock()
-	delete(s.depleted, id)
-	s.mu.Unlock()
-}
-
-// setDepletedLocked parks id until at least deadline, grounded at basis. A
-// write whose basis predates the existing entry's basis is dropped (stale data
-// must not override fresher data); the deadline never moves earlier. Caller
-// must hold s.mu.
-func (s *accountSelector) setDepletedLocked(id string, deadline, basis time.Time) {
-	if e, ok := s.depleted[id]; ok {
-		if e.basis.After(basis) {
-			return // existing entry grounded in fresher information
-		}
-		if e.until.After(deadline) {
-			deadline = e.until // never shorten an existing deadline
-		}
+// revalidate checks a lease immediately before a runtime send. It linearizes
+// account mutation at AccountStore.mu without holding either lock across I/O.
+func (s *accountSelector) revalidate(lease *accountLease) bool {
+	if lease == nil || lease.creds == nil {
+		return false
 	}
-	s.depleted[id] = depletedEntry{until: deadline, basis: basis}
+	return s.store.withRuntime(lease.creds.id, func(rt accountRuntime) bool {
+		if rt.Revision != lease.revision || !accountUsable(rt.Account) {
+			return false
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		st := s.states[lease.creds.id]
+		if st == nil || st.revision != lease.revision || st.generation != lease.generation {
+			return false
+		}
+		if st.quota == quotaDepleted || (!rt.Account.OverageEnabled && st.quota != quotaAvailable) {
+			return false
+		}
+		cooling := time.Now().Before(st.cooldownUntil)
+		return cooling == lease.fallback
+	})
 }
 
-// depletedDeadline returns when credit is expected back from a usage snapshot:
-// its reset_at, or now+depletedFallbackTTL when reset_at is missing or past.
+// recordSuccess clears cooldown only when the exact selected generation remains
+// current. Runtime success never promotes unknown or depleted quota state.
+func (s *accountSelector) recordSuccess(lease *accountLease) {
+	s.withLeaseState(lease, true, func(st *selectorAccountState) {
+		if st.cooldownUntil.IsZero() {
+			return
+		}
+		st.cooldownUntil = time.Time{}
+		s.mutateLocked(st)
+	})
+}
+
+// recordFailure conservatively cools the current account revision. A failure may
+// supersede an older success generation, but never a replaced/re-added account.
+func (s *accountSelector) recordFailure(lease *accountLease) {
+	s.withLeaseState(lease, false, func(st *selectorAccountState) {
+		st.cooldownUntil = time.Now().Add(accountCooldown)
+		s.mutateLocked(st)
+	})
+}
+
+// recordDepleted records a reactive quota failure. It is sticky until a fresh,
+// matching usage observation reports positive base Remaining and is never an
+// all-skipped fallback candidate.
+func (s *accountSelector) recordDepleted(lease *accountLease) {
+	s.withLeaseState(lease, false, func(st *selectorAccountState) {
+		retryAfter := time.Now().Add(depletedFallbackTTL)
+		if st.retryAfter.After(retryAfter) {
+			retryAfter = st.retryAfter
+		}
+		st.quota = quotaDepleted
+		st.reactive = true
+		st.retryAfter = retryAfter
+		s.mutateLocked(st)
+	})
+}
+
+func (s *accountSelector) withLeaseState(lease *accountLease, requireGeneration bool, fn func(*selectorAccountState)) bool {
+	if lease == nil || lease.creds == nil {
+		return false
+	}
+	return s.store.withRuntime(lease.creds.id, func(rt accountRuntime) bool {
+		if rt.Revision != lease.revision {
+			return false
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		st := s.states[lease.creds.id]
+		if st == nil || st.revision != lease.revision {
+			return false
+		}
+		if requireGeneration && st.generation != lease.generation {
+			return false
+		}
+		fn(st)
+		return true
+	})
+}
+
+// usageTarget captures credentials and a selector stamp before GetUsage starts.
+func (s *accountSelector) usageTarget(id string) (*accountCreds, usageStamp, bool) {
+	var creds *accountCreds
+	var stamp usageStamp
+	ok := s.store.withRuntime(id, func(rt accountRuntime) bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		st := s.stateForRuntimeLocked(rt)
+		if st == nil {
+			return false
+		}
+		creds = s.credsFor(rt)
+		stamp = usageStamp{
+			id: id, revision: rt.Revision, generation: st.generation,
+			overageEnabled: rt.Account.OverageEnabled,
+		}
+		return true
+	})
+	return creds, stamp, ok
+}
+
+// depletedDeadline derives retry/probe metadata from usage. Elapsing this time
+// never changes quota eligibility.
 func depletedDeadline(u *kiroUsage, now time.Time) time.Time {
-	if u.ResetAt != "" {
+	if u != nil && u.ResetAt != "" {
 		if t, err := time.Parse(time.RFC3339, u.ResetAt); err == nil && t.After(now) {
 			return t
 		}
@@ -413,63 +520,123 @@ func depletedDeadline(u *kiroUsage, now time.Time) time.Time {
 	return now.Add(depletedFallbackTTL)
 }
 
-// applyUsage reconciles the depleted state with a usage snapshot taken at
-// fetched. An account with budget left is un-parked; one without is parked
-// until reset_at (or the fallback TTL). Budget means base credit remaining, or
-// — only when the account opts in via OverageEnabled AND upstream has actually
-// switched overage on (overageStatus ENABLED/ACTIVE, checked by overageActive)
-// — base exhausted but overage still available. The overage opt-in only lifts on an authoritative
-// path (preciseOnly=false: ensureUsage / admin toggle); the probe path ignores
-// it, since an optimistic overage budget under upstream currentUsage clamping
-// would lift a fresher reactive 402 mark and loop (probe un-park -> fail ->
-// re-park). With overage disabled (the default) zero base credit counts as
-// exhausted, preserving the legacy strictly-no-overage behaviour.
-// preciseOnly (the probe path) refines an existing entry but never creates one,
-// so a stale snapshot cannot re-park an account that just recovered and served
-// traffic. Writes are grounded at fetched, so a stale snapshot cannot lift a
-// mark a concurrent request failure just set. A nil usage/credit leaves the
-// state untouched.
-func (s *accountSelector) applyUsage(id string, u *kiroUsage, fetched time.Time, preciseOnly bool) {
-	if u == nil || u.Credit == nil {
-		return
+// applyUsage applies a GetUsage result only if the account revision and selector
+// generation still match the pre-fetch stamp. Positive base Remaining is the
+// sole way to admit or recover a strict account and the sole way to clear a
+// reactive depletion. Overage-enabled unknown accounts remain availability-first.
+func (s *accountSelector) applyUsage(stamp usageStamp, u *kiroUsage, source usageObservationSource) bool {
+	if stamp.id == "" || u == nil || u.Credit == nil {
+		return false
 	}
-	// Read the overage opt-in outside s.mu so selector.mu never nests store.mu
-	// (store.Get takes store.mu). A toggle racing in here is fine: this is a
-	// best-effort reconcile and the next refresh re-evaluates.
-	overage := false
-	if a, ok := s.store.Get(id); ok {
-		overage = a.OverageEnabled
+	return s.store.withRuntime(stamp.id, func(rt accountRuntime) bool {
+		if rt.Revision != stamp.revision || rt.Account.OverageEnabled != stamp.overageEnabled {
+			return false
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		st := s.states[stamp.id]
+		if st == nil || st.revision != stamp.revision || st.generation != stamp.generation {
+			return false
+		}
+
+		now := time.Now()
+		if u.Credit.Remaining > 0 {
+			changed := st.quota != quotaAvailable || st.reactive || !st.retryAfter.IsZero()
+			st.quota = quotaAvailable
+			st.reactive = false
+			st.retryAfter = time.Time{}
+			if changed {
+				s.mutateLocked(st)
+			}
+			return true
+		}
+
+		// A base-zero observation can authorize unused overage only before a
+		// reactive quota failure. Probe observations cannot make this optimistic
+		// transition because upstream may clamp usage at the base limit.
+		if !st.reactive && source != usageObservationProbe && stamp.overageEnabled &&
+			overageActive(u) && overageRemaining(u.Credit) > 0 {
+			changed := st.quota != quotaAvailable || !st.retryAfter.IsZero()
+			st.quota = quotaAvailable
+			st.retryAfter = time.Time{}
+			if changed {
+				s.mutateLocked(st)
+			}
+			return true
+		}
+
+		st.quota = quotaDepleted
+		deadline := depletedDeadline(u, now)
+		if st.reactive && st.retryAfter.After(deadline) {
+			deadline = st.retryAfter
+		}
+		st.retryAfter = deadline
+		s.mutateLocked(st)
+		return true
+	})
+}
+
+// probeIDs returns strict unknown accounts plus every depleted account. Disabled
+// or unusable accounts are omitted. Probe observations remain conservative: a
+// base-zero overage snapshot cannot unlock an account, reactive or otherwise.
+func (s *accountSelector) probeIDs() []string {
+	list := s.store.RuntimeList()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneStatesLocked(list)
+	ids := make([]string, 0, len(list))
+	for _, rt := range list {
+		a := rt.Account
+		if !accountUsable(a) {
+			continue
+		}
+		st := s.stateForRuntimeLocked(rt)
+		if st == nil {
+			continue
+		}
+		if (!a.OverageEnabled && st.quota == quotaUnknown) || st.quota == quotaDepleted {
+			ids = append(ids, a.ID)
+		}
+	}
+	return ids
+}
+
+// forget discards selector state after account removal. Old observations remain
+// harmless because their runtime revision no longer exists.
+func (s *accountSelector) forget(id string) {
+	s.mu.Lock()
+	delete(s.states, id)
+	s.mu.Unlock()
+}
+
+func (s *accountSelector) isReactivelyDepleted(id string, revision uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.states[id]
+	return st != nil && st.revision == revision && st.quota == quotaDepleted && st.reactive
+}
+
+func (s *accountSelector) isDepletedAtRevision(id string, revision uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.states[id]
+	return st != nil && st.revision == revision && st.quota == quotaDepleted
+}
+
+// isDepleted is a temporary compatibility query for callers not yet migrated to
+// revision-aware aggregate inspection.
+func (s *accountSelector) isDepleted(id string) bool {
+	rt, ok := s.store.Runtime(id)
+	if !ok {
+		return false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	budget := u.Credit.Remaining > 0
-	if !budget && !preciseOnly && overage && overageActive(u) && overageRemaining(u.Credit) > 0 {
-		// Base exhausted: overage may still serve, but only if the account opts
-		// in locally AND upstream has overage active. Skipped on the probe path
-		// (preciseOnly), where an optimistic overage budget must not lift a
-		// fresher reactive 402 mark.
-		budget = true
-	}
-	if budget {
-		// Lift the mark only if this snapshot is at least as fresh as the mark.
-		if e, ok := s.depleted[id]; !ok || !e.basis.After(fetched) {
-			delete(s.depleted, id)
-		}
-		return
-	}
-	if preciseOnly {
-		if _, ok := s.depleted[id]; !ok {
-			return // do not re-park an account that recovered since the snapshot
-		}
-	}
-	s.setDepletedLocked(id, depletedDeadline(u, time.Now()), fetched)
+	st := s.states[id]
+	return st != nil && st.revision == rt.Revision && st.quota == quotaDepleted
 }
 
-// overageRemaining reports how much overage budget is left on a CREDIT usage
-// line. Once Used exceeds Limit the account is spending overage, so the excess
-// is overage spent. Robust to either upstream currentUsage semantics: when the
-// upstream clamps currentUsage at the limit, this stays positive and the
-// reactive markDepleted path catches a truly exhausted account instead.
+// overageRemaining reports how much configured overage budget remains.
 func overageRemaining(c *kiroCreditUsage) float64 {
 	if c == nil || c.OverageCap <= 0 {
 		return 0
@@ -478,19 +645,13 @@ func overageRemaining(c *kiroCreditUsage) float64 {
 	if spent < 0 {
 		spent = 0
 	}
-	if r := c.OverageCap - spent; r > 0 {
-		return r
+	if remaining := c.OverageCap - spent; remaining > 0 {
+		return remaining
 	}
 	return 0
 }
 
-// overageActive reports whether upstream has actually switched overage on for
-// this account. overageStatus is the authoritative toggle (ENABLED/ACTIVE); a
-// positive overageCap alone is NOT enough, since a DISABLED account still
-// reports the cap it would have if enabled. This gates both routing
-// (applyUsage) and the per-model aggregate, so an account whose overage is off
-// at AWS never counts as having overage budget — even when the local opt-in is
-// on and the cap is non-zero.
+// overageActive reports whether upstream has enabled overage for the account.
 func overageActive(u *kiroUsage) bool {
 	if u == nil {
 		return false
@@ -500,28 +661,6 @@ func overageActive(u *kiroUsage) bool {
 		return true
 	}
 	return false
-}
-
-// isDepleted reports whether id is currently parked for exhausted credit.
-// Expired entries are treated as inactive; cleanup remains the responsibility
-// of the normal selector path so this read-only query has no side effects.
-func (s *accountSelector) isDepleted(id string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	e, ok := s.depleted[id]
-	return ok && time.Now().Before(e.until)
-}
-
-// depletedIDs returns a snapshot of ids currently marked depleted, for the
-// background probe to re-check. Callers need not hold the lock.
-func (s *accountSelector) depletedIDs() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ids := make([]string, 0, len(s.depleted))
-	for id := range s.depleted {
-		ids = append(ids, id)
-	}
-	return ids
 }
 
 // isAccountFailure reports whether err is an upstream failure that warrants
@@ -569,5 +708,6 @@ func isAccountDepleted(err error) bool {
 	if he.Status == http.StatusPaymentRequired || he.Status == http.StatusLocked {
 		return true
 	}
-	return he.Kind == "serviceQuotaExceededError"
+	kind := normalizeKiroEventKind(he.Kind)
+	return kind == "servicequotaexceedederror" || kind == "servicequotaexceededexception"
 }

@@ -16,24 +16,32 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 )
 
 // Server wires the Anthropic-facing HTTP API to the Kiro backend. All requests
 // and control-plane calls are served from the multi-account store; there is no
 // single primary account.
 type Server struct {
-	cfg      *Config
-	kiro     *KiroClient
-	accounts *AccountStore    // multi-account credential store (the only account source)
-	login    *loginManager    // IdC sign-in flow driver
-	selector *accountSelector // round-robin picker over the account store
-	logger   *slog.Logger     // per-request access log; nil disables it
+	cfg       *Config
+	kiro      *KiroClient
+	accounts  *AccountStore    // multi-account credential store (the only account source)
+	login     *loginManager    // IdC sign-in flow driver
+	selector  *accountSelector // round-robin picker over the account store
+	logger    *slog.Logger     // per-request access log; nil disables it
+	warmupCtx context.Context  // service lifetime for detached cache warmups
 
 	modelsMu    sync.Mutex
 	modelsCache map[string]modelsCacheEntry // per-account model list cache
+	modelsEpoch map[string]uint64           // invalidation generation by account id
+	modelsGroup singleflight.Group
 
 	usageMu    sync.Mutex
 	usageCache map[string]usageCacheEntry // per-account usage cache
+	usageEpoch map[string]uint64          // invalidation generation by account id
+	usageGroup singleflight.Group
+
+	warmupSlots chan struct{}
 
 	updateMu    sync.Mutex
 	updateCache *updateStatus // last successful GitHub update check (nil until first fetch)
@@ -42,17 +50,50 @@ type Server struct {
 	updateErrAt time.Time     // when updateErr was recorded
 }
 
-// modelsCacheEntry caches one account's model list.
+// modelsCacheEntry caches one account revision's model list.
 type modelsCacheEntry struct {
-	models  []kiroModelInfo
-	fetched time.Time
+	models   []kiroModelInfo
+	fetched  time.Time
+	revision uint64
 }
 
-// usageCacheEntry caches one account's usage.
+// usageCacheEntry caches one account revision's usage. Selector reconciliation
+// uses the pre-fetch generation carried by usageFetchResult, never a cache hit.
 type usageCacheEntry struct {
-	usage   *kiroUsage
-	fetched time.Time
+	usage      *kiroUsage
+	fetched    time.Time
+	revision   uint64
+	generation uint64
 }
+
+type usageFetchResult struct {
+	usage     *kiroUsage
+	stamp     usageStamp
+	fetchedAt time.Time
+}
+
+type usageRequestMode struct {
+	allowCache       bool
+	observeSelector  bool
+	source           usageObservationSource
+	expectedRevision uint64
+}
+
+// Control-plane fetches are bounded independently of any one waiter. A
+// canceled waiter stops waiting without aborting work still needed by others.
+const (
+	usageFetchTimeout          = 15 * time.Second
+	modelFetchTimeout          = 15 * time.Second
+	maxUsageObservationRetries = 2
+	maxModelRevisionRetries    = 2
+	warmupConcurrency          = 4
+	firstFrameProbeTimeout     = time.Second
+)
+
+var (
+	errUsageObservationStale = errors.New("usage observation became stale")
+	errModelResultStale      = errors.New("model result became stale")
+)
 
 // usageCacheTTL is how long a GetUsageLimits result is reused before refetching,
 // so the auto-refreshing admin page does not hammer the control plane.
@@ -60,6 +101,10 @@ const usageCacheTTL = 60 * time.Second
 
 // modelsCacheTTL is how long a per-account model list is reused.
 const modelsCacheTTL = 5 * time.Minute
+
+// modelWarmupTimeout bounds detached model prefetches. Runtime streams remain
+// timeout-free; only this best-effort control-plane work gets a fixed deadline.
+const modelWarmupTimeout = 15 * time.Second
 
 // aggregateConcurrency caps how many accounts a per-model aggregation fans out
 // to in parallel, so a large pool does not stampede the control plane at once.
@@ -110,9 +155,30 @@ func NewServer(cfg *Config, client *http.Client) *Server {
 		cfg:         cfg,
 		kiro:        NewKiroClient(cfg, client),
 		login:       newLoginManager(client),
+		warmupCtx:   context.Background(),
 		modelsCache: map[string]modelsCacheEntry{},
+		modelsEpoch: map[string]uint64{},
 		usageCache:  map[string]usageCacheEntry{},
+		usageEpoch:  map[string]uint64{},
+		warmupSlots: make(chan struct{}, warmupConcurrency),
 	}
+}
+
+// setWarmupContext ties detached cache prefetches to the service lifetime.
+// Call it during startup, before any warmup is launched.
+func (s *Server) setWarmupContext(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.warmupCtx = ctx
+}
+
+func (s *Server) controlPlaneContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	base := s.warmupCtx
+	if base == nil {
+		base = context.Background()
+	}
+	return context.WithTimeout(base, timeout)
 }
 
 // setAccounts attaches the multi-account store and builds the round-robin
@@ -325,23 +391,91 @@ func modelInfoJSON(m kiroModelInfo, now string) map[string]any {
 // real upstream cause; "any models" callers (anyModels) ignore it.
 func (s *Server) ensureModels(ctx context.Context, creds *accountCreds) ([]kiroModelInfo, error) {
 	s.modelsMu.Lock()
-	if e, ok := s.modelsCache[creds.id]; ok && time.Since(e.fetched) < modelsCacheTTL {
+	epoch := s.modelsEpoch[creds.id]
+	if e, ok := s.modelsCache[creds.id]; ok && e.revision == creds.revision && time.Since(e.fetched) < modelsCacheTTL {
 		s.modelsMu.Unlock()
 		return e.models, nil
 	}
 	s.modelsMu.Unlock()
-
-	models, err := s.kiro.ListModels(ctx, creds)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if len(models) == 0 {
-		return nil, fmt.Errorf("upstream returned no models")
+
+	key := fmt.Sprintf("%s/%d/%d", creds.id, creds.revision, epoch)
+	ch := s.modelsGroup.DoChan(key, func() (any, error) {
+		fetchCtx, cancel := s.controlPlaneContext(modelFetchTimeout)
+		defer cancel()
+		models, err := s.kiro.ListModels(fetchCtx, creds)
+		if err != nil {
+			return nil, err
+		}
+		if len(models) == 0 {
+			return nil, fmt.Errorf("upstream returned no models")
+		}
+		fetched := time.Now()
+		s.accounts.withRuntime(creds.id, func(rt accountRuntime) bool {
+			if rt.Revision != creds.revision {
+				return false
+			}
+			s.modelsMu.Lock()
+			defer s.modelsMu.Unlock()
+			if s.modelsEpoch[creds.id] != epoch {
+				return false
+			}
+			if s.modelsCache == nil {
+				s.modelsCache = map[string]modelsCacheEntry{}
+			}
+			s.modelsCache[creds.id] = modelsCacheEntry{models: models, fetched: fetched, revision: creds.revision}
+			return true
+		})
+		return models, nil
+	})
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-ch:
+		if result.Err != nil {
+			return nil, result.Err
+		}
+		rt, ok := s.accounts.Runtime(creds.id)
+		if !ok || rt.Revision != creds.revision {
+			return nil, fmt.Errorf("%w: %s", errAccountRevisionChanged, creds.id)
+		}
+		s.modelsMu.Lock()
+		currentEpoch := s.modelsEpoch[creds.id]
+		s.modelsMu.Unlock()
+		if currentEpoch != epoch {
+			return nil, fmt.Errorf("%w: %s", errModelResultStale, creds.id)
+		}
+		return result.Val.([]kiroModelInfo), nil
 	}
-	s.modelsMu.Lock()
-	s.modelsCache[creds.id] = modelsCacheEntry{models: models, fetched: time.Now()}
-	s.modelsMu.Unlock()
-	return models, nil
+}
+
+// ensureModelsCurrent retries stale control-plane results against a freshly
+// captured account snapshot. It is for read-only/admin/warmup callers only;
+// runtime routing remains bound to its selected lease and reselects in openStream.
+func (s *Server) ensureModelsCurrent(ctx context.Context, id string) ([]kiroModelInfo, error) {
+	if s.selector == nil {
+		return nil, fmt.Errorf("account store is not configured")
+	}
+	for attempt := 0; ; attempt++ {
+		creds, ok := s.selector.byID(id)
+		if !ok {
+			return nil, fmt.Errorf("account not found: %s", id)
+		}
+		models, err := s.ensureModels(ctx, creds)
+		if err == nil {
+			return models, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if attempt >= maxModelRevisionRetries ||
+			(!errors.Is(err, errAccountRevisionChanged) && !errors.Is(err, errModelResultStale)) {
+			return nil, err
+		}
+	}
 }
 
 // anyModels returns the model list from any one account (model schemas are the
@@ -357,7 +491,7 @@ func (s *Server) anyModels(ctx context.Context) []kiroModelInfo {
 	if !ok {
 		return nil
 	}
-	models, _ := s.ensureModels(ctx, creds)
+	models, _ := s.ensureModelsCurrent(ctx, creds.id)
 	return models
 }
 
@@ -372,94 +506,240 @@ func (s *Server) modelsByAccount(ctx context.Context, id string) ([]kiroModelInf
 	if s.selector == nil {
 		return nil, fmt.Errorf("account store is not configured")
 	}
-	creds, ok := s.selector.byID(id)
-	if !ok {
-		return nil, fmt.Errorf("account not found: %s", id)
-	}
-	models, err := s.ensureModels(ctx, creds)
+	models, err := s.ensureModelsCurrent(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("list models for account %s: %w", id, err)
 	}
 	return models, nil
 }
 
-// ensureUsage returns one account's usage, fetching it at most once per
-// usageCacheTTL. A failed fetch is not cached and is surfaced to the caller.
+// accountUsage centralizes usage caching and coalesces matching account
+// revision/generation fetches. Each caller retains its own observation mode and
+// cancellation: a read-only waiter never mutates routing, while an observing
+// waiter may apply the same shared result using its pre-fetch selector stamp.
+func (s *Server) accountUsage(ctx context.Context, id string, mode usageRequestMode) (*kiroUsage, error) {
+	if s.selector == nil {
+		return nil, fmt.Errorf("account store is not configured")
+	}
+	allowCache := mode.allowCache
+	for attempt := 0; ; attempt++ {
+		creds, stamp, ok := s.selector.usageTarget(id)
+		if !ok {
+			return nil, fmt.Errorf("account not found: %s", id)
+		}
+		if mode.expectedRevision != 0 && stamp.revision != mode.expectedRevision {
+			return nil, fmt.Errorf("%w: %s", errAccountRevisionChanged, id)
+		}
+
+		s.usageMu.Lock()
+		epoch := s.usageEpoch[id]
+		if allowCache {
+			if e, hit := s.usageCache[id]; hit && e.revision == stamp.revision && time.Since(e.fetched) < usageCacheTTL {
+				u := e.usage
+				s.usageMu.Unlock()
+				return u, nil
+			}
+		}
+		s.usageMu.Unlock()
+		if s.kiro == nil {
+			return nil, fmt.Errorf("Kiro client is not configured")
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		key := fmt.Sprintf("%s/%d/%d/%d", id, stamp.revision, stamp.generation, epoch)
+		ch := s.usageGroup.DoChan(key, func() (any, error) {
+			fetchCtx, cancel := s.controlPlaneContext(usageFetchTimeout)
+			defer cancel()
+			u, err := s.kiro.GetUsage(fetchCtx, creds)
+			if err != nil {
+				return nil, err
+			}
+			result := usageFetchResult{usage: u, stamp: stamp, fetchedAt: time.Now()}
+			s.accounts.withRuntime(id, func(rt accountRuntime) bool {
+				if rt.Revision != stamp.revision {
+					return false
+				}
+				s.usageMu.Lock()
+				defer s.usageMu.Unlock()
+				if s.usageEpoch[id] != epoch {
+					return false
+				}
+				if current, exists := s.usageCache[id]; exists && current.revision == stamp.revision && current.generation > stamp.generation {
+					return false
+				}
+				if s.usageCache == nil {
+					s.usageCache = map[string]usageCacheEntry{}
+				}
+				s.usageCache[id] = usageCacheEntry{usage: u, fetched: result.fetchedAt, revision: stamp.revision, generation: stamp.generation}
+				return true
+			})
+			return result, nil
+		})
+
+		var result usageFetchResult
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case shared := <-ch:
+			if shared.Err != nil {
+				return nil, shared.Err
+			}
+			result = shared.Val.(usageFetchResult)
+		}
+		rt, current := s.accounts.Runtime(id)
+		if !current || rt.Revision != result.stamp.revision {
+			if mode.expectedRevision == 0 && mode.source == usageObservationAuthoritative && attempt < maxUsageObservationRetries {
+				allowCache = false
+				continue
+			}
+			return nil, fmt.Errorf("%w: %s", errAccountRevisionChanged, id)
+		}
+		if mode.observeSelector && (result.usage == nil || result.usage.Credit == nil) {
+			// An incomplete Usage response establishes neither availability nor
+			// depletion. It is valid data, not an ordering conflict, so leave the
+			// selector unchanged and let the caller keep the account blocked.
+			return result.usage, nil
+		}
+		if mode.observeSelector && !s.selector.applyUsage(result.stamp, result.usage, mode.source) {
+			if mode.source == usageObservationAuthoritative && attempt < maxUsageObservationRetries {
+				allowCache = false
+				continue
+			}
+			return nil, fmt.Errorf("%w: %s", errUsageObservationStale, id)
+		}
+		return result.usage, nil
+	}
+}
+
+// ensureUsage returns one account's cached or freshly observed usage. Cache
+// hits are data-only: selector state is changed only by a matching fresh fetch.
 func (s *Server) ensureUsage(ctx context.Context, creds *accountCreds) (*kiroUsage, error) {
-	s.usageMu.Lock()
-	if e, ok := s.usageCache[creds.id]; ok && time.Since(e.fetched) < usageCacheTTL {
-		u := e.usage
-		s.usageMu.Unlock()
-		return u, nil
-	}
-	s.usageMu.Unlock()
-
-	u, err := s.kiro.GetUsage(ctx, creds)
-	if err != nil {
-		return nil, err
-	}
-	now := time.Now()
-	s.usageMu.Lock()
-	s.usageCache[creds.id] = usageCacheEntry{usage: u, fetched: now}
-	s.usageMu.Unlock()
-	// Reconcile the depleted state with the fresh usage so admin-page refreshes
-	// (including manual ones) recover or precisely park depleted accounts.
-	if s.selector != nil {
-		s.selector.applyUsage(creds.id, u, now, false)
-	}
-	return u, nil
+	return s.accountUsage(ctx, creds.id, usageRequestMode{
+		allowCache: true, observeSelector: true, source: usageObservationAuthoritative,
+		expectedRevision: creds.revision,
+	})
 }
 
-// ensureUsageReadOnly returns one account's usage without reconciling the
-// selector's depleted state — the read-only path for queries (e.g. the
-// per-model aggregate) that must not park accounts as a side effect of
-// inspection. It shares ensureUsage's cache; a miss fetches once and fills the
-// cache but skips applyUsage, so inspection leaves routing untouched.
+// ensureUsageReadOnly shares cache and in-flight work with observed callers but
+// never reconciles selector state for this waiter. The caller's account revision
+// is pinned so model/policy metadata cannot be combined with newer usage.
 func (s *Server) ensureUsageReadOnly(ctx context.Context, creds *accountCreds) (*kiroUsage, error) {
-	s.usageMu.Lock()
-	if e, ok := s.usageCache[creds.id]; ok && time.Since(e.fetched) < usageCacheTTL {
-		u := e.usage
-		s.usageMu.Unlock()
-		return u, nil
-	}
-	s.usageMu.Unlock()
-
-	u, err := s.kiro.GetUsage(ctx, creds)
-	if err != nil {
-		return nil, err
-	}
-	s.usageMu.Lock()
-	s.usageCache[creds.id] = usageCacheEntry{usage: u, fetched: time.Now()}
-	s.usageMu.Unlock()
-	return u, nil
+	return s.accountUsage(ctx, creds.id, usageRequestMode{
+		allowCache: true, expectedRevision: creds.revision,
+	})
 }
 
-// warmAccount non-blockingly pre-fetches models and usage for one account so the
-// first real request to that account does not pay the fetch latency. Best-effort:
-// failures are silently ignored (caches stay cold, the request path fetches).
+// refreshUsage forces a fresh observed GetUsage while retaining shared-fetch
+// coalescing. Warmup, lifecycle reconciliation, probes, and strict-account
+// verification use this path rather than trusting a prior revision's cache.
+func (s *Server) refreshUsage(ctx context.Context, id string, source usageObservationSource) (*kiroUsage, error) {
+	return s.accountUsage(ctx, id, usageRequestMode{
+		observeSelector: true, source: source,
+	})
+}
+
+// warmModels performs the bounded model half of account warmup synchronously.
+// Keeping it separate makes the lifetime boundary explicit: warmAccount detaches
+// the work, while every nested wait still observes this context.
+func (s *Server) warmModels(baseCtx context.Context, id string) {
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	if baseCtx.Err() != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(baseCtx, modelWarmupTimeout)
+	defer cancel()
+	_, _ = s.ensureModelsCurrent(ctx, id)
+}
+
+func (s *Server) warmAccountSync(baseCtx context.Context, id string) {
+	if s.selector == nil || s.kiro == nil || baseCtx.Err() != nil {
+		return
+	}
+	select {
+	case s.warmupSlots <- struct{}{}:
+		defer func() { <-s.warmupSlots }()
+	case <-baseCtx.Done():
+		return
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		s.warmModels(baseCtx, id)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = s.refreshUsage(baseCtx, id, usageObservationAuthoritative)
+	}()
+	wg.Wait()
+}
+
+// warmAccount queues a bounded, non-blocking model and usage prefetch.
 func (s *Server) warmAccount(id string) {
-	if s.selector == nil || s.kiro == nil {
+	baseCtx := s.warmupCtx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	if baseCtx.Err() != nil {
 		return
 	}
-	creds, ok := s.selector.byID(id)
-	if !ok {
-		return
-	}
-	go func() { s.ensureModels(context.Background(), creds) }()
-	go func() { s.ensureUsage(context.Background(), creds) }()
+	go s.warmAccountSync(baseCtx, id)
 }
 
-// warmAllAccounts non-blockingly pre-fetches models and usage for every usable
-// account so the first request to a cold pool does not pay the fetch latency.
+// warmAllAccounts runs a fixed worker pool so pool size does not determine
+// startup goroutine or control-plane concurrency.
 func (s *Server) warmAllAccounts() {
 	if s.accounts == nil {
 		return
 	}
+	baseCtx := s.warmupCtx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	ids := make([]string, 0)
 	for _, a := range s.accounts.List() {
+		if baseCtx.Err() != nil {
+			return
+		}
 		if accountUsable(a) {
-			s.warmAccount(a.ID)
+			ids = append(ids, a.ID)
 		}
 	}
+	if len(ids) == 0 {
+		return
+	}
+	go func() {
+		jobs := make(chan string)
+		var wg sync.WaitGroup
+		workers := warmupConcurrency
+		if workers > len(ids) {
+			workers = len(ids)
+		}
+		wg.Add(workers)
+		for range workers {
+			go func() {
+				defer wg.Done()
+				for id := range jobs {
+					s.warmAccountSync(baseCtx, id)
+				}
+			}()
+		}
+		for _, id := range ids {
+			select {
+			case jobs <- id:
+			case <-baseCtx.Done():
+				close(jobs)
+				wg.Wait()
+				return
+			}
+		}
+		close(jobs)
+		wg.Wait()
+	}()
 }
 
 // aggregateModelUsage sums the remaining credit across every account in the
@@ -515,7 +795,6 @@ func (s *Server) aggregateModelUsage(ctx context.Context, modelID string) *model
 			defer func() { <-sem }()
 
 			recordErr := func(err error) {
-				noteError(gctx, fmt.Sprintf("aggregate %s: account %s: %s", modelID, c.id, err))
 				mu.Lock()
 				agg.Errors = append(agg.Errors, modelAggregateError{ID: c.id, Error: err.Error()})
 				mu.Unlock()
@@ -536,7 +815,13 @@ func (s *Server) aggregateModelUsage(ctx context.Context, modelID string) *model
 				recordErr(err)
 				return nil
 			}
-			if u.Credit == nil {
+			// Both control-plane results and the local policy below must describe the
+			// same account lifecycle captured by listAll. A replacement or policy
+			// change during either fetch excludes this stale fan-out result.
+			if rt, ok := s.accounts.Runtime(c.id); !ok || rt.Revision != c.revision {
+				return nil
+			}
+			if s.selector.isDepletedAtRevision(c.id, c.revision) || u.Credit == nil {
 				return nil
 			}
 			// Base exhausted: include only when the account opts in via
@@ -547,7 +832,7 @@ func (s *Server) aggregateModelUsage(ctx context.Context, modelID string) *model
 			// Flag included accounts so the UI can identify overage-only service.
 			onOverage := false
 			if u.Credit.Remaining <= 0 {
-				if !c.acct.OverageEnabled || !overageActive(u) || overageRemaining(u.Credit) <= 0 || s.selector.isDepleted(c.id) {
+				if !c.acct.OverageEnabled || !overageActive(u) || overageRemaining(u.Credit) <= 0 {
 					return nil
 				}
 				onOverage = true
@@ -580,6 +865,9 @@ func (s *Server) aggregateModelUsage(ctx context.Context, modelID string) *model
 		})
 	}
 	_ = g.Wait()
+	if len(agg.Errors) > 0 {
+		noteError(ctx, fmt.Sprintf("aggregate %s: account %s: %s", modelID, agg.Errors[0].ID, agg.Errors[0].Error))
+	}
 
 	// excluded is derivable: every pooled account is either summed into
 	// Accounts or excluded (unusable / not serving / exhausted / failed / not
@@ -719,6 +1007,10 @@ func (s *Server) ensureUpdateStatus(ctx context.Context) (*updateStatus, error) 
 // poll refetches it (e.g. after a manual token refresh).
 func (s *Server) invalidateUsage(id string) {
 	s.usageMu.Lock()
+	if s.usageEpoch == nil {
+		s.usageEpoch = map[string]uint64{}
+	}
+	s.usageEpoch[id]++
 	delete(s.usageCache, id)
 	s.usageMu.Unlock()
 }
@@ -728,6 +1020,10 @@ func (s *Server) invalidateUsage(id string) {
 // the cached list no longer matches what the runtime will accept.
 func (s *Server) invalidateModels(id string) {
 	s.modelsMu.Lock()
+	if s.modelsEpoch == nil {
+		s.modelsEpoch = map[string]uint64{}
+	}
+	s.modelsEpoch[id]++
 	delete(s.modelsCache, id)
 	s.modelsMu.Unlock()
 }
@@ -884,9 +1180,14 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	s.aggregateMessages(w, r, &areq, stream, inputChars)
 }
 
-// maxAccountAttempts caps how many accounts a single request will try before
-// giving up, bounding worst-case latency when many accounts are unhealthy.
+// maxAccountAttempts caps actual runtime Send calls for one request. Account
+// selection, strict usage verification, model lookup, and model-only skips do not
+// consume the budget.
 const maxAccountAttempts = 8
+
+// maxPreSendLeaseRefreshes bounds retries when account state changes after pick
+// but before the physical request. These do not consume the runtime-send budget.
+const maxPreSendLeaseRefreshes = 8
 
 // maxPromptTooLongRetries caps request-level recovery. The initial send is not
 // counted, so a request can make at most six context-size attempts.
@@ -896,10 +1197,20 @@ const maxPromptTooLongRetries = 5
 // the caller knows to sign in or import one via the admin page.
 var errNoAccount = fmt.Errorf("no account available; sign in or import one via the admin page")
 
+var errAccountPoolDepleted = &kiroHTTPError{
+	Status: http.StatusPaymentRequired,
+	Body:   "account pool quota exhausted",
+}
+
 // errModelUnavailable is returned when every usable account's model list was
 // fetched and none serves the requested model. Mapped to 400 so the client
 // knows the model is the problem, not account availability.
 var errModelUnavailable = fmt.Errorf("requested model is not available on any account")
+
+var (
+	errLeaseInvalid             = errors.New("account lease changed before runtime send")
+	errRuntimeAttemptsExhausted = errors.New("runtime send attempt limit reached")
+)
 
 // openStream opens the upstream stream, dispatching across stored accounts with
 // pre-stream failover. For each account it resolves the requested model against
@@ -933,6 +1244,17 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest, areq *anthro
 	promptTooLongRetries := 0
 	reasoningStripped := false
 	modelSkipped := false // an account was skipped because it doesn't serve the model
+	knownDepleted := false
+	runtimeAttempts := 0
+	preSendLeaseRefreshes := 0
+	requeueUnsent := func(id string) bool {
+		if preSendLeaseRefreshes >= maxPreSendLeaseRefreshes {
+			return false
+		}
+		delete(tried, id)
+		preSendLeaseRefreshes++
+		return true
+	}
 
 	// Per-account resolved model for the current attempt, kept in outer scope so
 	// the prompt-too-long rebuild reuses it instead of re-resolving.
@@ -961,11 +1283,36 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest, areq *anthro
 		return nil
 	}
 
-	for attempt := 0; attempt < maxAccountAttempts; attempt++ {
-		creds, ok := s.selector.pick(tried)
-		if !ok {
+dispatch:
+	for runtimeAttempts < maxAccountAttempts {
+		picked := s.selector.pick(tried)
+		knownDepleted = knownDepleted || picked.knownDepleted
+		if picked.lease == nil {
+			if picked.verifyID != "" {
+				u, err := s.refreshUsage(ctx, picked.verifyID, usageObservationAuthoritative)
+				if err != nil {
+					if ctx.Err() != nil {
+						return nil, ctx.Err()
+					}
+					lastErr = err
+					if (errors.Is(err, errAccountRevisionChanged) || errors.Is(err, errUsageObservationStale)) && requeueUnsent(picked.verifyID) {
+						continue
+					}
+					tried[picked.verifyID] = true
+				} else if u == nil || u.Credit == nil || u.Credit.Remaining <= 0 {
+					// Verification did not establish positive base credit. Avoid
+					// repeatedly probing an unknown/blocked account in this request.
+					if u != nil && u.Credit != nil && u.Credit.Remaining <= 0 {
+						knownDepleted = true
+					}
+					tried[picked.verifyID] = true
+				}
+				continue
+			}
 			break
 		}
+		lease := picked.lease
+		creds := lease.creds
 		tried[creds.id] = true
 
 		arn, err := creds.profileArn(ctx)
@@ -973,8 +1320,14 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest, areq *anthro
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
+			// Credential replacement can invalidate the selected revision while
+			// profile resolution refreshes its token. No runtime request was sent,
+			// so let the replacement lifecycle compete under a fresh lease.
+			if errors.Is(err, errAccountRevisionChanged) && requeueUnsent(creds.id) {
+				continue dispatch
+			}
 			lastErr = err
-			s.selector.recordFailure(creds.id)
+			s.selector.recordFailure(lease)
 			continue
 		}
 
@@ -984,6 +1337,12 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest, areq *anthro
 		if areq != nil {
 			models, merr := s.ensureModels(ctx, creds)
 			switch {
+			case errors.Is(merr, errAccountRevisionChanged) || errors.Is(merr, errModelResultStale):
+				if requeueUnsent(creds.id) {
+					continue dispatch
+				}
+				lastErr = merr
+				continue dispatch
 			case merr != nil || len(models) == 0:
 				// Can't determine this account's list (cold/network): fall back to
 				// the static id guess, and — when the global model cache knows its
@@ -1010,20 +1369,96 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest, areq *anthro
 			kreq.ProfileArn = arn // nil-areq (test) path: use the request as-is
 		}
 
+		leaseRuntimeAttempts := runtimeAttempts
 		for {
 			hadReasoning := hasReasoningInHistory(kreq)
-			stream, sendErr := s.sendWithReasoningRetry(ctx, creds, kreq)
+			var lastSendErr error
+			stream, sendErr := withReasoningRetry(kreq, func(req *kiroRequest) (*kiroStream, error) {
+				stream, err := s.kiro.Send(ctx, creds, req, func() error {
+					// Model/profile resolution, credential refresh, and earlier sends can
+					// block while account policy or quota changes. Linearize immediately
+					// before every physical runtime request, including auth and thinking
+					// retries.
+					if !s.selector.revalidate(lease) {
+						return errLeaseInvalid
+					}
+					if runtimeAttempts >= maxAccountAttempts {
+						return errRuntimeAttemptsExhausted
+					}
+					runtimeAttempts++
+					return nil
+				})
+				if err != nil {
+					var blocked *runtimeSendBlockedError
+					if errors.As(err, &blocked) {
+						if blocked.previous != nil {
+							lastSendErr = blocked.previous
+						}
+					} else {
+						lastSendErr = err
+					}
+				}
+				return stream, err
+			})
+			if errors.Is(sendErr, errLeaseInvalid) ||
+				(errors.Is(sendErr, errAccountRevisionChanged) && runtimeAttempts == leaseRuntimeAttempts) {
+				if lastSendErr != nil {
+					lastErr = lastSendErr
+				}
+				// A lease or credential revision invalidated before its first physical
+				// send has not consumed this account. Re-pick it against current state
+				// (it may now be a valid replacement or non-fallback lease), but cap
+				// state-churn retries independently.
+				if runtimeAttempts == leaseRuntimeAttempts {
+					requeueUnsent(creds.id)
+				}
+				continue dispatch
+			}
+			if errors.Is(sendErr, errRuntimeAttemptsExhausted) {
+				if lastSendErr != nil {
+					lastErr = lastSendErr
+				}
+				break dispatch
+			}
 			if hadReasoning && !hasReasoningInHistory(kreq) {
 				reasoningStripped = true
 			}
 
 			if sendErr == nil {
-				// Peek the first frame before committing. Some upstream failures
-				// arrive after a 200 as the very first event, while successful peeks
-				// are replayed by the first Recv call.
-				perr := firstFrameFailure(stream)
+				// Scan protocol-only leading frames before committing. The scan is
+				// bounded so a slow first token cannot delay SSE headers indefinitely;
+				// every inspected result is replayed by Recv.
+				perr := firstFrameFailure(ctx, stream, areq != nil && thinkingSuppressed(areq))
 				if perr == nil {
-					s.selector.recordSuccess(creds.id)
+					if resolved != "" {
+						stream.modelID = resolved
+					}
+					var failureOnce sync.Once
+					var depletionOnce sync.Once
+					stream.setReceiveObserver(func(ev *kiroEvent, recvErr error) {
+						if recvErr != nil {
+							// Normal completion and caller cancellation say nothing about
+							// account health. Other decoder/transport failures do.
+							if errors.Is(recvErr, io.EOF) || ctx.Err() != nil ||
+								errors.Is(recvErr, context.Canceled) || errors.Is(recvErr, context.DeadlineExceeded) {
+								return
+							}
+							if !s.selector.isReactivelyDepleted(creds.id, lease.revision) {
+								failureOnce.Do(func() { s.selector.recordFailure(lease) })
+							}
+							return
+						}
+						failure := kiroEventFailure(ev)
+						switch {
+						case isAccountDepleted(failure):
+							depletionOnce.Do(func() { s.selector.recordDepleted(lease) })
+						case isAccountFailure(failure):
+							if !s.selector.isReactivelyDepleted(creds.id, lease.revision) {
+								failureOnce.Do(func() { s.selector.recordFailure(lease) })
+							}
+						}
+					})
+					s.selector.recordSuccess(lease)
 					return stream, nil
 				}
 				stream.Close()
@@ -1066,16 +1501,17 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest, areq *anthro
 				return nil, sendErr
 			}
 			if isAccountDepleted(sendErr) {
-				// Out of credit: park until reset_at/fallback so the account is
-				// not retried every 60s. The probe refines this to reset_at.
-				s.selector.markDepleted(creds.id, time.Now().Add(depletedFallbackTTL))
+				s.selector.recordDepleted(lease)
 			} else {
-				s.selector.recordFailure(creds.id)
+				s.selector.recordFailure(lease)
 			}
 			break
 		}
 	}
 	if lastErr == nil {
+		if knownDepleted {
+			return nil, errAccountPoolDepleted
+		}
 		if modelSkipped {
 			return nil, errModelUnavailable
 		}
@@ -1084,47 +1520,41 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest, areq *anthro
 	return nil, lastErr
 }
 
-// firstFrameFailure primes the stream's first event and reports a retriable
-// error when the upstream fails before producing any content. It returns nil
-// when the stream is healthy (the peeked event is replayed by the first Recv).
-//
-// Two cases are treated as pre-stream failures worth failing over on:
-//   - an in-stream exception frame arriving as the very first event, and
-//   - a transport error (other than a clean io.EOF) reading that first frame.
-//
-// A clean io.EOF is an empty-but-valid stream and passes through unchanged.
-// ValidationException (including THINKING_SIGNATURE_INVALID, PROMPT_TOO_LONG) is
-// a request-level error; other exceptions remain account failures.
-func firstFrameFailure(stream *kiroStream) error {
-	ev, err := stream.peekFirst()
-	if err != nil {
-		if err == io.EOF {
-			return nil
-		}
-		return fmt.Errorf("upstream stream failed before any content: %w", err)
+// firstFrameFailure scans buffered protocol-only frames before committing the
+// response. Visible content proves the stream is healthy. An exception,
+// transport failure, or clean EOF before visible content is a pre-stream
+// failure and can safely fail over. The scan stops after a short fixed budget;
+// Recv then takes ownership of any decoder read still in progress.
+func kiroEventFailure(ev *kiroEvent) error {
+	if ev == nil || ev.Kind != evError {
+		return nil
 	}
-	if ev != nil && ev.Kind == evError {
-		status := http.StatusBadGateway
-		switch ev.ErrKind {
-		case "ValidationException":
-			status = http.StatusBadRequest
-		case "serviceQuotaExceededError":
-			status = http.StatusPaymentRequired // 402 – credit exhausted
-		}
-		return &kiroHTTPError{Status: status, Body: upstreamEventError(ev), ReasonCode: ev.ErrReason, Kind: ev.ErrKind}
+	status := http.StatusBadGateway
+	switch normalizeKiroEventKind(ev.ErrKind) {
+	case "validationexception":
+		status = http.StatusBadRequest
+	case "throttlingerror", "throttlingexception":
+		status = http.StatusTooManyRequests
+	case "servicequotaexceedederror", "servicequotaexceededexception":
+		status = http.StatusPaymentRequired // 402 – credit exhausted
 	}
-	return nil
+	return &kiroHTTPError{
+		Status: status, Body: upstreamEventError(ev), ReasonCode: ev.ErrReason, Kind: ev.ErrKind,
+	}
 }
 
-// sendWithReasoningRetry sends the request and, if the backend rejects a stale
-// or invalid extended-thinking signature, retries once with reasoningContent
-// stripped from history. This mirrors Kiro's own recovery and matters most
-// during multi-turn / context compaction, where a signature may no longer
-// validate.
-func (s *Server) sendWithReasoningRetry(ctx context.Context, creds kiroCredentials, kreq *kiroRequest) (*kiroStream, error) {
-	return withReasoningRetry(kreq, func(k *kiroRequest) (*kiroStream, error) {
-		return s.kiro.Send(ctx, creds, k)
-	})
+func firstFrameFailure(ctx context.Context, stream *kiroStream, suppressReasoning bool) error {
+	ready := func(ev *kiroEvent) bool {
+		if ev == nil || ev.Kind == evOther {
+			return false
+		}
+		return ev.Kind != evReasoning || !suppressReasoning
+	}
+	ev, err := stream.primeUntil(ctx, firstFrameProbeTimeout, ready)
+	if err != nil {
+		return fmt.Errorf("upstream stream failed before any visible content: %w", err)
+	}
+	return kiroEventFailure(ev)
 }
 
 // withReasoningRetry runs send(kreq) and, on an invalid/stale thinking-signature
@@ -1190,6 +1620,16 @@ func isInvalidModelError(err error) bool {
 	return strings.Contains(body, "invalid model id")
 }
 
+func responseModel(areq *anthropicRequest, stream *kiroStream) string {
+	if stream != nil && stream.modelID != "" {
+		return stream.modelID
+	}
+	if areq == nil {
+		return ""
+	}
+	return mapModel(areq.Model)
+}
+
 // aggregateMessages handles non-streaming requests: collect all events, then
 // return a single Anthropic message.
 func (s *Server) aggregateMessages(w http.ResponseWriter, r *http.Request, areq *anthropicRequest, stream *kiroStream, inputChars int) {
@@ -1222,7 +1662,8 @@ func (s *Server) aggregateMessages(w http.ResponseWriter, r *http.Request, areq 
 		case evMetadata:
 			asm.setStopReason(ev.StopReason)
 		case evError:
-			writeAnthropicError(w, r, http.StatusBadGateway, "api_error", upstreamEventError(ev))
+			status, errType, message := mapUpstreamEventError(ev)
+			writeAnthropicError(w, r, status, errType, message)
 			return
 		}
 	}
@@ -1237,7 +1678,7 @@ func (s *Server) aggregateMessages(w http.ResponseWriter, r *http.Request, areq 
 		ID:         "msg_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
 		Type:       "message",
 		Role:       "assistant",
-		Model:      mapModel(areq.Model),
+		Model:      responseModel(areq, stream),
 		Content:    blocks,
 		StopReason: asm.stopReason(),
 		Usage: anthropicUsage{
@@ -1284,7 +1725,7 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, areq *an
 			"id":            msgID,
 			"type":          "message",
 			"role":          "assistant",
-			"model":         mapModel(areq.Model),
+			"model":         responseModel(areq, stream),
 			"content":       []any{},
 			"stop_reason":   nil,
 			"stop_sequence": nil,
@@ -1338,10 +1779,11 @@ func (s *Server) streamMessages(w http.ResponseWriter, r *http.Request, areq *an
 		case evMetadata:
 			asm.setStopReason(ev.StopReason)
 		case evError:
-			noteError(r.Context(), upstreamEventError(ev))
+			_, errType, message := mapUpstreamEventError(ev)
+			noteError(r.Context(), message)
 			_ = emit("error", map[string]any{
 				"type":  "error",
-				"error": map[string]any{"type": "api_error", "message": upstreamEventError(ev)},
+				"error": map[string]any{"type": errType, "message": message},
 			})
 			return
 		}
@@ -1394,6 +1836,14 @@ func upstreamEventError(ev *kiroEvent) string {
 	return "unknown upstream error"
 }
 
+// mapUpstreamEventError preserves an in-stream error's upstream classification
+// for both an aggregate HTTP response and an SSE error payload.
+func mapUpstreamEventError(ev *kiroEvent) (int, string, string) {
+	message := upstreamEventError(ev)
+	status, errType := mapUpstreamError(kiroEventFailure(ev))
+	return status, errType, message
+}
+
 // mapUpstreamError maps a Kiro HTTP error to an Anthropic status + error type.
 func mapUpstreamError(err error) (int, string) {
 	if he, ok := err.(*kiroHTTPError); ok {
@@ -1405,13 +1855,13 @@ func mapUpstreamError(err error) (int, string) {
 		case http.StatusTooManyRequests:
 			return http.StatusTooManyRequests, "rate_limit_error"
 		case http.StatusBadRequest:
-		return http.StatusBadRequest, "invalid_request_error"
-	case http.StatusPaymentRequired: // 402 – credit exhausted
-		return http.StatusPaymentRequired, "api_error"
-	case http.StatusLocked: // 423 – account suspended
-		return http.StatusLocked, "api_error"
-	default:
-		return http.StatusBadGateway, "api_error"
+			return http.StatusBadRequest, "invalid_request_error"
+		case http.StatusPaymentRequired: // 402 – credit exhausted
+			return http.StatusPaymentRequired, "api_error"
+		case http.StatusLocked: // 423 – account suspended
+			return http.StatusLocked, "api_error"
+		default:
+			return http.StatusBadGateway, "api_error"
 		}
 	}
 	return http.StatusBadGateway, "api_error"

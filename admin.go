@@ -280,7 +280,7 @@ func (s *Server) handleLoginCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Pre-warm models and usage for the newly signed-in (or refreshed) account.
-	go s.warmAccount(warmID)
+	s.warmAccount(warmID)
 	renderCallbackPage(w, true, "Signed in successfully. You can close this window and return to the admin page.")
 }
 
@@ -316,7 +316,7 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Pre-warm models and usage for the newly imported account.
-	go s.warmAccount(acct.ID)
+	s.warmAccount(acct.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": acct.ID, "already_present": false})
 }
 
@@ -380,7 +380,7 @@ func (s *Server) handleAccountImportBundle(w http.ResponseWriter, r *http.Reques
 	}
 	// Pre-warm models and usage for all accounts after a bundle import.
 	if res.Added > 0 || res.Replaced > 0 {
-		go s.warmAllAccounts()
+		s.warmAllAccounts()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "added": res.Added, "replaced": res.Replaced, "total": len(bundle.Accounts),
@@ -602,25 +602,23 @@ func (s *Server) handleAccountDisable(w http.ResponseWriter, r *http.Request) {
 		adminError(w, http.StatusBadRequest, "id is required")
 		return
 	}
-	if err := s.accounts.SetDisabled(body.ID, body.Disabled); err != nil {
+	changed, err := s.accounts.SetDisabledChanged(body.ID, body.Disabled)
+	if err != nil {
 		adminError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	// When re-enabling, pre-warm models and usage so the account is ready.
-	if !body.Disabled {
-		go s.warmAccount(body.ID)
+	// When actually re-enabling, pre-warm models and usage so the account is ready.
+	if changed && !body.Disabled {
+		s.warmAccount(body.ID)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "disabled": body.Disabled})
 }
 
 // handleAccountOverage toggles whether an account may keep serving after its
-// base credit is exhausted (spending its configured overage). After toggling it
-// re-evaluates the depleted mark with the cached usage, grounded at the current
-// time so the toggle's intent overrides any staler request-failure signal: an
-// account turned on with overage left is un-parked immediately; one turned off
-// (or with overage exhausted) is parked. With no cached usage, turning on
-// clears the mark (the next request/probe re-evaluates); turning off leaves any
-// existing mark, since off is the stricter mode.
+// base credit is exhausted (spending its configured overage). A real policy
+// change advances the account's runtime revision, invalidating old leases and
+// routing state. Prior usage data is discarded and a fresh observed fetch is
+// launched asynchronously; strict accounts remain blocked while usage is unknown.
 func (s *Server) handleAccountOverage(w http.ResponseWriter, r *http.Request) {
 	if s.accounts == nil {
 		adminError(w, http.StatusServiceUnavailable, "account store is not configured")
@@ -638,27 +636,16 @@ func (s *Server) handleAccountOverage(w http.ResponseWriter, r *http.Request) {
 		adminError(w, http.StatusBadRequest, "id is required")
 		return
 	}
-	if err := s.accounts.SetOverageEnabled(body.ID, body.OverageEnabled); err != nil {
+	changed, err := s.accounts.SetOverageEnabledChanged(body.ID, body.OverageEnabled)
+	if err != nil {
 		adminError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	// Re-evaluate with the cached usage so the toggle takes effect without
-	// waiting for the next usage refresh. Ground at the snapshot's own fetch
-	// time, not now: a stale snapshot must not lift a fresher request-failure
-	// mark (applyUsage's contract). With no usable snapshot (no cache, or one
-	// without a CREDIT line) and overage just enabled, clear the mark so the
-	// account is retried — the reactive path re-parks it if overage is actually
-	// gone. Turning off with no snapshot leaves any existing mark (off is
-	// stricter).
-	if s.selector != nil {
-		s.usageMu.Lock()
-		entry, hasUsage := s.usageCache[body.ID]
-		s.usageMu.Unlock()
-		if hasUsage && entry.usage != nil && entry.usage.Credit != nil {
-			s.selector.applyUsage(body.ID, entry.usage, entry.fetched, false)
-		} else if body.OverageEnabled {
-			s.selector.clearDepleted(body.ID)
-		}
+	if changed {
+		// Discard prior control-plane data and force a fresh observed usage fetch
+		// only for a real policy revision.
+		s.invalidateUsage(body.ID)
+		s.warmAccount(body.ID)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "overage_enabled": body.OverageEnabled})
 }
@@ -683,6 +670,11 @@ func (s *Server) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 	if err := s.accounts.Remove(body.ID); err != nil {
 		adminError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	s.invalidateUsage(body.ID)
+	s.invalidateModels(body.ID)
+	if s.selector != nil {
+		s.selector.forget(body.ID)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

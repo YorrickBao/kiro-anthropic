@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -70,6 +71,16 @@ type StoredAccount struct {
 	OverageEnabled bool `json:"overageEnabled,omitempty"`
 }
 
+// accountRuntime is an atomic account snapshot paired with the in-memory
+// revision of the routing-relevant configuration that produced it. Revisions
+// are deliberately not persisted or exposed through the public account JSON.
+type accountRuntime struct {
+	Account    StoredAccount
+	Revision   uint64
+	Lifecycle  uint64
+	Credential uint64
+}
+
 // expiry parses ExpiresAt; zero time means unknown.
 func (a StoredAccount) expiry() time.Time {
 	if a.ExpiresAt == "" {
@@ -87,17 +98,27 @@ func (a StoredAccount) expiry() time.Time {
 type AccountStore struct {
 	path string
 
-	mu       sync.Mutex
-	accounts map[string]*StoredAccount
+	mu             sync.Mutex
+	accounts       map[string]*StoredAccount
+	revisions      map[string]uint64
+	nextRevision   uint64
+	lifecycles     map[string]uint64
+	nextLifecycle  uint64
+	credentials    map[string]uint64
+	nextCredential uint64
 
-	// refreshGroup collapses concurrent token refreshes of the same account (by
-	// id) into a single SSO-OIDC CreateToken call. AWS rotates refresh tokens on
-	// every refresh, so two independent refreshers racing on one account would
-	// each spend the (now stale) refresh token and one would fail with
-	// invalid_grant, or fork the token chain. Both the request path
-	// (accountCreds) and the background refresher route through RefreshToken.
+	// refreshGroup collapses concurrent token refreshes of the same credential
+	// generation into a single SSO-OIDC CreateToken call. AWS rotates refresh tokens
+	// on every refresh, so two independent refreshers racing on one chain would each
+	// spend the now-stale refresh token. Policy and profile revisions intentionally do
+	// not split that chain; actual credential replacement does.
 	refreshGroup singleflight.Group
 }
+
+// tokenRefreshTimeout bounds the shared CreateToken operation independently of
+// any one caller. A canceled waiter stops waiting without aborting a refresh
+// that another request or the background refresher may still need.
+const tokenRefreshTimeout = 30 * time.Second
 
 // accountsFile mirrors the on-disk layout.
 type accountsFile struct {
@@ -109,7 +130,13 @@ func NewAccountStore(path string) (*AccountStore, error) {
 	if path == "" {
 		return nil, fmt.Errorf("accounts file path is empty (could not determine home dir)")
 	}
-	s := &AccountStore{path: path, accounts: map[string]*StoredAccount{}}
+	s := &AccountStore{
+		path:        path,
+		accounts:    map[string]*StoredAccount{},
+		revisions:   map[string]uint64{},
+		lifecycles:  map[string]uint64{},
+		credentials: map[string]uint64{},
+	}
 	if err := s.load(); err != nil {
 		return nil, err
 	}
@@ -137,6 +164,7 @@ func (s *AccountStore) load() error {
 	for _, a := range f.Accounts {
 		if a != nil && a.ID != "" {
 			s.accounts[a.ID] = a
+			s.bumpCredentialLocked(a.ID)
 		}
 	}
 	return nil
@@ -186,7 +214,9 @@ func (s *AccountStore) Add(a *StoredAccount) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.accounts[a.ID] = a
+	stored := *a
+	s.accounts[a.ID] = &stored
+	s.bumpCredentialLocked(a.ID)
 	return s.saveLocked()
 }
 
@@ -202,6 +232,7 @@ func (s *AccountStore) ReplaceCredentials(id string, fresh *StoredAccount) error
 		return fmt.Errorf("account %s not found", id)
 	}
 	applyCredentialsLocked(a, fresh)
+	s.bumpCredentialLocked(id)
 	return s.saveLocked()
 }
 
@@ -255,7 +286,12 @@ func (s *AccountStore) ImportAccounts(incoming []*StoredAccount) (ImportResult, 
 			continue
 		}
 		if id, ok := s.findDuplicateLocked(*in); ok {
-			applyCredentialsLocked(s.accounts[id], in)
+			a := s.accounts[id]
+			before := *a
+			applyCredentialsLocked(a, in)
+			if *a != before {
+				s.bumpCredentialLocked(id)
+			}
 			res.Replaced++
 			continue
 		}
@@ -272,6 +308,7 @@ func (s *AccountStore) ImportAccounts(incoming []*StoredAccount) (ImportResult, 
 			na.CreatedAt = time.Now().UTC().Format(time.RFC3339)
 		}
 		s.accounts[na.ID] = &na
+		s.bumpCredentialLocked(na.ID)
 		res.Added++
 	}
 	if res.Added == 0 && res.Replaced == 0 {
@@ -288,28 +325,48 @@ func (s *AccountStore) ImportAccounts(incoming []*StoredAccount) (ImportResult, 
 // shown on the admin page; it is only excluded from selection. Returns an error
 // if the id is unknown.
 func (s *AccountStore) SetDisabled(id string, disabled bool) error {
+	_, err := s.SetDisabledChanged(id, disabled)
+	return err
+}
+
+// SetDisabledChanged is SetDisabled plus whether the stored policy changed.
+func (s *AccountStore) SetDisabledChanged(id string, disabled bool) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a, ok := s.accounts[id]
 	if !ok {
-		return fmt.Errorf("account %s not found", id)
+		return false, fmt.Errorf("account %s not found", id)
+	}
+	if a.Disabled == disabled {
+		return false, nil
 	}
 	a.Disabled = disabled
-	return s.saveLocked()
+	s.bumpRuntimeLocked(id)
+	return true, s.saveLocked()
 }
 
 // SetOverageEnabled toggles whether the account may keep serving after its base
 // credit is exhausted (spending its configured overage) and persists the store.
 // Returns an error if the id is unknown.
 func (s *AccountStore) SetOverageEnabled(id string, enabled bool) error {
+	_, err := s.SetOverageEnabledChanged(id, enabled)
+	return err
+}
+
+// SetOverageEnabledChanged is SetOverageEnabled plus whether the policy changed.
+func (s *AccountStore) SetOverageEnabledChanged(id string, enabled bool) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a, ok := s.accounts[id]
 	if !ok {
-		return fmt.Errorf("account %s not found", id)
+		return false, fmt.Errorf("account %s not found", id)
+	}
+	if a.OverageEnabled == enabled {
+		return false, nil
 	}
 	a.OverageEnabled = enabled
-	return s.saveLocked()
+	s.bumpRuntimeLocked(id)
+	return true, s.saveLocked()
 }
 
 // UpdateLabel sets the label (note) of an existing account and persists the
@@ -325,19 +382,38 @@ func (s *AccountStore) UpdateLabel(id, label string) error {
 	return s.saveLocked()
 }
 
+var errAccountRevisionChanged = errors.New("account revision changed")
+
 // UpdateIdentity persists the profileArn, email and/or userId of an existing
 // account. Empty values are ignored so a partial resolution does not erase
 // previously stored identity. This is used by the lazy resolver in selector.go
 // to write back identity resolved at request time, so it survives restarts and
 // is visible on the admin page. It also backfills userId onto older records that
-// predate the field. Returns an error if the id is unknown.
+// predate the field. Replacing one non-empty profileArn with another advances
+// the runtime revision because model entitlement and active leases are tied to
+// that identity; ordinary backfill and email/userId maintenance do not.
 func (s *AccountStore) UpdateIdentity(id, profileArn, email, userID string) error {
+	return s.updateIdentity(id, 0, profileArn, email, userID)
+}
+
+func (s *AccountStore) updateIdentityAtRevision(id string, revision uint64, profileArn, email, userID string) error {
+	return s.updateIdentity(id, revision, profileArn, email, userID)
+}
+
+func (s *AccountStore) updateIdentity(id string, expectedRevision uint64, profileArn, email, userID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a, ok := s.accounts[id]
 	if !ok {
+		if expectedRevision != 0 {
+			return fmt.Errorf("%w: %s", errAccountRevisionChanged, id)
+		}
 		return fmt.Errorf("account %s not found", id)
 	}
+	if expectedRevision != 0 && s.revisions[id] != expectedRevision {
+		return fmt.Errorf("%w: %s", errAccountRevisionChanged, id)
+	}
+	profileChanged := profileArn != "" && a.ProfileArn != profileArn
 	if profileArn != "" {
 		a.ProfileArn = profileArn
 	}
@@ -347,6 +423,9 @@ func (s *AccountStore) UpdateIdentity(id, profileArn, email, userID string) erro
 	if userID != "" {
 		a.UserID = userID
 	}
+	if profileChanged {
+		s.bumpLifecycleLocked(id)
+	}
 	return s.saveLocked()
 }
 
@@ -354,11 +433,25 @@ func (s *AccountStore) UpdateIdentity(id, profileArn, email, userID string) erro
 // store. It is a no-op error if the id is unknown. Only token/expiry fields are
 // touched; registration and identity fields are left intact.
 func (s *AccountStore) UpdateTokens(id, accessToken, refreshToken, expiresAt string) error {
+	return s.updateTokens(id, 0, accessToken, refreshToken, expiresAt)
+}
+
+func (s *AccountStore) updateTokensAtCredential(id string, credential uint64, accessToken, refreshToken, expiresAt string) error {
+	return s.updateTokens(id, credential, accessToken, refreshToken, expiresAt)
+}
+
+func (s *AccountStore) updateTokens(id string, expectedCredential uint64, accessToken, refreshToken, expiresAt string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	a, ok := s.accounts[id]
 	if !ok {
+		if expectedCredential != 0 {
+			return fmt.Errorf("%w: %s", errAccountRevisionChanged, id)
+		}
 		return fmt.Errorf("account %s not found", id)
+	}
+	if expectedCredential != 0 && s.credentials[id] != expectedCredential {
+		return fmt.Errorf("%w: %s", errAccountRevisionChanged, id)
 	}
 	a.AccessToken = accessToken
 	if refreshToken != "" {
@@ -368,24 +461,43 @@ func (s *AccountStore) UpdateTokens(id, accessToken, refreshToken, expiresAt str
 	return s.saveLocked()
 }
 
-// RefreshToken refreshes the account's SSO-OIDC token exactly once even under
-// concurrent callers, returning the refreshed account snapshot. Concurrent
-// calls for the same id share a single CreateToken call and all receive the
-// same result; this prevents racing refreshers from each spending the rotated
-// refresh token. The fresh tokens are persisted best-effort before returning,
-// so the returned snapshot is usable even if the write fails.
+// RefreshToken refreshes the current credential chain's SSO-OIDC token exactly
+// once even under concurrent callers. Policy and profile revisions share the
+// same flight; credential replacements do not, and stale results cannot overwrite
+// the replacement chain.
 func (s *AccountStore) RefreshToken(ctx context.Context, client *http.Client, id string) (StoredAccount, error) {
-	v, err, _ := s.refreshGroup.Do(id, func() (any, error) {
-		cur, ok := s.Get(id)
-		if !ok {
-			return StoredAccount{}, fmt.Errorf("account %s not found", id)
+	rt, ok := s.Runtime(id)
+	if !ok {
+		return StoredAccount{}, fmt.Errorf("account %s not found", id)
+	}
+	return s.refreshTokenAtCredential(ctx, client, id, rt.Credential)
+}
+
+func (s *AccountStore) refreshTokenAtCredential(ctx context.Context, client *http.Client, id string, credential uint64) (StoredAccount, error) {
+	if err := ctx.Err(); err != nil {
+		return StoredAccount{}, err
+	}
+
+	key := fmt.Sprintf("%s/%d", id, credential)
+	ch := s.refreshGroup.DoChan(key, func() (any, error) {
+		refreshCtx, cancel := context.WithTimeout(context.Background(), tokenRefreshTimeout)
+		defer cancel()
+
+		rt, ok := s.Runtime(id)
+		if !ok || rt.Credential != credential {
+			return StoredAccount{}, fmt.Errorf("%w: %s", errAccountRevisionChanged, id)
 		}
-		access, refresh, expiresAt, err := refreshAccountToken(ctx, client, cur)
+		cur := rt.Account
+		access, refresh, expiresAt, err := refreshAccountToken(refreshCtx, client, cur)
 		if err != nil {
 			return StoredAccount{}, err
 		}
-		// Persist best-effort; the returned snapshot still carries the new token.
-		_ = s.UpdateTokens(id, access, refresh, expiresAt)
+		// Persistence remains best-effort for filesystem errors, but a credential
+		// mismatch must fail: returning old tokens would pair them with the wrong
+		// registration and refresh-token chain.
+		if err := s.updateTokensAtCredential(id, credential, access, refresh, expiresAt); errors.Is(err, errAccountRevisionChanged) {
+			return StoredAccount{}, err
+		}
 		cur.AccessToken = access
 		if refresh != "" {
 			cur.RefreshToken = refresh
@@ -393,33 +505,39 @@ func (s *AccountStore) RefreshToken(ctx context.Context, client *http.Client, id
 		cur.ExpiresAt = expiresAt
 		return cur, nil
 	})
-	if err != nil {
-		return StoredAccount{}, err
+
+	select {
+	case <-ctx.Done():
+		return StoredAccount{}, ctx.Err()
+	case result := <-ch:
+		if result.Err != nil {
+			return StoredAccount{}, result.Err
+		}
+		return result.Val.(StoredAccount), nil
 	}
-	return v.(StoredAccount), nil
 }
 
 // RefreshIdentity re-resolves the account's profileArn, email and userId from
-// the Kiro management endpoint and persists them. Unlike the lazy resolver in
-// selector.go, which only fills fields that are empty, this forces a fresh
-// lookup and overwrites the stored identity, so an admin can correct stale
-// identity from the admin page. The management endpoint rejects a stale token,
-// so the token is refreshed first when missing or near expiry. Values that come
-// back empty are left untouched (see UpdateIdentity), so a partial lookup never
-// erases existing identity. Returns the refreshed account snapshot.
+// the Kiro management endpoint and persists them. The entire operation is pinned
+// to one runtime revision so a late response cannot overwrite replacement
+// credentials or a removed-and-re-added account. Replacing a non-empty
+// profileArn advances the revision; empty-to-filled lazy backfill does not.
 func (s *AccountStore) RefreshIdentity(ctx context.Context, client *http.Client, id string) (StoredAccount, error) {
-	cur, ok := s.Get(id)
+	rt, ok := s.Runtime(id)
 	if !ok {
 		return StoredAccount{}, fmt.Errorf("account %s not found", id)
 	}
+	cur := rt.Account
+	revision := rt.Revision
+	credential := rt.Credential
 	// Ensure a usable token: the ListAvailableProfiles / getUsageLimits calls
 	// 401 on an expired one. Fall back to the stored token only if a refresh
 	// fails but we still hold something to try.
 	exp := cur.expiry()
 	if cur.AccessToken == "" || (!exp.IsZero() && time.Now().Add(tokenRefreshBuffer).After(exp)) {
-		if fresh, err := s.RefreshToken(ctx, client, id); err == nil {
+		if fresh, err := s.refreshTokenAtCredential(ctx, client, id, credential); err == nil {
 			cur = fresh
-		} else if cur.AccessToken == "" {
+		} else if cur.AccessToken == "" || errors.Is(err, errAccountRevisionChanged) {
 			return StoredAccount{}, err
 		}
 	}
@@ -432,10 +550,13 @@ func (s *AccountStore) RefreshIdentity(ctx context.Context, client *http.Client,
 		return StoredAccount{}, fmt.Errorf("resolve identity for account %s: %w", id, err)
 	}
 	ident := fetchAccountIdentity(ctx, client, region, arn, cur.AccessToken)
-	if err := s.UpdateIdentity(id, arn, ident.Email, ident.UserID); err != nil {
+	if err := s.updateIdentityAtRevision(id, revision, arn, ident.Email, ident.UserID); err != nil {
 		return StoredAccount{}, err
 	}
-	updated, _ := s.Get(id)
+	updated, ok := s.Get(id)
+	if !ok {
+		return StoredAccount{}, fmt.Errorf("%w: %s", errAccountRevisionChanged, id)
+	}
 	return updated, nil
 }
 
@@ -450,6 +571,89 @@ func (s *AccountStore) Get(id string) (StoredAccount, bool) {
 	return *a, true
 }
 
+// Runtime returns an atomic account-and-revision snapshot for selector and
+// cache users. The revision changes only for routing-relevant mutations.
+func (s *AccountStore) Runtime(id string) (accountRuntime, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.runtimeLocked(id)
+}
+
+// RuntimeList returns atomic account-and-revision snapshots ordered by account
+// creation time, matching List's stable routing order.
+func (s *AccountStore) RuntimeList() []accountRuntime {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]accountRuntime, 0, len(s.accounts))
+	for id, a := range s.accounts {
+		out = append(out, accountRuntime{
+			Account: *a, Revision: s.revisions[id], Lifecycle: s.lifecycles[id], Credential: s.credentials[id],
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Account.CreatedAt < out[j].Account.CreatedAt
+	})
+	return out
+}
+
+// withRuntime invokes fn while holding the account-store lock. It is used for
+// short store-to-selector compare-and-swap checks; fn must not perform I/O or
+// call back into AccountStore.
+func (s *AccountStore) withRuntime(id string, fn func(accountRuntime) bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rt, ok := s.runtimeLocked(id)
+	if !ok {
+		return false
+	}
+	return fn(rt)
+}
+
+func (s *AccountStore) runtimeLocked(id string) (accountRuntime, bool) {
+	a, ok := s.accounts[id]
+	if !ok {
+		return accountRuntime{}, false
+	}
+	return accountRuntime{
+		Account: *a, Revision: s.revisions[id], Lifecycle: s.lifecycles[id], Credential: s.credentials[id],
+	}, true
+}
+
+// bumpRuntimeLocked allocates a process-unique revision. The monotonically
+// increasing counter ensures remove/re-add cannot resurrect an old snapshot.
+func (s *AccountStore) bumpRuntimeLocked(id string) uint64 {
+	s.nextRevision++
+	if s.nextRevision == 0 { // reserve zero as the unset revision
+		s.nextRevision++
+	}
+	s.revisions[id] = s.nextRevision
+	return s.nextRevision
+}
+
+// bumpCredentialLocked starts a new refresh-token chain. It also starts a new
+// identity lifecycle and invalidates every routing lease from the old credentials.
+func (s *AccountStore) bumpCredentialLocked(id string) uint64 {
+	s.nextCredential++
+	if s.nextCredential == 0 {
+		s.nextCredential++
+	}
+	s.credentials[id] = s.nextCredential
+	s.bumpLifecycleLocked(id)
+	return s.nextCredential
+}
+
+// bumpLifecycleLocked starts a new credential/profile lifecycle and also
+// invalidates every routing lease from the previous lifecycle.
+func (s *AccountStore) bumpLifecycleLocked(id string) uint64 {
+	s.nextLifecycle++
+	if s.nextLifecycle == 0 {
+		s.nextLifecycle++
+	}
+	s.lifecycles[id] = s.nextLifecycle
+	s.bumpRuntimeLocked(id)
+	return s.nextLifecycle
+}
+
 // Remove deletes an account and persists the store. Removing a missing id is a
 // no-op that still succeeds.
 func (s *AccountStore) Remove(id string) error {
@@ -459,6 +663,9 @@ func (s *AccountStore) Remove(id string) error {
 		return nil
 	}
 	delete(s.accounts, id)
+	delete(s.revisions, id)
+	delete(s.lifecycles, id)
+	delete(s.credentials, id)
 	return s.saveLocked()
 }
 

@@ -83,7 +83,12 @@ func credsForAccount(t *testing.T, client *http.Client, a StoredAccount) (*accou
 		a.CreatedAt = "1"
 	}
 	require.NoError(t, store.Add(&a))
-	return &accountCreds{store: store, client: client, id: a.ID, acct: a}, store
+	rt, ok := store.Runtime(a.ID)
+	require.True(t, ok)
+	return &accountCreds{
+		store: store, client: client, id: a.ID,
+		revision: rt.Revision, credential: rt.Credential, acct: rt.Account,
+	}, store
 }
 
 // ---- accountUsable ---------------------------------------------------------
@@ -193,16 +198,19 @@ func TestSelectorUnusableSkippedEvenWhenUsableCoolingDown(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, store.Add(&StoredAccount{ID: "dead", CreatedAt: "0"})) // unusable
 	require.NoError(t, store.Add(&StoredAccount{
-		ID: "good", ProfileArn: "arn:x", ClientID: "c", ClientSecret: "s", RefreshToken: "r", CreatedAt: "1",
+		ID: "good", ProfileArn: "arn:x", ClientID: "c", ClientSecret: "s", RefreshToken: "r",
+		OverageEnabled: true, CreatedAt: "1",
 	}))
 	s := newAccountSelector(store, &http.Client{})
 
 	// Put the only usable account into cooldown.
-	s.recordFailure("good")
+	first := s.pick(map[string]bool{})
+	require.NotNil(t, first.lease)
+	s.recordFailure(first.lease)
 	// pick must still choose "good" (soonest-recovering usable) and never "dead".
-	creds, ok := s.pick(map[string]bool{})
-	require.True(t, ok)
-	assert.Equal(t, "good", creds.id)
+	picked := s.pick(map[string]bool{})
+	require.NotNil(t, picked.lease)
+	assert.Equal(t, "good", picked.lease.creds.id)
 }
 
 func TestPeekAnyPrefersUsableNotInCooldown(t *testing.T) {
@@ -221,9 +229,13 @@ func TestPeekAnyAllUsableCoolingDownStillReturnsUsable(t *testing.T) {
 	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
 	require.NoError(t, err)
 	require.NoError(t, store.Add(&StoredAccount{ID: "dead", CreatedAt: "0"}))
-	require.NoError(t, store.Add(&StoredAccount{ID: "good", ProfileArn: "arn:x", CreatedAt: "1"}))
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "good", ProfileArn: "arn:x", OverageEnabled: true, CreatedAt: "1",
+	}))
 	s := newAccountSelector(store, &http.Client{})
-	s.recordFailure("good")
+	picked := s.pick(map[string]bool{})
+	require.NotNil(t, picked.lease)
+	s.recordFailure(picked.lease)
 
 	creds, ok := s.peekAny()
 	require.True(t, ok, "a cooling-down usable account still serves a cached schema lookup")

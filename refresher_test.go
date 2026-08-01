@@ -15,6 +15,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type doneObservedContext struct {
+	context.Context
+	observed chan struct{}
+	once     sync.Once
+}
+
+func (c *doneObservedContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.observed) })
+	return c.Context.Done()
+}
+
 func TestAccountNeedsRefresh(t *testing.T) {
 	now := time.Now()
 	base := StoredAccount{ClientID: "c", ClientSecret: "s", RefreshToken: "r"}
@@ -194,6 +205,307 @@ func TestStoreRefreshTokenDedupsConcurrent(t *testing.T) {
 	// Persisted.
 	got, _ := store.Get("acct")
 	assert.Equal(t, "shared-access", got.AccessToken)
+}
+
+func TestStoreRefreshTokenCanceledContextDoesNotStartFlight(t *testing.T) {
+	var hits atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token", func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		http.Error(w, "unexpected token refresh", http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	target, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	client := &http.Client{Transport: &rewriteTransport{host: target.Host, scheme: target.Scheme}}
+
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "acct", ClientID: "c", ClientSecret: "s", RefreshToken: "r",
+		Region: "us-east-1", CreatedAt: "1",
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = store.RefreshToken(ctx, client, "acct")
+	require.ErrorIs(t, err, context.Canceled)
+	require.Never(t, func() bool { return hits.Load() != 0 }, 100*time.Millisecond, 5*time.Millisecond)
+}
+
+func TestStoreRefreshTokenCanceledWaiterLeavesSharedRefreshRunning(t *testing.T) {
+	var hits atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token", func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		close(started)
+		<-release
+		writeJSON(w, http.StatusOK, map[string]any{
+			"accessToken": "fresh-access", "refreshToken": "fresh-refresh",
+			"tokenType": "Bearer", "expiresIn": 3600,
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	target, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	client := &http.Client{Transport: &rewriteTransport{host: target.Host, scheme: target.Scheme}}
+
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "acct", ClientID: "c", ClientSecret: "s", RefreshToken: "r",
+		Region: "us-east-1", CreatedAt: "1",
+	}))
+
+	ownerDone := make(chan error, 1)
+	go func() {
+		_, refreshErr := store.RefreshToken(context.Background(), client, "acct")
+		ownerDone <- refreshErr
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("shared token refresh did not start")
+	}
+
+	waiterBase, cancelWaiter := context.WithCancel(context.Background())
+	defer cancelWaiter()
+	waiterCtx := &doneObservedContext{Context: waiterBase, observed: make(chan struct{})}
+	waiterDone := make(chan error, 1)
+	go func() {
+		_, refreshErr := store.RefreshToken(waiterCtx, client, "acct")
+		waiterDone <- refreshErr
+	}()
+	select {
+	case <-waiterCtx.observed:
+		// refreshTokenAtRevision calls Done only after DoChan has joined the
+		// existing flight, so cancellation below exercises a live waiter.
+	case <-time.After(time.Second):
+		t.Fatal("waiter did not join the shared token refresh")
+	}
+	cancelWaiter()
+	select {
+	case refreshErr := <-waiterDone:
+		require.ErrorIs(t, refreshErr, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("canceled waiter remained blocked on the shared token refresh")
+	}
+	assert.Equal(t, int32(1), hits.Load())
+
+	unblock()
+	select {
+	case refreshErr := <-ownerDone:
+		require.NoError(t, refreshErr)
+	case <-time.After(time.Second):
+		t.Fatal("shared token refresh did not finish after release")
+	}
+	got, ok := store.Get("acct")
+	require.True(t, ok)
+	assert.Equal(t, "fresh-access", got.AccessToken)
+	assert.Equal(t, "fresh-refresh", got.RefreshToken)
+}
+
+func TestStoreRefreshTokenOutlivesInitiatingCaller(t *testing.T) {
+	var hits atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token", func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		close(started)
+		<-release
+		writeJSON(w, http.StatusOK, map[string]any{
+			"accessToken": "fresh-access", "refreshToken": "fresh-refresh",
+			"tokenType": "Bearer", "expiresIn": 3600,
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	target, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	client := &http.Client{Transport: &rewriteTransport{host: target.Host, scheme: target.Scheme}}
+
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "acct", ClientID: "c", ClientSecret: "s", RefreshToken: "r",
+		Region: "us-east-1", CreatedAt: "1",
+	}))
+
+	initiatorCtx, cancelInitiator := context.WithCancel(context.Background())
+	initiatorDone := make(chan error, 1)
+	go func() {
+		_, refreshErr := store.RefreshToken(initiatorCtx, client, "acct")
+		initiatorDone <- refreshErr
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("shared token refresh did not start")
+	}
+	cancelInitiator()
+	select {
+	case refreshErr := <-initiatorDone:
+		require.ErrorIs(t, refreshErr, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("initiating caller did not stop after cancellation")
+	}
+
+	unblock()
+	require.Eventually(t, func() bool {
+		got, ok := store.Get("acct")
+		return ok && got.AccessToken == "fresh-access" && got.RefreshToken == "fresh-refresh"
+	}, time.Second, 10*time.Millisecond, "shared refresh did not publish after its initiating caller left")
+	assert.Equal(t, int32(1), hits.Load(), "caller cancellation must not start a second refresh")
+}
+
+func TestStoreRefreshTokenSharesFlightAcrossPolicyRevisions(t *testing.T) {
+	var hits atomic.Int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token", func(w http.ResponseWriter, _ *http.Request) {
+		if hits.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		writeJSON(w, http.StatusOK, map[string]any{
+			"accessToken": "shared-result", "refreshToken": "shared-rotated", "expiresIn": 3600,
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	unblock := cleanupTestRelease(t, release)
+	target, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	client := &http.Client{Transport: &rewriteTransport{host: target.Host, scheme: target.Scheme}}
+
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "acct", ClientID: "client", ClientSecret: "secret",
+		RefreshToken: "refresh", Region: "us-east-1", CreatedAt: "1",
+	}))
+	initial, ok := store.Runtime("acct")
+	require.True(t, ok)
+
+	first := make(chan error, 1)
+	go func() {
+		_, refreshErr := store.RefreshToken(context.Background(), client, "acct")
+		first <- refreshErr
+	}()
+	<-started
+
+	require.NoError(t, store.SetDisabled("acct", true))
+	require.NoError(t, store.SetOverageEnabled("acct", true))
+	policy, ok := store.Runtime("acct")
+	require.True(t, ok)
+	assert.Greater(t, policy.Revision, initial.Revision)
+	assert.Equal(t, initial.Credential, policy.Credential)
+
+	second := make(chan error, 1)
+	go func() {
+		_, refreshErr := store.RefreshToken(context.Background(), client, "acct")
+		second <- refreshErr
+	}()
+	require.Never(t, func() bool { return hits.Load() > 1 }, 50*time.Millisecond, 5*time.Millisecond)
+	unblock()
+	require.NoError(t, <-first)
+	require.NoError(t, <-second)
+
+	got, ok := store.Get("acct")
+	require.True(t, ok)
+	assert.Equal(t, "shared-result", got.AccessToken)
+	assert.Equal(t, "shared-rotated", got.RefreshToken)
+	assert.Equal(t, int32(1), hits.Load())
+}
+
+func TestStoreRefreshTokenSeparatesCredentialGenerations(t *testing.T) {
+	var hits atomic.Int32
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token", func(w http.ResponseWriter, _ *http.Request) {
+		switch hits.Add(1) {
+		case 1:
+			close(firstStarted)
+			<-releaseFirst
+			writeJSON(w, http.StatusOK, map[string]any{
+				"accessToken": "old-result", "refreshToken": "old-rotated", "expiresIn": 3600,
+			})
+		case 2:
+			close(secondStarted)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"accessToken": "new-result", "refreshToken": "new-rotated", "expiresIn": 3600,
+			})
+		default:
+			http.Error(w, "unexpected refresh", http.StatusInternalServerError)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	unblockFirst := cleanupTestRelease(t, releaseFirst)
+	target, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	client := &http.Client{Transport: &rewriteTransport{host: target.Host, scheme: target.Scheme}}
+
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "acct", ClientID: "old-client", ClientSecret: "old-secret",
+		RefreshToken: "old-refresh", Region: "us-east-1", CreatedAt: "1",
+	}))
+
+	firstErr := make(chan error, 1)
+	go func() {
+		_, refreshErr := store.RefreshToken(context.Background(), client, "acct")
+		firstErr <- refreshErr
+	}()
+	<-firstStarted
+
+	current, ok := store.Get("acct")
+	require.True(t, ok)
+	current.ClientID = "new-client"
+	current.ClientSecret = "new-secret"
+	current.RefreshToken = "new-refresh"
+	require.NoError(t, store.ReplaceCredentials("acct", &current))
+
+	secondResult := make(chan StoredAccount, 1)
+	secondErr := make(chan error, 1)
+	go func() {
+		fresh, refreshErr := store.RefreshToken(context.Background(), client, "acct")
+		secondResult <- fresh
+		secondErr <- refreshErr
+	}()
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("new credentials joined the stale refresh flight")
+	}
+	require.NoError(t, <-secondErr)
+	assert.Equal(t, "new-result", (<-secondResult).AccessToken)
+
+	unblockFirst()
+	require.ErrorIs(t, <-firstErr, errAccountRevisionChanged)
+	got, ok := store.Get("acct")
+	require.True(t, ok)
+	assert.Equal(t, "new-client", got.ClientID)
+	assert.Equal(t, "new-result", got.AccessToken)
+	assert.Equal(t, "new-rotated", got.RefreshToken)
+	assert.Equal(t, int32(2), hits.Load())
 }
 
 func TestRefresherRunStopsOnContext(t *testing.T) {

@@ -247,9 +247,15 @@ func runServe(cfg *Config) error {
 		}
 	}
 
+	// One service-lifetime context stops refreshers, probes, and detached cache
+	// warmups when SIGINT/SIGTERM begins graceful shutdown.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	srv.setWarmupContext(ctx)
+
 	// Pre-warm models and usage caches for all usable accounts so the first
 	// request does not pay the control-plane fetch latency.
-	go srv.warmAllAccounts()
+	srv.warmAllAccounts()
 
 	logger, closeLog, logNote, err := setupRequestLog(cfg.Log, cfg.LogFile)
 	if err != nil {
@@ -282,10 +288,6 @@ func runServe(cfg *Config) error {
 
 	httpServer := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 30 * time.Second}
 	adminServer := &http.Server{Handler: srv.AdminHandler(), ReadHeaderTimeout: 30 * time.Second}
-
-	// Graceful shutdown on SIGINT/SIGTERM.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	// Periodically refresh stored accounts before their tokens expire. Stops
 	// when ctx is cancelled.

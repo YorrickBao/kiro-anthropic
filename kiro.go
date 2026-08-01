@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -174,24 +175,45 @@ func (c *KiroClient) runtimeEndpoint(region string) string {
 	return fmt.Sprintf("https://runtime.%s.kiro.dev/", region)
 }
 
+type streamRecvResult struct {
+	ev  *kiroEvent
+	err error
+}
+
 // kiroStream is an open streaming response.
 type kiroStream struct {
 	resp *http.Response
 	dec  *eventStreamDecoder
 
-	// primed holds the first event (and its error) once peekFirst has run, so a
-	// caller can inspect it before committing response headers and still have
-	// Recv replay it as the first event.
-	primed    bool
-	primedEv  *kiroEvent
-	primedErr error
+	// Priming can buffer multiple protocol-only events. If its short pre-commit
+	// budget expires during a read, Recv takes ownership of pendingRead before it
+	// touches the decoder, so there is never more than one concurrent decoder read.
+	primed      []streamRecvResult
+	pendingRead <-chan streamRecvResult
+
+	modelID string // concrete model selected for this physical runtime request
+
+	// receiveObserver sees every result exactly once when Recv delivers it;
+	// pre-commit inspection itself never invokes the observer.
+	receiveObserver func(*kiroEvent, error)
 }
 
+// runtimeSendBlockedError reports that the dispatch gate rejected a physical
+// runtime request. previous preserves a non-2xx response from an initial send
+// when the gate rejects the post-refresh retry.
+type runtimeSendBlockedError struct {
+	cause    error
+	previous error
+}
+
+func (e *runtimeSendBlockedError) Error() string { return e.cause.Error() }
+func (e *runtimeSendBlockedError) Unwrap() error { return e.cause }
+
 // Send issues the request using the supplied credentials and returns a stream
-// of events. On a 401/403 the credentials are refreshed and the request retried
-// once.
-func (c *KiroClient) Send(ctx context.Context, creds kiroCredentials, req *kiroRequest) (*kiroStream, error) {
-	stream, status, body, err := c.sendOnce(ctx, creds, req)
+// of events. beforeSend runs immediately before each physical runtime request,
+// including the one-time retry after a 401/403 credential refresh.
+func (c *KiroClient) Send(ctx context.Context, creds kiroCredentials, req *kiroRequest, beforeSend func() error) (*kiroStream, error) {
+	stream, status, body, err := c.sendOnce(ctx, creds, req, beforeSend)
 	if err != nil {
 		return nil, err
 	}
@@ -201,8 +223,13 @@ func (c *KiroClient) Send(ctx context.Context, creds kiroCredentials, req *kiroR
 	// Non-2xx on first try.
 	if status == http.StatusUnauthorized || status == http.StatusForbidden {
 		if rerr := creds.refresh(ctx); rerr == nil {
-			stream, status, body, err = c.sendOnce(ctx, creds, req)
+			previous := &kiroHTTPError{Status: status, Body: body}
+			stream, status, body, err = c.sendOnce(ctx, creds, req, beforeSend)
 			if err != nil {
+				var blocked *runtimeSendBlockedError
+				if errors.As(err, &blocked) {
+					return nil, &runtimeSendBlockedError{cause: blocked.cause, previous: previous}
+				}
 				return nil, err
 			}
 			if stream != nil {
@@ -214,8 +241,9 @@ func (c *KiroClient) Send(ctx context.Context, creds kiroCredentials, req *kiroR
 }
 
 // sendOnce performs a single attempt. On success it returns a stream; on a
-// non-2xx response it returns (nil, status, body, nil).
-func (c *KiroClient) sendOnce(ctx context.Context, creds kiroCredentials, req *kiroRequest) (*kiroStream, int, string, error) {
+// non-2xx response it returns (nil, status, body, nil). The dispatch gate runs
+// after request preparation and immediately before the HTTP request is issued.
+func (c *KiroClient) sendOnce(ctx context.Context, creds kiroCredentials, req *kiroRequest, beforeSend func() error) (*kiroStream, int, string, error) {
 	token, err := creds.accessToken(ctx)
 	if err != nil {
 		return nil, 0, "", err
@@ -239,6 +267,11 @@ func (c *KiroClient) sendOnce(ctx context.Context, creds kiroCredentials, req *k
 	httpReq.Header.Set("X-Amz-Target", "AmazonCodeWhispererStreamingService.GenerateAssistantResponse")
 	applyKiroHeaders(httpReq, token, creds.machineID())
 
+	if beforeSend != nil {
+		if err := beforeSend(); err != nil {
+			return nil, 0, "", &runtimeSendBlockedError{cause: err}
+		}
+	}
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
 		return nil, 0, "", err
@@ -253,28 +286,67 @@ func (c *KiroClient) sendOnce(ctx context.Context, creds kiroCredentials, req *k
 	return &kiroStream{resp: resp, dec: newEventStreamDecoder(resp.Body)}, resp.StatusCode, "", nil
 }
 
-// peekFirst reads and buffers the first event so the caller can inspect it
-// before sending response headers. It is idempotent: the buffered event (or
-// error) is replayed by the first Recv call. This enables pre-stream failover
-// on an upstream exception that arrives as the very first frame, before any
-// assistant content has been produced.
-func (s *kiroStream) peekFirst() (*kiroEvent, error) {
-	if !s.primed {
-		s.primedEv, s.primedErr = s.recvRaw()
-		s.primed = true
+// primeUntil buffers events until ready accepts one, an error/EOF arrives, or
+// the total budget expires. On timeout the active read is handed to Recv.
+func (s *kiroStream) primeUntil(ctx context.Context, timeout time.Duration, ready func(*kiroEvent) bool) (*kiroEvent, error) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		ch := s.readAsync()
+		select {
+		case result := <-ch:
+			s.primed = append(s.primed, result)
+			if result.err != nil || ready(result.ev) {
+				return result.ev, result.err
+			}
+		case <-timer.C:
+			s.pendingRead = ch
+			return nil, nil
+		case <-ctx.Done():
+			s.Close()
+			return nil, ctx.Err()
+		}
 	}
-	return s.primedEv, s.primedErr
+}
+
+func (s *kiroStream) readAsync() <-chan streamRecvResult {
+	ch := make(chan streamRecvResult, 1)
+	go func() {
+		ev, err := s.recvRaw()
+		ch <- streamRecvResult{ev: ev, err: err}
+	}()
+	return ch
+}
+
+// setReceiveObserver installs a delivery observer. Primed results are observed
+// only when Recv replays them, so pre-commit inspection cannot double-observe.
+func (s *kiroStream) setReceiveObserver(observer func(*kiroEvent, error)) {
+	s.receiveObserver = observer
+}
+
+func (s *kiroStream) deliver(ev *kiroEvent, err error) (*kiroEvent, error) {
+	if s.receiveObserver != nil {
+		s.receiveObserver(ev, err)
+	}
+	return ev, err
 }
 
 // Recv returns the next parsed event, or io.EOF when the stream ends.
 func (s *kiroStream) Recv() (*kiroEvent, error) {
-	if s.primed {
-		s.primed = false
-		ev, err := s.primedEv, s.primedErr
-		s.primedEv, s.primedErr = nil, nil
-		return ev, err
+	if len(s.primed) > 0 {
+		result := s.primed[0]
+		s.primed[0] = streamRecvResult{}
+		s.primed = s.primed[1:]
+		return s.deliver(result.ev, result.err)
 	}
-	return s.recvRaw()
+	if s.pendingRead != nil {
+		ch := s.pendingRead
+		s.pendingRead = nil
+		result := <-ch
+		return s.deliver(result.ev, result.err)
+	}
+	ev, err := s.recvRaw()
+	return s.deliver(ev, err)
 }
 
 // recvRaw reads the next event directly from the decoder, bypassing the peek
@@ -305,6 +377,22 @@ func (s *kiroStream) Close() error {
 	return nil
 }
 
+func normalizeKiroEventKind(kind string) string {
+	return strings.ToLower(strings.TrimSpace(kind))
+}
+
+func isKiroErrorEventKind(kind string) bool {
+	switch normalizeKiroEventKind(kind) {
+	case "invalidstateevent", "internalserverexception",
+		"throttlingerror", "throttlingexception",
+		"servicequotaexceedederror", "servicequotaexceededexception",
+		"conversationexpirederror", "dryrunsucceedevent":
+		return true
+	default:
+		return false
+	}
+}
+
 // parseKiroMessage converts a raw framed message into a kiroEvent.
 func parseKiroMessage(msg *eventMessage) *kiroEvent {
 	// Service-level exceptions are flagged in the message headers.
@@ -313,7 +401,16 @@ func parseKiroMessage(msg *eventMessage) *kiroEvent {
 		return &kiroEvent{Kind: evError, ErrKind: msg.exceptionType(), ErrMsg: errMsg, ErrReason: reason}
 	}
 
-	switch msg.eventType() {
+	eventType := msg.eventType()
+	if isKiroErrorEventKind(eventType) {
+		// Error-ish union members may use either legacy *Error or AWS-style
+		// *Exception names. Preserve the raw kind while classifying aliases
+		// case-insensitively downstream.
+		errMsg, reason := extractMessageAndReason(msg.payload)
+		return &kiroEvent{Kind: evError, ErrKind: eventType, ErrMsg: errMsg, ErrReason: reason}
+	}
+
+	switch eventType {
 	case "assistantResponseEvent":
 		var p struct {
 			Content string `json:"content"`
@@ -366,12 +463,6 @@ func parseKiroMessage(msg *eventMessage) *kiroEvent {
 		}
 		_ = json.Unmarshal(msg.payload, &p)
 		return &kiroEvent{Kind: evMetadata, ConversationID: p.ConversationID, StopReason: p.StopReason}
-
-	case "invalidStateEvent", "internalServerException", "throttlingError",
-		"serviceQuotaExceededError", "conversationExpiredError", "dryRunSucceedEvent":
-		// Error-ish union members surfaced as normal events.
-		errMsg, reason := extractMessageAndReason(msg.payload)
-		return &kiroEvent{Kind: evError, ErrKind: msg.eventType(), ErrMsg: errMsg, ErrReason: reason}
 
 	default:
 		// codeReferenceEvent, followupPromptEvent, supplementaryWebLinksEvent,

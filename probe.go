@@ -3,31 +3,45 @@ package main
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 )
 
 // depletedProbeInterval is how often the background probe re-checks accounts
-// parked as depleted, so a reset/upgrade that restores credit is picked up
-// without waiting on real traffic. It only touches depleted accounts, so the
-// control-plane cost stays proportional to the number of exhausted accounts.
-const depletedProbeInterval = 30 * time.Minute
+// that still need a control-plane quota decision: strict unknown accounts and
+// every account parked as depleted. This picks up reset/upgrade recovery without
+// sending inference traffic; bounded workers cap the control-plane load.
+const (
+	depletedProbeInterval    = 30 * time.Minute
+	depletedProbeConcurrency = 4
+	depletedProbeTimeout     = 15 * time.Second
+)
 
-// depletedProbe periodically re-fetches usage for accounts marked depleted and
-// reconciles their state: an account with credit again is un-parked; one still
-// exhausted is refined to its real reset_at. It mirrors accountRefresher's
-// shape and shares the process-lifetime context from runServe.
+// depletedProbe periodically re-fetches usage for selector probe targets and
+// reconciles their state: an account with base credit again is un-parked; one
+// still exhausted remains blocked. It mirrors accountRefresher's shape and
+// shares the process-lifetime context from runServe.
 type depletedProbe struct {
-	srv      *Server
-	logger   *slog.Logger  // optional; nil disables logging
-	interval time.Duration // scan cadence; zero uses depletedProbeInterval
+	srv         *Server
+	logger      *slog.Logger  // optional; nil disables logging
+	interval    time.Duration // scan cadence; zero uses depletedProbeInterval
+	concurrency int           // simultaneous accounts; non-positive uses the default
+	timeout     time.Duration // per-account wait; non-positive uses the default
 }
 
 func newDepletedProbe(srv *Server, logger *slog.Logger) *depletedProbe {
-	return &depletedProbe{srv: srv, logger: logger, interval: depletedProbeInterval}
+	return &depletedProbe{
+		srv: srv, logger: logger, interval: depletedProbeInterval,
+		concurrency: depletedProbeConcurrency, timeout: depletedProbeTimeout,
+	}
 }
 
-// Run ticks until ctx is cancelled.
+// Run performs an immediate scan, then repeats until ctx is cancelled.
 func (p *depletedProbe) Run(ctx context.Context) {
+	p.scan(ctx)
+	if ctx.Err() != nil {
+		return
+	}
 	interval := p.interval
 	if interval <= 0 {
 		interval = depletedProbeInterval
@@ -44,37 +58,72 @@ func (p *depletedProbe) Run(ctx context.Context) {
 	}
 }
 
-// scan re-checks every depleted account. A failed fetch leaves the account
-// parked (the error may be transient); a successful one reconciles the depleted
-// mark and refreshes the usage cache so the admin page benefits too.
+// scan re-checks every current probe target with bounded workers and an
+// independent timeout per account. A stalled account occupies only one worker;
+// other workers continue, and a timeout/error leaves selector state unchanged.
 func (p *depletedProbe) scan(ctx context.Context) {
-	for _, id := range p.srv.selector.depletedIDs() {
-		creds, ok := p.srv.selector.byID(id)
-		if !ok {
-			// Account vanished from the store; drop the stale mark.
-			p.srv.selector.clearDepleted(id)
-			continue
-		}
-		u, err := p.srv.kiro.GetUsage(ctx, creds)
-		if err != nil {
-			if p.logger != nil {
-				p.logger.Log(context.Background(), slog.LevelDebug, "depleted probe usage fetch failed",
-					"id", id, "error", err.Error())
+	if p.srv == nil || p.srv.selector == nil {
+		return
+	}
+	ids := p.srv.selector.probeIDs()
+	if len(ids) == 0 {
+		return
+	}
+	concurrency := p.concurrency
+	if concurrency <= 0 {
+		concurrency = depletedProbeConcurrency
+	}
+	if concurrency > len(ids) {
+		concurrency = len(ids)
+	}
+	timeout := p.timeout
+	if timeout <= 0 {
+		timeout = depletedProbeTimeout
+	}
+
+	jobs := make(chan string, len(ids))
+	for _, id := range ids {
+		jobs <- id
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for range concurrency {
+		go func() {
+			defer wg.Done()
+			for {
+				if ctx.Err() != nil {
+					return
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case id, ok := <-jobs:
+					if !ok {
+						return
+					}
+					p.probeAccount(ctx, id, timeout)
+				}
 			}
-			continue
+		}()
+	}
+	wg.Wait()
+}
+
+func (p *depletedProbe) probeAccount(ctx context.Context, id string, timeout time.Duration) {
+	accountCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	u, err := p.srv.refreshUsage(accountCtx, id, usageObservationProbe)
+	if err != nil {
+		if p.logger != nil {
+			p.logger.Log(context.Background(), slog.LevelDebug, "depleted probe usage fetch failed",
+				"id", id, "error", err.Error())
 		}
-		fetched := time.Now()
-		// applyUsage reconciles the depleted mark (lifts it if credit returned,
-		// refines to reset_at otherwise) without creating a new one, so a stale
-		// snapshot can't re-park an account that recovered mid-fetch. Also
-		// refresh the cache so the admin page shows the fresh figure.
-		p.srv.selector.applyUsage(id, u, fetched, true)
-		p.srv.usageMu.Lock()
-		p.srv.usageCache[id] = usageCacheEntry{usage: u, fetched: fetched}
-		p.srv.usageMu.Unlock()
-		if u.Credit != nil && u.Credit.Remaining > 0 && p.logger != nil {
-			p.logger.Log(context.Background(), slog.LevelInfo, "depleted account recovered",
-				"id", id, "remaining", u.Credit.Remaining)
-		}
+		return
+	}
+	if u.Credit != nil && u.Credit.Remaining > 0 && p.logger != nil {
+		p.logger.Log(context.Background(), slog.LevelInfo, "depleted account recovered",
+			"id", id, "remaining", u.Credit.Remaining)
 	}
 }

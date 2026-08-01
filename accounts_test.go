@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -88,11 +89,13 @@ func TestAccountStoreRefreshIdentityOverwritesAndPersists(t *testing.T) {
 		CreatedAt:   "2020-01-01T00:00:00Z",
 	}))
 
+	before := runtimeRevision(t, s, "id-1")
 	got, err := s.RefreshIdentity(context.Background(), client, "id-1")
 	require.NoError(t, err)
 	assert.Equal(t, "arn:new", got.ProfileArn)
 	assert.Equal(t, "new@x.com", got.Email)
 	assert.Equal(t, "user-new", got.UserID)
+	assert.Greater(t, runtimeRevision(t, s, "id-1"), before, "profile replacement must invalidate old runtime snapshots")
 
 	// The overwrite must survive a reload from disk.
 	s2, err := NewAccountStore(path)
@@ -139,6 +142,58 @@ func TestAccountStoreRefreshIdentityKeepsExistingOnError(t *testing.T) {
 	assert.Equal(t, "arn:old", got.ProfileArn)
 	assert.Equal(t, "old@x.com", got.Email)
 	assert.Equal(t, "user-old", got.UserID)
+}
+
+func TestAccountStoreRefreshIdentityRejectsStaleRevisionWrite(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		writeJSON(w, http.StatusOK, map[string]any{
+			"profiles": []map[string]any{{"arn": "arn:stale"}},
+		})
+	})
+	mux.HandleFunc("/getUsageLimits", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"userInfo": map[string]any{"email": "stale@x.com", "userId": "stale-user"},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	target, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	client := &http.Client{Transport: &rewriteTransport{host: target.Host, scheme: target.Scheme}}
+
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "id-1", ClientID: "old-client", ClientSecret: "old-secret", RefreshToken: "old-refresh",
+		AccessToken: "old-access", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		Region: "us-east-1", ProfileArn: "arn:old", Email: "old@x.com", CreatedAt: "1",
+	}))
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, refreshErr := store.RefreshIdentity(context.Background(), client, "id-1")
+		errCh <- refreshErr
+	}()
+	<-started
+	require.NoError(t, store.ReplaceCredentials("id-1", &StoredAccount{
+		ClientID: "new-client", ClientSecret: "new-secret", RefreshToken: "new-refresh",
+		AccessToken: "new-access", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		Region: "us-east-1", ProfileArn: "arn:replacement", Email: "replacement@x.com",
+	}))
+	close(release)
+	require.ErrorIs(t, <-errCh, errAccountRevisionChanged)
+
+	got, ok := store.Get("id-1")
+	require.True(t, ok)
+	assert.Equal(t, "new-client", got.ClientID)
+	assert.Equal(t, "new-access", got.AccessToken)
+	assert.Equal(t, "arn:replacement", got.ProfileArn)
+	assert.Equal(t, "replacement@x.com", got.Email)
 }
 
 func TestAccountStoreImportAccounts(t *testing.T) {
@@ -395,4 +450,119 @@ func TestStoredAccountExpiryState(t *testing.T) {
 
 	unknown := StoredAccount{}
 	assert.Equal(t, "unknown", unknown.view()["expiry_state"])
+}
+
+func TestAccountStoreRuntimeRevisionBoundaries(t *testing.T) {
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "a", Email: "a@example.com", ProfileArn: "arn:a",
+		ClientID: "client", ClientSecret: "secret", AccessToken: "token",
+		RefreshToken: "refresh", CreatedAt: "1",
+	}))
+
+	runtime, ok := store.Runtime("a")
+	require.True(t, ok)
+	require.NotZero(t, runtime.Revision)
+	initial := runtime.Revision
+
+	require.NoError(t, store.UpdateLabel("a", "note"))
+	assert.Equal(t, initial, runtimeRevision(t, store, "a"), "labels do not affect routing")
+	require.NoError(t, store.UpdateTokens("a", "token-2", "refresh-2", "2030-01-01T00:00:00Z"))
+	assert.Equal(t, initial, runtimeRevision(t, store, "a"), "routine token maintenance does not invalidate leases")
+	require.NoError(t, store.UpdateIdentity("a", "arn:a", "new@example.com", "user"))
+	assert.Equal(t, initial, runtimeRevision(t, store, "a"), "same-profile identity maintenance does not invalidate leases")
+	require.NoError(t, store.UpdateIdentity("a", "arn:new", "", ""))
+	identity := runtimeRevision(t, store, "a")
+	assert.Greater(t, identity, initial, "replacing a resolved profile invalidates old leases and model cache")
+
+	require.NoError(t, store.SetDisabled("a", true))
+	disabled := runtimeRevision(t, store, "a")
+	assert.Greater(t, disabled, identity)
+	require.NoError(t, store.SetDisabled("a", true))
+	assert.Equal(t, disabled, runtimeRevision(t, store, "a"), "no-op disable does not bump")
+
+	require.NoError(t, store.SetOverageEnabled("a", true))
+	overage := runtimeRevision(t, store, "a")
+	assert.Greater(t, overage, disabled)
+	require.NoError(t, store.SetOverageEnabled("a", true))
+	assert.Equal(t, overage, runtimeRevision(t, store, "a"), "no-op policy toggle does not bump")
+
+	require.NoError(t, store.ReplaceCredentials("a", &StoredAccount{
+		Email: "replacement@example.com", ClientID: "new-client", RefreshToken: "new-refresh",
+	}))
+	assert.Greater(t, runtimeRevision(t, store, "a"), overage)
+}
+
+func TestAccountStoreImportBumpsOnlyChangedRuntime(t *testing.T) {
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	original := &StoredAccount{
+		ID: "a", Email: "a@example.com", Provider: "BuilderId", Region: "us-east-1",
+		ClientID: "client", ClientSecret: "secret", AccessToken: "token",
+		RefreshToken: "refresh", ExpiresAt: "2030-01-01T00:00:00Z", CreatedAt: "1",
+	}
+	require.NoError(t, store.Add(original))
+	initial := runtimeRevision(t, store, "a")
+
+	identical := *original
+	identical.ID = "exported-id"
+	_, err = store.ImportAccounts([]*StoredAccount{&identical})
+	require.NoError(t, err)
+	assert.Equal(t, initial, runtimeRevision(t, store, "a"))
+
+	changed := identical
+	changed.AccessToken = "new-token"
+	_, err = store.ImportAccounts([]*StoredAccount{&changed})
+	require.NoError(t, err)
+	assert.Greater(t, runtimeRevision(t, store, "a"), initial)
+}
+
+func TestAccountStoreRemoveReaddGetsFreshRevision(t *testing.T) {
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, store.Add(&StoredAccount{ID: "same", CreatedAt: "1"}))
+	old := runtimeRevision(t, store, "same")
+	require.NoError(t, store.Remove("same"))
+	_, ok := store.Runtime("same")
+	assert.False(t, ok)
+
+	require.NoError(t, store.Add(&StoredAccount{ID: "same", CreatedAt: "1"}))
+	assert.Greater(t, runtimeRevision(t, store, "same"), old)
+}
+
+func TestAccountStoreLoadedAccountsReceiveRuntimeRevisions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	store, err := NewAccountStore(path)
+	require.NoError(t, err)
+	require.NoError(t, store.Add(&StoredAccount{ID: "a", CreatedAt: "1"}))
+	require.NoError(t, store.Add(&StoredAccount{ID: "b", CreatedAt: "2"}))
+
+	reloaded, err := NewAccountStore(path)
+	require.NoError(t, err)
+	list := reloaded.RuntimeList()
+	require.Len(t, list, 2)
+	assert.NotZero(t, list[0].Revision)
+	assert.NotZero(t, list[1].Revision)
+	assert.NotEqual(t, list[0].Revision, list[1].Revision)
+	assert.Equal(t, []string{"a", "b"}, []string{list[0].Account.ID, list[1].Account.ID})
+}
+
+func TestAccountRuntimeRevisionIsNotPublicJSON(t *testing.T) {
+	accountJSON, err := json.Marshal(StoredAccount{ID: "a"})
+	require.NoError(t, err)
+	assert.NotContains(t, string(accountJSON), "revision")
+
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, store.Add(&StoredAccount{ID: "a", CreatedAt: "1"}))
+	view := store.RuntimeList()[0].Account.view()
+	assert.NotContains(t, view, "revision")
+}
+
+func runtimeRevision(t *testing.T, store *AccountStore, id string) uint64 {
+	t.Helper()
+	runtime, ok := store.Runtime(id)
+	require.True(t, ok)
+	return runtime.Revision
 }

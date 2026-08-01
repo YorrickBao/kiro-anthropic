@@ -89,8 +89,8 @@ func promptTooLongReply() scriptedRuntimeReply {
 	}
 }
 
-func successfulEmptyStreamReply() scriptedRuntimeReply {
-	return scriptedRuntimeReply{status: http.StatusOK}
+func successfulStreamReply() scriptedRuntimeReply {
+	return scriptedRuntimeReply{status: http.StatusOK, body: contentFrame("ok")}
 }
 
 func promptTooLongFrame() []byte {
@@ -149,7 +149,7 @@ func TestOpenStreamPromptTooLongRebuildKeepsAccountModel(t *testing.T) {
 		if call == 1 {
 			return promptTooLongReply()
 		}
-		return successfulEmptyStreamReply()
+		return successfulStreamReply()
 	})
 	s := serverWithPool(t, runtime.fake, "a", "b")
 	areq := &anthropicRequest{Model: "claude-opus-4.8", MaxTokens: 4096, Messages: []anthropicMessage{
@@ -182,7 +182,7 @@ func TestOpenStreamTrimsOneTurnUntilSuccess(t *testing.T) {
 		if call <= 2 {
 			return promptTooLongReply()
 		}
-		return successfulEmptyStreamReply()
+		return successfulStreamReply()
 	})
 	s := serverWithPool(t, runtime.fake, "a", "b")
 	areq := requestWithPlainTurns(3)
@@ -256,7 +256,7 @@ func TestOpenStreamRetriesFirstFramePromptTooLong(t *testing.T) {
 		if call == 1 {
 			return scriptedRuntimeReply{status: http.StatusOK, body: promptTooLongFrame()}
 		}
-		return successfulEmptyStreamReply()
+		return successfulStreamReply()
 	})
 	s := serverWithPool(t, runtime.fake, "a", "b")
 	areq := requestWithPlainTurns(1)
@@ -283,7 +283,7 @@ func TestOpenStreamKeepsReasoningStrippedAfterPromptTrim(t *testing.T) {
 		case 2:
 			return promptTooLongReply()
 		default:
-			return successfulEmptyStreamReply()
+			return successfulStreamReply()
 		}
 	})
 	s := serverWithPool(t, runtime.fake, "a", "b")
@@ -323,7 +323,7 @@ func TestOpenStreamCancellationDuringPromptRetryDoesNotBurnAccounts(t *testing.T
 		default:
 		}
 		<-request.Context().Done()
-		return successfulEmptyStreamReply()
+		return successfulStreamReply()
 	})
 	s := serverWithPool(t, runtime.fake, "a", "b")
 	areq := requestWithPlainTurns(2)
@@ -363,7 +363,12 @@ func TestOpenStreamCancellationDuringPromptRetryDoesNotBurnAccounts(t *testing.T
 	assert.Len(t, requests, 2, "cancellation must not fail over to another account")
 	assertSingleAccount(t, tokens)
 	s.selector.mu.Lock()
-	cooldowns := len(s.selector.cooldown)
+	cooldowns := 0
+	for _, state := range s.selector.states {
+		if time.Now().Before(state.cooldownUntil) {
+			cooldowns++
+		}
+	}
 	s.selector.mu.Unlock()
 	assert.Zero(t, cooldowns, "client cancellation must not cool down healthy accounts")
 }
@@ -402,7 +407,7 @@ func TestOpenStreamRecoversFirstFrameThinkingSignature(t *testing.T) {
 		if call == 1 {
 			return scriptedRuntimeReply{status: http.StatusOK, body: thinkingSignatureExceptionFrame()}
 		}
-		return successfulEmptyStreamReply()
+		return successfulStreamReply()
 	})
 	s := serverWithPool(t, runtime.fake, "a", "b")
 	areq := reasoningRequest()
@@ -438,7 +443,12 @@ func TestOpenStreamFirstFrameValidationErrorDoesNotFailover(t *testing.T) {
 	assert.Equal(t, before, areq.Messages, "must not trim history")
 	assert.Len(t, tokens, 1)
 	s.selector.mu.Lock()
-	cooldowns := len(s.selector.cooldown)
+	cooldowns := 0
+	for _, state := range s.selector.states {
+		if time.Now().Before(state.cooldownUntil) {
+			cooldowns++
+		}
+	}
 	s.selector.mu.Unlock()
 	assert.Zero(t, cooldowns, "validation error must not cool down accounts")
 }

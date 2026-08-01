@@ -52,6 +52,9 @@ func (r *accountRefresher) Run(ctx context.Context) {
 func (r *accountRefresher) scan(ctx context.Context) {
 	now := time.Now()
 	for _, a := range r.store.List() {
+		if ctx.Err() != nil {
+			return
+		}
 		if !accountNeedsRefresh(a, now) {
 			continue
 		}

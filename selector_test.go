@@ -60,6 +60,73 @@ func TestSelectorRoundRobin(t *testing.T) {
 	assert.Equal(t, []string{"a", "b", "c", "a", "b", "c"}, got)
 }
 
+func TestSelectorSessionAffinityIsStable(t *testing.T) {
+	s := newTestSelector(t, "a", "b", "c")
+	const sessionID = "550e8400-e29b-41d4-a716-446655440000"
+
+	first := requireLease(t, s.pickFor(map[string]bool{}, sessionID))
+	for i := 0; i < 6; i++ {
+		lease := requireLease(t, s.pickFor(map[string]bool{}, sessionID))
+		assert.Equal(t, first.creds.id, lease.creds.id)
+		s.recordSuccess(lease)
+	}
+
+	tried := map[string]bool{first.creds.id: true}
+	second := requireLease(t, s.pickFor(tried, sessionID))
+	assert.NotEqual(t, first.creds.id, second.creds.id)
+	assert.Equal(t, second.creds.id, requireLease(t, s.pickFor(tried, sessionID)).creds.id)
+}
+
+func TestSelectorAffinityDoesNotAdvanceRoundRobin(t *testing.T) {
+	s := newTestSelector(t, "a", "b", "c")
+	_ = requireLease(t, s.pickFor(map[string]bool{}, "session-affinity"))
+	_ = requireLease(t, s.pickFor(map[string]bool{}, "session-affinity"))
+
+	assert.Equal(t, "a", requireLease(t, s.pickFor(map[string]bool{}, "")).creds.id)
+	assert.Equal(t, "b", requireLease(t, s.pick(map[string]bool{})).creds.id)
+}
+
+func TestSelectorAffinityHonorsQuotaAndCooldownGates(t *testing.T) {
+	t.Run("depleted", func(t *testing.T) {
+		s := newTestSelector(t, "a", "b")
+		const sessionID = "depleted-session"
+		preferred := requireLease(t, s.pickFor(map[string]bool{}, sessionID))
+		s.recordDepleted(preferred)
+
+		next := requireLease(t, s.pickFor(map[string]bool{}, sessionID))
+		assert.NotEqual(t, preferred.creds.id, next.creds.id)
+	})
+
+	t.Run("cooldown", func(t *testing.T) {
+		s := newTestSelector(t, "a", "b")
+		const sessionID = "cooldown-session"
+		preferred := requireLease(t, s.pickFor(map[string]bool{}, sessionID))
+		s.recordFailure(preferred)
+
+		next := requireLease(t, s.pickFor(map[string]bool{}, sessionID))
+		assert.NotEqual(t, preferred.creds.id, next.creds.id)
+		assert.False(t, next.fallback)
+		s.recordFailure(next)
+
+		fallback := requireLease(t, s.pickFor(map[string]bool{}, sessionID))
+		assert.True(t, fallback.fallback)
+		assert.Equal(t, preferred.creds.id, fallback.creds.id)
+	})
+
+	t.Run("strict unknown", func(t *testing.T) {
+		s := newStrictTestSelector(t, "unknown", "available")
+		assert.True(t, applyFreshUsage(t, s, "available", &kiroUsage{
+			Credit: &kiroCreditUsage{Remaining: 1},
+		}, usageObservationAuthoritative))
+
+		available := requireLease(t, s.pickFor(map[string]bool{}, "strict-session"))
+		assert.Equal(t, "available", available.creds.id)
+		result := s.pickFor(map[string]bool{"available": true}, "strict-session")
+		assert.Nil(t, result.lease)
+		assert.Equal(t, "unknown", result.verifyID)
+	})
+}
+
 func TestSelectorPeekAnyDoesNotAdvance(t *testing.T) {
 	s := newTestSelector(t, "a", "b")
 	for i := 0; i < 5; i++ {
@@ -162,6 +229,34 @@ func TestSelectorConcurrentPick(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestSelectorConcurrentSessionAffinityIsStable(t *testing.T) {
+	s := newTestSelector(t, "a", "b", "c", "d")
+	const sessionID = "concurrent-session"
+	want := requireLease(t, s.pickFor(map[string]bool{}, sessionID)).creds.id
+
+	const workers = 50
+	got := make(chan string, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			lease := s.pickFor(map[string]bool{}, sessionID).lease
+			if lease != nil {
+				got <- lease.creds.id
+			}
+		}()
+	}
+	wg.Wait()
+	close(got)
+	count := 0
+	for id := range got {
+		assert.Equal(t, want, id)
+		count++
+	}
+	assert.Equal(t, workers, count)
 }
 
 func TestSelectorStrictUnknownRequiresVerification(t *testing.T) {

@@ -199,6 +199,131 @@ func TestOpenStreamFailsOverToHealthyAccount(t *testing.T) {
 	assert.Equal(t, "arn:x", kreq.ProfileArn)
 }
 
+func TestMessagesUsesClaudeCodeSessionAffinity(t *testing.T) {
+	const body = `{"model":"gpt-4o","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+	send := func(t *testing.T, handler http.Handler, sessionID string) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+		if sessionID != "" {
+			req.Header.Set(claudeCodeSessionIDHeader, sessionID)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	t.Run("same session", func(t *testing.T) {
+		rt := newFakeRuntime(t)
+		for _, id := range []string{"a", "b", "c"} {
+			rt.modelsFor["Bearer "+id] = []kiroModelInfo{{ModelID: "gpt-5.6-sol"}}
+		}
+		s := serverWithPool(t, rt, "a", "b", "c")
+		handler := s.Handler()
+		const sessionID = "550e8400-e29b-41d4-a716-446655440000"
+		expected := requireLease(t, s.selector.pickFor(map[string]bool{}, sessionID)).creds.id
+
+		for i := 0; i < 3; i++ {
+			send(t, handler, sessionID)
+		}
+		assert.Equal(t, []string{"Bearer " + expected, "Bearer " + expected, "Bearer " + expected}, rt.sendTokens)
+	})
+
+	t.Run("maximum length session", func(t *testing.T) {
+		rt := newFakeRuntime(t)
+		for _, id := range []string{"a", "b"} {
+			rt.modelsFor["Bearer "+id] = []kiroModelInfo{{ModelID: "gpt-5.6-sol"}}
+		}
+		s := serverWithPool(t, rt, "a", "b")
+		handler := s.Handler()
+		sessionID := strings.Repeat("s", maxClaudeCodeSessionIDBytes)
+		expected := requireLease(t, s.selector.pickFor(map[string]bool{}, sessionID)).creds.id
+
+		send(t, handler, sessionID)
+		send(t, handler, sessionID)
+
+		assert.Equal(t, []string{"Bearer " + expected, "Bearer " + expected}, rt.sendTokens)
+	})
+
+	t.Run("oversized session falls back to round robin", func(t *testing.T) {
+		rt := newFakeRuntime(t)
+		for _, id := range []string{"a", "b"} {
+			rt.modelsFor["Bearer "+id] = []kiroModelInfo{{ModelID: "gpt-5.6-sol"}}
+		}
+		s := serverWithPool(t, rt, "a", "b")
+		handler := s.Handler()
+		sessionID := strings.Repeat("s", maxClaudeCodeSessionIDBytes+1)
+
+		send(t, handler, sessionID)
+		send(t, handler, sessionID)
+
+		assert.Equal(t, []string{"Bearer a", "Bearer b"}, rt.sendTokens)
+	})
+
+	t.Run("missing or blank session", func(t *testing.T) {
+		rt := newFakeRuntime(t)
+		for _, id := range []string{"a", "b"} {
+			rt.modelsFor["Bearer "+id] = []kiroModelInfo{{ModelID: "gpt-5.6-sol"}}
+		}
+		s := serverWithPool(t, rt, "a", "b")
+		handler := s.Handler()
+
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+		req.Header.Set(claudeCodeSessionIDHeader, "   ")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		send(t, handler, "")
+
+		assert.Equal(t, []string{"Bearer a", "Bearer b"}, rt.sendTokens)
+	})
+}
+
+func TestOpenStreamSessionAffinityFailsOverDeterministically(t *testing.T) {
+	rt := newFakeRuntime(t)
+	s := serverWithPool(t, rt, "a", "b", "c")
+	const sessionID = "runtime-failover-session"
+	primary := requireLease(t, s.selector.pickFor(map[string]bool{}, sessionID)).creds.id
+	secondary := requireLease(t, s.selector.pickFor(map[string]bool{primary: true}, sessionID)).creds.id
+	rt.badTokens["Bearer "+primary] = true
+	ctx := context.WithValue(context.Background(), ctxKeyAccountAffinity{}, sessionID)
+
+	stream, err := s.openStream(ctx, &kiroRequest{}, nil)
+	require.NoError(t, err)
+	require.NotNil(t, stream)
+	stream.Close()
+	assert.Equal(t, []string{"Bearer " + primary, "Bearer " + secondary}, rt.seen)
+}
+
+func TestOpenStreamSessionAffinityModelSkipsDoNotConsumeSendBudget(t *testing.T) {
+	accounts := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"}
+	const sessionID = "model-skip-session"
+	serve := accounts[0]
+	for _, id := range accounts[1:] {
+		score := accountAffinityScore(sessionID, id)
+		serveScore := accountAffinityScore(sessionID, serve)
+		if score < serveScore || (score == serveScore && id > serve) {
+			serve = id
+		}
+	}
+
+	rt := newFakeRuntime(t)
+	for _, id := range accounts {
+		modelID := "claude-opus-4.8"
+		if id == serve {
+			modelID = "gpt-5.6-sol"
+		}
+		rt.modelsFor["Bearer "+id] = []kiroModelInfo{{ModelID: modelID}}
+	}
+	s := serverWithPool(t, rt, accounts...)
+	ctx := context.WithValue(context.Background(), ctxKeyAccountAffinity{}, sessionID)
+
+	stream, err := s.openStream(ctx, &kiroRequest{}, msgAreq("gpt-4o"))
+	require.NoError(t, err)
+	require.NotNil(t, stream)
+	stream.Close()
+	assert.Equal(t, []string{"Bearer " + serve}, rt.sendTokens)
+}
+
 func TestOpenStreamAllAccountsFail(t *testing.T) {
 	rt := newFakeRuntime(t, "Bearer a", "Bearer b")
 	s := serverWithPool(t, rt, "a", "b")

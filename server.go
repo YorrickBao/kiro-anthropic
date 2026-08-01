@@ -208,6 +208,18 @@ func (s *Server) Handler() http.Handler {
 // ctxKeyAccess is the context key under which per-request log details live.
 type ctxKeyAccess struct{}
 
+const (
+	claudeCodeSessionIDHeader   = "x-claude-code-session-id"
+	maxClaudeCodeSessionIDBytes = 1024
+)
+
+type ctxKeyAccountAffinity struct{}
+
+func accountAffinityFrom(ctx context.Context) string {
+	affinity, _ := ctx.Value(ctxKeyAccountAffinity{}).(string)
+	return affinity
+}
+
 // accessInfo carries request details that handlers attach for the access log.
 type accessInfo struct {
 	model    string
@@ -1113,6 +1125,9 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, r, http.StatusUnauthorized, "authentication_error", "invalid api key")
 		return
 	}
+	if sessionID := strings.TrimSpace(r.Header.Get(claudeCodeSessionIDHeader)); sessionID != "" && len(sessionID) <= maxClaudeCodeSessionIDBytes {
+		r = r.WithContext(context.WithValue(r.Context(), ctxKeyAccountAffinity{}, sessionID))
+	}
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, 32*1024*1024))
 	if err != nil {
@@ -1247,6 +1262,7 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest, areq *anthro
 	knownDepleted := false
 	runtimeAttempts := 0
 	preSendLeaseRefreshes := 0
+	affinityKey := accountAffinityFrom(ctx)
 	requeueUnsent := func(id string) bool {
 		if preSendLeaseRefreshes >= maxPreSendLeaseRefreshes {
 			return false
@@ -1285,7 +1301,7 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest, areq *anthro
 
 dispatch:
 	for runtimeAttempts < maxAccountAttempts {
-		picked := s.selector.pick(tried)
+		picked := s.selector.pickFor(tried, affinityKey)
 		knownDepleted = knownDepleted || picked.knownDepleted
 		if picked.lease == nil {
 			if picked.verifyID != "" {

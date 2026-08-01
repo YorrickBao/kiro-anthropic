@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"net/http"
 	"strings"
@@ -267,12 +269,21 @@ func (s *accountSelector) pruneStatesLocked(list []accountRuntime) {
 	}
 }
 
-// pick chooses the next immediately eligible account. Strict no-overage
-// accounts are selectable only in quotaAvailable. If no account can be routed
-// immediately, verifyID names the first strict quotaUnknown account that should
-// receive a fresh GetUsage before retrying selection. Only cooldown participates
-// in the all-skipped fallback; depleted accounts are never fallback candidates.
+// pick preserves the legacy round-robin path for callers without a session
+// affinity key.
 func (s *accountSelector) pick(tried map[string]bool) pickResult {
+	return s.pickFor(tried, "")
+}
+
+// pickFor chooses the next immediately eligible account. With affinityKey it
+// uses rendezvous hashing so one client session returns to the same eligible
+// account without storing session state. Without affinityKey it retains the
+// existing round-robin order. Strict no-overage accounts are selectable only
+// in quotaAvailable. If no account can be routed immediately, verifyID names a
+// strict quotaUnknown account that should receive a fresh GetUsage before
+// selection retries. Only cooldown participates in the all-skipped fallback;
+// depleted accounts are never fallback candidates.
+func (s *accountSelector) pickFor(tried map[string]bool, affinityKey string) pickResult {
 	list := s.store.RuntimeList()
 	if len(list) == 0 {
 		return pickResult{}
@@ -282,14 +293,23 @@ func (s *accountSelector) pick(tried map[string]bool) pickResult {
 	defer s.mu.Unlock()
 	s.pruneStatesLocked(list)
 
+	affinity := affinityKey != ""
 	now := time.Now()
+	var selected *accountLease
+	var selectedScore uint64
 	var verifyID string
+	var verifyScore uint64
 	knownDepleted := false
 	var fallback *accountLease
 	var fallbackAt time.Time
+	var fallbackScore uint64
 	n := len(list)
 	for i := 0; i < n; i++ {
-		rt := list[(s.index+i)%n]
+		pos := i
+		if !affinity {
+			pos = (s.index + i) % n
+		}
+		rt := list[pos]
 		a := rt.Account
 		if tried[a.ID] || !accountUsable(a) {
 			continue
@@ -305,8 +325,15 @@ func (s *accountSelector) pick(tried map[string]bool) pickResult {
 			continue
 		case quotaUnknown:
 			if !a.OverageEnabled {
-				if verifyID == "" {
-					verifyID = a.ID
+				if !affinity {
+					if verifyID == "" {
+						verifyID = a.ID
+					}
+				} else {
+					score := accountAffinityScore(affinityKey, a.ID)
+					if verifyID == "" || score > verifyScore || (score == verifyScore && a.ID < verifyID) {
+						verifyID, verifyScore = a.ID, score
+					}
 				}
 				continue
 			}
@@ -320,19 +347,39 @@ func (s *accountSelector) pick(tried map[string]bool) pickResult {
 		}
 		if now.Before(st.cooldownUntil) {
 			lease.fallback = true
-			if fallback == nil || st.cooldownUntil.Before(fallbackAt) {
-				fallback, fallbackAt = lease, st.cooldownUntil
+			score := uint64(0)
+			if affinity {
+				score = accountAffinityScore(affinityKey, a.ID)
+			}
+			if fallback == nil || st.cooldownUntil.Before(fallbackAt) ||
+				(affinity && st.cooldownUntil.Equal(fallbackAt) &&
+					(score > fallbackScore || (score == fallbackScore && a.ID < fallback.creds.id))) {
+				fallback, fallbackAt, fallbackScore = lease, st.cooldownUntil, score
 			}
 			continue
 		}
 
-		s.index = (s.index + i + 1) % n
-		return pickResult{lease: lease, knownDepleted: knownDepleted}
+		if !affinity {
+			s.index = (s.index + i + 1) % n
+			return pickResult{lease: lease, knownDepleted: knownDepleted}
+		}
+		score := accountAffinityScore(affinityKey, a.ID)
+		if selected == nil || score > selectedScore || (score == selectedScore && a.ID < selected.creds.id) {
+			selected, selectedScore = lease, score
+		}
+	}
+	if selected != nil {
+		return pickResult{lease: selected, knownDepleted: knownDepleted}
 	}
 	if verifyID != "" {
 		return pickResult{verifyID: verifyID, knownDepleted: knownDepleted}
 	}
 	return pickResult{lease: fallback, knownDepleted: knownDepleted}
+}
+
+func accountAffinityScore(affinityKey, accountID string) uint64 {
+	sum := sha256.Sum256([]byte(affinityKey + "\x00" + accountID))
+	return binary.BigEndian.Uint64(sum[:8])
 }
 
 // credsFor builds accountCreds for an atomic runtime snapshot.

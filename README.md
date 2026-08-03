@@ -55,7 +55,8 @@
 - **扩展思考（extended thinking）**：模型的思考过程通过 Anthropic 原生的 `thinking` / `redacted_thinking` 内容块透传（流式下发 `thinking_delta` + `signature_delta`）。多轮对话时思考块连同 `signature` 原样回传给后端；若后端判定签名失效（`THINKING_SIGNATURE_INVALID`），自动剥离推理内容并重试一次。请求侧 `thinking: {type:"disabled"}` 会关闭思考块并把 effort 降到最低档。
 - **最大输出 tokens**：按模型 schema 把调用方的 `max_tokens` 下发给 Kiro。**注意：实测 Kiro 后端不强制执行该上限**，实际输出长度由模型/effort 决定，`stop_reason` 基本不会是 `max_tokens`。该字段仅为协议兼容而发送。
 - **模型能力发现** `GET /v1/models`：返回 `max_input_tokens`、`max_tokens`、`capabilities.effort`（上下文窗口、effort 档位）。
-- **账号池**：无主账号，所有请求走账号池轮询。账号来自启动自动导入本地凭据、管理页 IdC 登录、管理页「导入本机凭据」，三者进同一个池；后台自动刷新令牌保活。池为空时 `/v1/messages` 返回 503。
+- **账号池**：无主账号，所有请求按额度状态分层选号；同一 Claude Code session 在可用层内保持账号亲和，无 session 时 round-robin。账号来自启动自动导入本地凭据、管理页 IdC 登录、管理页「导入本机凭据」，三者进同一个池；后台自动刷新令牌保活。池为空时 `/v1/messages` 返回 503。
+- **Claude Code 会话连续性**：有效的 `x-claude-code-session-id` 在当前服务进程内映射为稳定的 Kiro `conversationId`（UUID），模型重建、重试和账号故障转移都复用该 ID；24 小时无活动后自动过期。未传/无效 session 时每个入站请求生成独立 UUID，服务重启不会保留映射。
 - **令牌自动刷新**：池里每个账号快过期时都用 SSO-OIDC 自动续期并写回；刷新经 singleflight 去重，请求路径与后台保活不会对同一账号重复发起 `CreateToken`。
 - **profileArn 自动解析**：企业/IdC 账号走 `ListAvailableProfiles`，免费/社交登录用内置固定 ARN；结果随账号存储。
 - **出站代理**：所有到 AWS / Kiro 的请求都走代理，默认 `http://127.0.0.1:7890`，可覆盖或关闭。
@@ -111,6 +112,8 @@ export NO_PROXY=127.0.0.1,localhost
 ```
 
 设置了 `--api-key` 时，把 `ANTHROPIC_API_KEY` 设成同一个值即可。
+
+Claude Code 会自动发送 `x-claude-code-session-id`。服务会先去除首尾空白；非空且不超过 1024 bytes 时，该值同时用于账号亲和与进程内 `conversationId` 复用。映射在 24 小时无活动后过期，服务重启后重新生成；未传、全空白或超长 header 则每个 `/v1/messages` 请求使用新的随机 UUID。
 
 ---
 
@@ -190,13 +193,16 @@ http://127.0.0.1:27890/health      # 健康检查
 
 #### 账号池请求分发
 
-`/v1/messages` **始终**在账号池里做**轮询（round-robin）**负载均衡，没有主账号概念：
+`/v1/messages` **始终**从账号池动态选号，没有主账号概念：
 
-- **池空返回 503**：账号池为空时，`/v1/messages` 直接返回 **503**，提示去管理页登录或导入账号。一旦池里有账号，请求即在这些账号间轮询。
-- **流前故障转移**：某账号请求失败（鉴权失效、配额/限流、上游 5xx、网络错误）时，自动切换到下一个账号重试；请求本身的问题（如 400 参数错误）则立即返回，不会白白消耗其他账号。**注意**：故障转移只发生在流开始前——一旦 SSE 开始下发数据（响应头已发出），中途的上游错误只能如实透传，无法再切换账号。
-- **轻量冷却**：失败的账号会被短暂冷却（默认 60s）跳过；全部账号都在冷却时，选用最快恢复的那个。成功一次即清除冷却。
-- **保活**：无论账号是否正被分发使用，后台都会按前述规则自动刷新其令牌。
-- 选号策略刻意保持简单（纯轮询 + 冷却），不做会话粘性 / 加权 / 单账号并发限制。
+- **池空返回 503**：账号池为空时直接返回 **503**，提示去管理页登录或导入账号。
+- **额度优先级**：优先选择已知 Base 额度为正的账号，以及允许透支但 Usage 尚为 Unknown 的账号；没有 ready preferred 账号时才使用已知 Overage；全部 ready 账号不可用时才回退到最早结束冷却的账号。已确认耗尽且不可透支的账号会被跳过。
+- **会话亲和 / 轮询**：有效 `x-claude-code-session-id` 在当前最高可用层内使用 rendezvous hash，尽量稳定落到同一账号；没有有效 session 时在该层 round-robin。优先级始终先于亲和性，因此高优先级账号恢复时可以接管请求。
+- **发送前复核**：模型/profile 解析、令牌刷新等准备工作结束后，会在每次物理发送前重新验证 lease。账号失效或更高优先级账号变为 ready 时重新选号，且保持本次入站请求的同一个 `conversationId`。
+- **流前故障转移**：某账号请求失败（鉴权失效、配额/限流、上游 5xx、网络错误）时，自动切换账号重试；请求本身的问题（如 400 参数错误）则立即返回。**注意**：故障转移只发生在流开始前——一旦 SSE 开始下发数据，中途的上游错误只能如实透传。
+- **轻量冷却**：失败的账号会被短暂冷却（默认 60s）跳过；成功一次即清除冷却。后台还会定期复核已耗尽账号，以便额度恢复后重新参与选号。
+- **Conversation ID 生命周期**：同一有效 Claude Code session 在进程内复用一个 UUID；24 小时无活动且没有在途请求后清理。未传/无效 session 时每个入站请求随机生成 UUID，但该请求内的所有重试与 failover 仍保持不变。映射不写磁盘，进程重启后重置；最多保留 65,536 个 session，满额且无过期项可清理时仅新的 session 请求返回可重试 503，已有映射不受影响。
+- **保活与并发**：后台持续刷新所有账号令牌；不对同 session 请求额外串行化，也不做单账号并发限制。
 
 ### 环境变量
 
@@ -339,6 +345,7 @@ Anthropic 客户端 ──/v1/messages──►  kiro-anthropic  ──GenerateA
 ```
 
 - 鉴权：所有请求都从**账号池**取账号；池由三种来源填充——启动时自动导入本地凭据、管理页 IdC 登录、管理页「导入本机凭据」按钮。每个账号自带 `region` / `profileArn`，后台自动用 SSO-OIDC `CreateToken` 刷新保活。池为空时 `/v1/messages` 返回 **503**（提示去管理页登录/导入）。
+- 会话：有效 `x-claude-code-session-id` 同时驱动账号 rendezvous affinity 和进程内 Kiro `conversationId` UUID 映射；一次入站请求的所有物理发送复用同一个 ID。
 - 推理：向 `https://runtime.<region>.kiro.dev` 发送 `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`，解析其 `vnd.amazon.eventstream` 响应，再翻译回 Anthropic 的 SSE / JSON；`<region>` 取自被选中账号自身的记录。
 - 模型与 profile：通过 `https://management.<region>.kiro.dev` 的 `ListAvailableModels` / `ListAvailableProfiles` 获取。
 
@@ -366,7 +373,8 @@ VERSION=1.0.0 ./build.sh   # 打版本号进二进制
 main.go          CLI 入口（cobra）、参数、代理解析、启动
 httpclient.go    出站 HTTP 客户端（代理感知）
 token.go         令牌文件类型/解析（供导入用）
-selector.go      账号选择/轮询（round-robin + 冷却）、凭据抽象
+selector.go      额度分层选号、round-robin / session rendezvous affinity、lease 复核
+conversation_registry.go  Claude Code session → conversation UUID 内存映射与 TTL 清理
 eventstream.go   AWS vnd.amazon.eventstream 解码（基于 smithy-go）
 kiro.go          Kiro 运行时客户端、请求/响应类型、模型列表、账号额度（getUsageLimits）
 anthropic.go     Anthropic 类型、模型映射、请求翻译、SSE 组装

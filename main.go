@@ -298,6 +298,10 @@ func runServe(cfg *Config) error {
 	// cancelled.
 	go newDepletedProbe(srv, logger).Run(ctx)
 
+	// Expire inactive Claude Code session-to-conversation mappings. The registry
+	// is process-local and stops with the same service-lifetime context.
+	go srv.conversations.Run(ctx)
+
 	serveErr := make(chan error, 2)
 	go func() {
 		if err := httpServer.Serve(apiLn); err != nil && err != http.ErrServerClosed {

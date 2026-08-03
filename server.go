@@ -23,13 +23,14 @@ import (
 // and control-plane calls are served from the multi-account store; there is no
 // single primary account.
 type Server struct {
-	cfg       *Config
-	kiro      *KiroClient
-	accounts  *AccountStore    // multi-account credential store (the only account source)
-	login     *loginManager    // IdC sign-in flow driver
-	selector  *accountSelector // round-robin picker over the account store
-	logger    *slog.Logger     // per-request access log; nil disables it
-	warmupCtx context.Context  // service lifetime for detached cache warmups
+	cfg           *Config
+	kiro          *KiroClient
+	accounts      *AccountStore    // multi-account credential store (the only account source)
+	login         *loginManager    // IdC sign-in flow driver
+	selector      *accountSelector // round-robin picker over the account store
+	logger        *slog.Logger     // per-request access log; nil disables it
+	warmupCtx     context.Context  // service lifetime for detached cache warmups
+	conversations conversationRegistry
 
 	modelsMu    sync.Mutex
 	modelsCache map[string]modelsCacheEntry // per-account model list cache
@@ -214,6 +215,14 @@ const (
 	claudeCodeSessionIDHeader   = "x-claude-code-session-id"
 	maxClaudeCodeSessionIDBytes = 1024
 )
+
+func normalizeClaudeCodeSessionID(raw string) string {
+	sessionID := strings.TrimSpace(raw)
+	if sessionID == "" || len(sessionID) > maxClaudeCodeSessionIDBytes {
+		return ""
+	}
+	return sessionID
+}
 
 type ctxKeyAccountAffinity struct{}
 
@@ -1163,8 +1172,18 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, r, http.StatusUnauthorized, "authentication_error", "invalid api key")
 		return
 	}
-	if sessionID := strings.TrimSpace(r.Header.Get(claudeCodeSessionIDHeader)); sessionID != "" && len(sessionID) <= maxClaudeCodeSessionIDBytes {
+	sessionID := normalizeClaudeCodeSessionID(r.Header.Get(claudeCodeSessionIDHeader))
+	var (
+		conversationID      string
+		releaseConversation func()
+		conversationPinned  bool
+	)
+	if sessionID != "" {
 		r = r.WithContext(context.WithValue(r.Context(), ctxKeyAccountAffinity{}, sessionID))
+		conversationID, releaseConversation, conversationPinned = s.conversations.AcquireExisting(sessionID)
+		if conversationPinned {
+			defer releaseConversation()
+		}
 	}
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, 32*1024*1024))
@@ -1197,6 +1216,25 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeAnthropicError(w, r, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
+	}
+	if sessionID != "" {
+		if !conversationPinned {
+			// Image fetching treats cancellation as a recoverable omission so request
+			// translation can still complete after the client has gone away. Do not
+			// let that path allocate a fresh 24-hour session mapping.
+			if r.Context().Err() != nil {
+				noteCanceled(r.Context())
+				return
+			}
+			var acquireErr error
+			conversationID, releaseConversation, acquireErr = s.conversations.Acquire(sessionID)
+			if acquireErr != nil {
+				writeAnthropicError(w, r, http.StatusServiceUnavailable, "api_error", acquireErr.Error())
+				return
+			}
+			defer releaseConversation()
+		}
+		kreq.ConversationState.ConversationID = conversationID
 	}
 
 	// Effort, max output tokens, and the modelId itself are resolved per account
@@ -1283,6 +1321,12 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest, areq *anthro
 		return nil, errNoAccount
 	}
 
+	conversationID := kreq.ConversationState.ConversationID
+	if conversationID == "" {
+		conversationID = uuid.NewString()
+		kreq.ConversationState.ConversationID = conversationID
+	}
+
 	// Request-driven model fields are resolved per account (the chosen account's
 	// matched model carries its own effort/token schema), so pull them from areq
 	// up front.
@@ -1323,7 +1367,7 @@ func (s *Server) openStream(ctx context.Context, kreq *kiroRequest, areq *anthro
 	// valid on this account, the per-model request fields, the profileArn, and —
 	// if a prior turn stripped reasoning — a stripped history. It replaces kreq.
 	rebuild := func(arn string) error {
-		next, err := buildKiroRequestWithModel(s.cfg, areq, resolved)
+		next, err := buildKiroRequestWithModelAndConversationID(s.cfg, areq, resolved, conversationID)
 		if err != nil {
 			return err
 		}

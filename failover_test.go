@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -44,9 +45,10 @@ type fakeRuntime struct {
 	// modelsHook runs inside a model-list request before its response is written.
 	// Tests use it to mutate an account while model resolution is in flight.
 	modelsHook func(string)
-	// Recorded on each Send: the bearer token and the modelId that was sent.
-	sendTokens []string
-	sentModels []string
+	// Recorded on each Send: the bearer token, modelId, and conversationId.
+	sendTokens          []string
+	sentModels          []string
+	sentConversationIDs []string
 }
 
 func newFakeRuntime(t *testing.T, bad ...string) *fakeRuntime {
@@ -94,21 +96,26 @@ func newFakeRuntime(t *testing.T, bad ...string) *fakeRuntime {
 			return
 		}
 
-		// runtime endpoint: GenerateAssistantResponse — record the sent modelId.
-		if raw, err := io.ReadAll(r.Body); err == nil {
-			var body struct {
-				ConversationState struct {
-					CurrentMessage struct {
-						UserInputMessage struct {
-							ModelID string `json:"modelId"`
-						} `json:"userInputMessage"`
-					} `json:"currentMessage"`
-				} `json:"conversationState"`
-			}
-			if json.Unmarshal(raw, &body) == nil {
-				if mid := body.ConversationState.CurrentMessage.UserInputMessage.ModelID; mid != "" {
-					f.sendTokens = append(f.sendTokens, tok)
-					f.sentModels = append(f.sentModels, mid)
+		// runtime endpoint: GenerateAssistantResponse — record the sent modelId
+		// and conversationId.
+		if r.Header.Get("X-Amz-Target") == "AmazonCodeWhispererStreamingService.GenerateAssistantResponse" {
+			if raw, err := io.ReadAll(r.Body); err == nil {
+				var body struct {
+					ConversationState struct {
+						ConversationID string `json:"conversationId"`
+						CurrentMessage struct {
+							UserInputMessage struct {
+								ModelID string `json:"modelId"`
+							} `json:"userInputMessage"`
+						} `json:"currentMessage"`
+					} `json:"conversationState"`
+				}
+				if json.Unmarshal(raw, &body) == nil {
+					f.sentConversationIDs = append(f.sentConversationIDs, body.ConversationState.ConversationID)
+					if mid := body.ConversationState.CurrentMessage.UserInputMessage.ModelID; mid != "" {
+						f.sendTokens = append(f.sendTokens, tok)
+						f.sentModels = append(f.sentModels, mid)
+					}
 				}
 			}
 		}
@@ -185,6 +192,17 @@ func serverWithPool(t *testing.T, rt *fakeRuntime, accessTokens ...string) *Serv
 	return s
 }
 
+func requireSingleConversationID(t *testing.T, ids []string) string {
+	t.Helper()
+	require.NotEmpty(t, ids)
+	want := ids[0]
+	require.NoError(t, uuid.Validate(want))
+	for i, id := range ids[1:] {
+		assert.Equal(t, want, id, "send %d changed conversationId", i+1)
+	}
+	return want
+}
+
 func TestOpenStreamFailsOverToHealthyAccount(t *testing.T) {
 	// "good1" is bad upstream; "good2" succeeds.
 	rt := newFakeRuntime(t, "Bearer good1")
@@ -199,6 +217,7 @@ func TestOpenStreamFailsOverToHealthyAccount(t *testing.T) {
 	assert.Contains(t, rt.seen, "Bearer good1", "tried the failing account")
 	assert.Contains(t, rt.seen, "Bearer good2", "then the healthy one")
 	assert.Equal(t, "arn:x", kreq.ProfileArn)
+	requireSingleConversationID(t, rt.sentConversationIDs)
 }
 
 func TestOpenStreamPrefersBaseBeforeOverage(t *testing.T) {
@@ -250,10 +269,12 @@ func TestMessagesUsesClaudeCodeSessionAffinity(t *testing.T) {
 		const sessionID = "550e8400-e29b-41d4-a716-446655440000"
 		expected := requireLease(t, s.selector.pickFor(map[string]bool{}, sessionID)).creds.id
 
-		for i := 0; i < 3; i++ {
+		send(t, handler, "  "+sessionID+"  ")
+		for i := 0; i < 2; i++ {
 			send(t, handler, sessionID)
 		}
 		assert.Equal(t, []string{"Bearer " + expected, "Bearer " + expected, "Bearer " + expected}, rt.sendTokens)
+		requireSingleConversationID(t, rt.sentConversationIDs)
 	})
 
 	t.Run("maximum length session", func(t *testing.T) {
@@ -270,6 +291,22 @@ func TestMessagesUsesClaudeCodeSessionAffinity(t *testing.T) {
 		send(t, handler, sessionID)
 
 		assert.Equal(t, []string{"Bearer " + expected, "Bearer " + expected}, rt.sendTokens)
+		requireSingleConversationID(t, rt.sentConversationIDs)
+	})
+
+	t.Run("different sessions", func(t *testing.T) {
+		rt := newFakeRuntime(t)
+		rt.modelsFor["Bearer a"] = []kiroModelInfo{{ModelID: "gpt-5.6-sol"}}
+		s := serverWithPool(t, rt, "a")
+		handler := s.Handler()
+
+		send(t, handler, "session-a")
+		send(t, handler, "session-b")
+
+		require.Len(t, rt.sentConversationIDs, 2)
+		require.NoError(t, uuid.Validate(rt.sentConversationIDs[0]))
+		require.NoError(t, uuid.Validate(rt.sentConversationIDs[1]))
+		assert.NotEqual(t, rt.sentConversationIDs[0], rt.sentConversationIDs[1])
 	})
 
 	t.Run("oversized session falls back to round robin", func(t *testing.T) {
@@ -285,6 +322,10 @@ func TestMessagesUsesClaudeCodeSessionAffinity(t *testing.T) {
 		send(t, handler, sessionID)
 
 		assert.Equal(t, []string{"Bearer a", "Bearer b"}, rt.sendTokens)
+		require.Len(t, rt.sentConversationIDs, 2)
+		require.NoError(t, uuid.Validate(rt.sentConversationIDs[0]))
+		require.NoError(t, uuid.Validate(rt.sentConversationIDs[1]))
+		assert.NotEqual(t, rt.sentConversationIDs[0], rt.sentConversationIDs[1])
 	})
 
 	t.Run("missing or blank session", func(t *testing.T) {
@@ -303,7 +344,103 @@ func TestMessagesUsesClaudeCodeSessionAffinity(t *testing.T) {
 		send(t, handler, "")
 
 		assert.Equal(t, []string{"Bearer a", "Bearer b"}, rt.sendTokens)
+		require.Len(t, rt.sentConversationIDs, 2)
+		require.NoError(t, uuid.Validate(rt.sentConversationIDs[0]))
+		require.NoError(t, uuid.Validate(rt.sentConversationIDs[1]))
+		assert.NotEqual(t, rt.sentConversationIDs[0], rt.sentConversationIDs[1])
 	})
+}
+
+func TestMessagesPinsExistingConversationBeforeReadingBody(t *testing.T) {
+	rt := newFakeRuntime(t)
+	rt.modelsFor["Bearer a"] = []kiroModelInfo{{ModelID: "gpt-5.6-sol"}}
+	s := serverWithPool(t, rt, "a")
+	clock := &conversationTestClock{now: time.Date(2026, 8, 3, 0, 0, 0, 0, time.UTC)}
+	s.conversations.ttl = defaultConversationTTL
+	s.conversations.maxEntries = 8
+	s.conversations.now = clock.Now
+
+	const sessionID = "session-active-during-request-preparation"
+	first, release, err := s.conversations.Acquire(sessionID)
+	require.NoError(t, err)
+	release()
+	clock.Advance(defaultConversationTTL - time.Second)
+
+	bodyReader, bodyWriter := io.Pipe()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	req.Body = bodyReader
+	req.Header.Set(claudeCodeSessionIDHeader, sessionID)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		s.Handler().ServeHTTP(rec, req)
+		close(done)
+	}()
+
+	pinned := assert.Eventually(t, func() bool {
+		s.conversations.mu.Lock()
+		defer s.conversations.mu.Unlock()
+		for _, entry := range s.conversations.entries {
+			if entry.inFlight > 0 {
+				return true
+			}
+		}
+		return false
+	}, time.Second, time.Millisecond, "existing session should be pinned before body reading")
+	if !pinned {
+		_ = bodyWriter.Close()
+		<-done
+		return
+	}
+
+	clock.Advance(defaultConversationTTL + time.Second)
+	s.conversations.Sweep(clock.Now())
+	assert.Equal(t, 1, conversationRegistrySize(&s.conversations), "active request must survive a TTL sweep")
+
+	const body = `{"model":"gpt-4o","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+	_, err = io.WriteString(bodyWriter, body)
+	require.NoError(t, err)
+	require.NoError(t, bodyWriter.Close())
+	<-done
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.Equal(t, first, requireSingleConversationID(t, rt.sentConversationIDs))
+}
+
+func TestMessagesCanceledRequestDoesNotCreateConversation(t *testing.T) {
+	rt := newFakeRuntime(t)
+	s := serverWithPool(t, rt, "a")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	const body = `{"model":"gpt-4o","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)).WithContext(ctx)
+	req.Header.Set(claudeCodeSessionIDHeader, "canceled-new-session")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	assert.Zero(t, conversationRegistrySize(&s.conversations))
+	assert.Empty(t, rt.sentConversationIDs, "canceled request must not reach the runtime")
+}
+
+func TestMessagesConversationRegistryFullReturns503(t *testing.T) {
+	rt := newFakeRuntime(t)
+	rt.modelsFor["Bearer a"] = []kiroModelInfo{{ModelID: "gpt-5.6-sol"}}
+	s := serverWithPool(t, rt, "a")
+	s.conversations.maxEntries = 1
+	_, release, err := s.conversations.Acquire("occupied-session")
+	require.NoError(t, err)
+	release()
+
+	body := `{"model":"gpt-4o","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req.Header.Set(claudeCodeSessionIDHeader, "new-session")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Contains(t, rec.Body.String(), errConversationRegistryFull.Error())
+	assert.Empty(t, rt.sentConversationIDs, "a rejected new session must not reach the runtime")
 }
 
 func TestOpenStreamSessionAffinityFailsOverDeterministically(t *testing.T) {
@@ -320,6 +457,7 @@ func TestOpenStreamSessionAffinityFailsOverDeterministically(t *testing.T) {
 	require.NotNil(t, stream)
 	stream.Close()
 	assert.Equal(t, []string{"Bearer " + primary, "Bearer " + secondary}, rt.seen)
+	requireSingleConversationID(t, rt.sentConversationIDs)
 }
 
 func TestOpenStreamSessionAffinityModelSkipsDoNotConsumeSendBudget(t *testing.T) {
@@ -816,6 +954,7 @@ func TestOpenStreamCapsPhysicalRuntimeSendsAcrossAuthRetries(t *testing.T) {
 		"Bearer d", "Bearer refreshed",
 	}
 	assert.Equal(t, expected, rt.seen, "post-refresh sends must consume the same physical-send budget")
+	requireSingleConversationID(t, rt.sentConversationIDs)
 }
 
 func TestOpenStreamRevalidatesLeaseBeforeAuthRetry(t *testing.T) {
@@ -1080,6 +1219,7 @@ func TestOpenStreamInvalidModelFailsOver(t *testing.T) {
 
 	assert.Contains(t, rt.sendTokens, "Bearer stale")
 	assert.Contains(t, rt.sendTokens, "Bearer good")
+	requireSingleConversationID(t, rt.sentConversationIDs)
 	s.modelsMu.Lock()
 	_, present := s.modelsCache["stale"]
 	s.modelsMu.Unlock()

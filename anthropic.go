@@ -452,17 +452,21 @@ func compareIntSlices(a, b []int) int {
 
 // buildKiroRequest converts an Anthropic Messages request into the Kiro
 // GenerateAssistantResponse payload, resolving the model via the static mapModel
-// fallback. openStream instead calls buildKiroRequestWithModel with an id
-// resolved against the chosen account's actual model list.
+// fallback and assigning a fresh conversation UUID.
 func buildKiroRequest(cfg *Config, areq *anthropicRequest) (*kiroRequest, error) {
-	return buildKiroRequestWithModel(cfg, areq, mapModel(areq.Model))
+	return buildKiroRequestWithModelAndConversationID(cfg, areq, mapModel(areq.Model), uuid.NewString())
 }
 
-// buildKiroRequestWithModel is the per-account build entrypoint: modelID is the
-// concrete Kiro modelId stamped on every user turn (current message, prefill
-// placeholder, system preamble, and each history user turn). Assistant turns
-// carry no modelId.
+// buildKiroRequestWithModel is the per-account build entrypoint for callers that
+// do not already own a request-level conversation ID.
 func buildKiroRequestWithModel(cfg *Config, areq *anthropicRequest, modelID string) (*kiroRequest, error) {
+	return buildKiroRequestWithModelAndConversationID(cfg, areq, modelID, uuid.NewString())
+}
+
+// buildKiroRequestWithModelAndConversationID stamps the concrete Kiro modelId on
+// every user turn and preserves the caller-supplied conversation ID. Assistant
+// turns carry no modelId.
+func buildKiroRequestWithModelAndConversationID(cfg *Config, areq *anthropicRequest, modelID, conversationID string) (*kiroRequest, error) {
 	if len(areq.Messages) == 0 {
 		return nil, fmt.Errorf("messages must not be empty")
 	}
@@ -535,7 +539,7 @@ func buildKiroRequestWithModel(cfg *Config, areq *anthropicRequest, modelID stri
 	return &kiroRequest{
 		ConversationState: kiroConversationState{
 			ChatTriggerType: "MANUAL",
-			ConversationID:  uuid.NewString(),
+			ConversationID:  conversationID,
 			CurrentMessage:  current,
 			History:         history,
 		},

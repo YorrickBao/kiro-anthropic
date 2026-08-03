@@ -136,6 +136,15 @@ func historyLengths(requests []kiroRequest) []int {
 	return lengths
 }
 
+func assertSingleRequestConversationID(t *testing.T, requests []kiroRequest) {
+	t.Helper()
+	ids := make([]string, len(requests))
+	for i := range requests {
+		ids[i] = requests[i].ConversationState.ConversationID
+	}
+	requireSingleConversationID(t, ids)
+}
+
 func requestHasReasoning(request kiroRequest) bool {
 	return hasReasoningInHistory(&request)
 }
@@ -167,6 +176,7 @@ func TestOpenStreamPromptTooLongRebuildKeepsAccountModel(t *testing.T) {
 
 	requests, tokens := runtime.snapshot()
 	require.Len(t, requests, 2, "prompt-too-long then success")
+	assertSingleRequestConversationID(t, requests)
 	assertSingleAccount(t, tokens)
 	for i, r := range requests {
 		assert.Equal(t, "claude-opus-4.8", r.ConversationState.CurrentMessage.UserInputMessage.ModelID,
@@ -194,6 +204,7 @@ func TestOpenStreamTrimsOneTurnUntilSuccess(t *testing.T) {
 
 	requests, tokens := runtime.snapshot()
 	require.Len(t, requests, 3)
+	assertSingleRequestConversationID(t, requests)
 	assert.Equal(t, []int{6, 4, 2}, historyLengths(requests), "one oldest turn should be removed per retry")
 	assertSingleAccount(t, tokens)
 	require.Len(t, areq.Messages, 3)
@@ -305,6 +316,7 @@ func TestOpenStreamKeepsReasoningStrippedAfterPromptTrim(t *testing.T) {
 
 	requests, tokens := runtime.snapshot()
 	require.Len(t, requests, 3)
+	assertSingleRequestConversationID(t, requests)
 	assert.True(t, requestHasReasoning(requests[0]), "initial request should carry reasoning")
 	assert.False(t, requestHasReasoning(requests[1]), "signature retry should strip reasoning")
 	assert.False(t, requestHasReasoning(requests[2]), "trim rebuild must not reintroduce reasoning")
@@ -347,6 +359,7 @@ func TestOpenStreamKeepsReasoningStrippedAfterLeaseSupersession(t *testing.T) {
 
 	requests, tokens := runtime.snapshot()
 	require.Len(t, requests, 2, "the stripped retry on selected is gated before physical send")
+	assertSingleRequestConversationID(t, requests)
 	assert.Equal(t, []string{"Bearer selected", "Bearer recovered"}, tokens)
 	assert.True(t, requestHasReasoning(requests[0]), "initial selected request carries reasoning")
 	assert.False(t, requestHasReasoning(requests[1]), "repicked account must keep rejected reasoning stripped")
@@ -459,6 +472,7 @@ func TestOpenStreamRecoversFirstFrameThinkingSignature(t *testing.T) {
 
 	requests, tokens := runtime.snapshot()
 	require.Len(t, requests, 2)
+	assertSingleRequestConversationID(t, requests)
 	assert.True(t, requestHasReasoning(requests[0]), "first send carries reasoning")
 	assert.False(t, requestHasReasoning(requests[1]), "retry must strip reasoning")
 	assertSingleAccount(t, tokens)

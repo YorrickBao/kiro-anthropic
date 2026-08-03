@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -49,6 +50,38 @@ func TestLoopbackOnlyMiddleware(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusForbidden {
 		t.Fatalf("remote peer: got %d, want 403", rr.Code)
+	}
+}
+
+func TestAdminPageDocumentsAccountSelection(t *testing.T) {
+	h := (&Server{}).AdminHandler()
+	req := httptest.NewRequest(http.MethodGet, "http://localhost:27890/", nil)
+	req.RemoteAddr = "127.0.0.1:40000"
+	req.Host = "localhost:27890"
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("admin page: got status %d, want 200", rr.Code)
+	}
+	if got := rr.Header().Get("Content-Type"); got != "text/html; charset=utf-8" {
+		t.Fatalf("admin page Content-Type = %q, want text/html; charset=utf-8", got)
+	}
+	body := rr.Body.String()
+	for _, marker := range []string{
+		`id="account-selection-guide"`,
+		"Base / 可透支 Unknown",
+		"已知 Overage",
+		"x-claude-code-session-id",
+		"rendezvous hash",
+		"round-robin",
+		"发送前复核",
+		"每 30 分钟",
+	} {
+		if !strings.Contains(body, marker) {
+			t.Errorf("admin page is missing account-selection marker %q", marker)
+		}
 	}
 }
 

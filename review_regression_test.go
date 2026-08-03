@@ -362,7 +362,7 @@ func TestProbeAndAuthoritativeWaitersPreserveAuthoritativeSemantics(t *testing.T
 	if err := <-probeErr; err != nil {
 		assert.ErrorIs(t, err, errUsageObservationStale)
 	}
-	assert.Equal(t, quotaAvailable, selectorQuota(t, s.selector, "acc"))
+	assert.Equal(t, quotaOverage, selectorQuota(t, s.selector, "acc"))
 	assert.NotNil(t, s.selector.pick(map[string]bool{}).lease)
 	assert.GreaterOrEqual(t, calls.Load(), int32(1))
 	assert.LessOrEqual(t, calls.Load(), int32(2))

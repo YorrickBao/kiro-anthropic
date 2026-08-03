@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="data:," />
 <title>kiro-anthropic · admin</title>
 <style>
   :root {
@@ -28,7 +29,7 @@
   header .spacer { flex: 1; }
   header .updated { color: var(--muted); font-size: 12px; }
   .wrap { padding: 20px 24px; max-width: 1100px; margin: 0 auto; display: grid; gap: 18px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+  .card { min-width: 0; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
   .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 14px; }
   .kv { display: grid; grid-template-columns: 150px 1fr; gap: 6px 14px; }
   .kv dt { color: var(--muted); }
@@ -51,6 +52,178 @@
   .err-box { color: var(--err); }
   a { color: var(--accent); }
   .muted { color: var(--muted); }
+  .selection-guide {
+    --selection-surface: #11151c;
+    --selection-panel: #0e1218;
+    --selection-copy: #adb5c5;
+    --selection-track: #3b4556;
+    margin: 0 0 14px;
+    background: var(--selection-surface);
+    border: 1px solid #2a303c;
+    border-radius: 9px;
+    overflow: hidden;
+  }
+  .selection-guide > summary {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) 20px;
+    align-items: center;
+    gap: 14px;
+    min-height: 52px;
+    padding: 10px 14px;
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+  }
+  .selection-guide > summary::-webkit-details-marker { display: none; }
+  .selection-guide > summary:hover { background: rgba(110,168,254,.045); }
+  .selection-guide > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .selection-guide[open] > summary { border-bottom: 1px solid var(--line); }
+  .selection-heading { display: flex; flex-direction: column; min-width: max-content; line-height: 1.15; }
+  .selection-kicker,
+  .selection-eyebrow,
+  .selection-tier-index,
+  .selection-step-head::before,
+  .selection-step-meta,
+  .selection-note-label {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    font-variant-numeric: tabular-nums;
+  }
+  .selection-kicker { color: var(--accent); font-size: 9px; font-weight: 700; letter-spacing: .13em; }
+  .selection-title { margin-top: 3px; color: var(--fg); font-size: 14px; font-weight: 650; letter-spacing: .01em; }
+  .selection-summary {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 7px;
+    min-width: 0;
+    color: var(--muted);
+    font: 10.5px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  }
+  .selection-summary .preferred { color: #70e49a; }
+  .selection-summary .overage { color: #f6c85f; }
+  .selection-summary .fallback { color: #99a2b5; }
+  .selection-summary .separator { color: var(--selection-track); }
+  .selection-disclosure { position: relative; width: 20px; height: 20px; border: 1px solid var(--line); border-radius: 5px; }
+  .selection-disclosure::before {
+    content: "";
+    position: absolute;
+    top: 5px;
+    left: 6px;
+    width: 5px;
+    height: 5px;
+    border-right: 1.5px solid var(--muted);
+    border-bottom: 1.5px solid var(--muted);
+    transform: rotate(45deg);
+    transition: transform .16s ease, top .16s ease;
+  }
+  .selection-guide[open] .selection-disclosure::before { top: 8px; transform: rotate(225deg); }
+  .selection-guide-body {
+    padding: 16px;
+    background: linear-gradient(180deg, rgba(110,168,254,.025), transparent 150px);
+  }
+  .selection-section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
+  .selection-eyebrow { color: var(--muted); font-size: 9.5px; font-weight: 700; letter-spacing: .12em; }
+  .selection-principle { color: var(--selection-copy); font-size: 11.5px; }
+  .selection-route {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 28px minmax(0, 1fr) 28px minmax(0, 1fr);
+    align-items: stretch;
+  }
+  .selection-tier {
+    --tier-color: var(--muted);
+    min-width: 0;
+    padding: 11px 12px 12px;
+    background: rgba(14,18,24,.82);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--tier-color);
+    border-radius: 6px;
+  }
+  .selection-tier.preferred { --tier-color: var(--ok); }
+  .selection-tier.overage { --tier-color: var(--warn); }
+  .selection-tier.fallback { --tier-color: #707a8e; }
+  .selection-tier-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+  .selection-tier strong { color: var(--fg); font-size: 12.5px; font-weight: 650; }
+  .selection-tier-index { color: var(--tier-color); font-size: 9.5px; letter-spacing: .08em; }
+  .selection-tier-key {
+    display: block;
+    margin: 7px 0 4px;
+    color: var(--tier-color);
+    font: 600 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    overflow-wrap: anywhere;
+  }
+  .selection-tier p { margin: 0; color: var(--selection-copy); font-size: 11.5px; line-height: 1.5; }
+  .selection-route-link { position: relative; display: grid; place-items: center; min-width: 0; color: var(--selection-track); }
+  .selection-route-link::before { content: ""; position: absolute; right: 0; left: 0; height: 1px; background: var(--selection-track); }
+  .selection-route-link span {
+    position: relative;
+    z-index: 1;
+    padding: 0 4px;
+    background: var(--selection-surface);
+    font: 12px/1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }
+  .selection-process { margin-top: 18px; }
+  .selection-steps {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    margin: 9px 0 0;
+    padding: 0;
+    list-style: none;
+    counter-reset: selection-step;
+    overflow: hidden;
+    background: rgba(14,18,24,.48);
+    border: 1px solid var(--line);
+    border-radius: 7px;
+  }
+  .selection-steps li { counter-increment: selection-step; min-width: 0; padding: 12px 14px 13px; }
+  .selection-steps li:nth-child(odd) { border-right: 1px solid var(--line); }
+  .selection-steps li:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+  .selection-step-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 5px; }
+  .selection-step-head::before { content: counter(selection-step, decimal-leading-zero); color: var(--accent); font-size: 9.5px; letter-spacing: .08em; }
+  .selection-step-title { color: var(--fg); font-size: 12.5px; font-weight: 650; }
+  .selection-step-meta { margin-left: auto; color: var(--muted); font-size: 9px; letter-spacing: .03em; white-space: nowrap; }
+  .selection-steps p { margin: 0; color: var(--selection-copy); font-size: 11.5px; line-height: 1.6; }
+  .selection-guide code {
+    color: #d7dce5;
+    background: #090c10;
+    border: 1px solid #282f3b;
+    border-radius: 3px;
+    padding: 0 3px;
+    font: 10.5px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    overflow-wrap: anywhere;
+  }
+  .selection-reconcile {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 10px;
+    margin-top: 12px;
+    padding: 10px 12px;
+    background: rgba(110,168,254,.045);
+    border-left: 2px solid var(--accent);
+  }
+  .selection-reconcile-label { color: var(--accent); font: 700 9.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; letter-spacing: .08em; white-space: nowrap; }
+  .selection-reconcile p { margin: 0; color: var(--selection-copy); font-size: 11.5px; line-height: 1.55; }
+  .selection-note { display: flex; gap: 9px; margin: 10px 0 0; padding-top: 9px; color: var(--muted); font-size: 10.5px; border-top: 1px dashed #29303b; }
+  .selection-note-label { color: #7f899c; font-size: 9px; font-weight: 700; letter-spacing: .08em; white-space: nowrap; }
+  @media (max-width: 680px) {
+    .selection-guide > summary { grid-template-columns: minmax(0, 1fr) 20px; gap: 6px 12px; padding: 10px 12px; }
+    .selection-heading { grid-column: 1; grid-row: 1; }
+    .selection-disclosure { grid-column: 2; grid-row: 1; }
+    .selection-summary { grid-column: 1 / -1; grid-row: 2; justify-content: flex-start; gap: 5px; flex-wrap: wrap; }
+    .selection-guide-body { padding: 12px; }
+    .selection-section-heading { align-items: flex-start; flex-direction: column; gap: 2px; }
+    .selection-route { grid-template-columns: minmax(0, 1fr); }
+    .selection-route-link { place-items: center start; height: 22px; padding-left: 10px; }
+    .selection-route-link::before { top: -2px; bottom: -2px; left: 16px; width: 1px; height: auto; }
+    .selection-route-link span { transform: rotate(90deg); }
+    .selection-process { margin-top: 15px; }
+    .selection-steps { grid-template-columns: minmax(0, 1fr); }
+    .selection-steps li, .selection-steps li:nth-child(-n+2) { border-right: 0; border-bottom: 1px solid var(--line); }
+    .selection-steps li:last-child { border-bottom: 0; }
+    .selection-step-head { flex-wrap: wrap; }
+    .selection-step-meta { white-space: normal; }
+    .selection-reconcile { grid-template-columns: minmax(0, 1fr); gap: 3px; }
+  }
+  @media (prefers-reduced-motion: reduce) { .selection-disclosure::before { transition: none; } }
   .login-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
   .login-form .field { display: flex; flex-direction: column; gap: 4px; }
   .login-form label { color: var(--muted); font-size: 12px; }
@@ -165,7 +338,7 @@
     </div>
     <p class="muted" style="font-size:12px;margin-top:10px">
       登录会在浏览器打开 AWS 授权页，完成后凭据保存在服务端。远程部署请通过 SSH 隧道访问本页
-      (<code>ssh -L 27890:localhost:27890 &lt;server&gt;</code>)，以便授权回跳到本机。所有账号参与请求负载均衡。
+      (<code>ssh -L 27890:localhost:27890 &lt;server&gt;</code>)，以便授权回跳到本机。启用且可用的账号会按下方选号规则参与请求路由。
     </p>
   </section>
   <section class="card">
@@ -176,6 +349,78 @@
       <button id="refresh-all-btn" class="ghost" type="button" style="text-transform:none;font-size:12px">刷新全部令牌</button>
       <input id="import-file-input" type="file" accept="application/json,.json" style="display:none" />
     </h2>
+    <details class="selection-guide" id="account-selection-guide">
+      <summary>
+        <span class="selection-heading">
+          <span class="selection-kicker">ROUTING POLICY</span>
+          <span class="selection-title">选号逻辑</span>
+        </span>
+        <span class="selection-summary" aria-label="优先级：Base / 可透支 Unknown，已知 Overage，冷却兜底">
+          <span class="preferred">Base / 可透支 Unknown</span>
+          <span class="separator" aria-hidden="true">→</span>
+          <span class="overage">已知 Overage</span>
+          <span class="separator" aria-hidden="true">→</span>
+          <span class="fallback">冷却兜底</span>
+        </span>
+        <span class="selection-disclosure" aria-hidden="true"></span>
+      </summary>
+      <div class="selection-guide-body">
+        <div class="selection-section-heading">
+          <span class="selection-eyebrow">PRIORITY RAIL · 01 → 03</span>
+          <span class="selection-principle">先比较额度层级，再在同层内选号</span>
+        </div>
+        <div class="selection-route" role="list" aria-label="选号优先级">
+          <div class="selection-tier preferred" role="listitem">
+            <div class="selection-tier-top"><strong>首选层</strong><span class="selection-tier-index">01</span></div>
+            <span class="selection-tier-key">Base / 可透支 Unknown</span>
+            <p>Base 有余额；或账户允许 Overage 且状态仍为 Unknown。</p>
+          </div>
+          <div class="selection-route-link" aria-hidden="true"><span>→</span></div>
+          <div class="selection-tier overage" role="listitem">
+            <div class="selection-tier-top"><strong>次选层</strong><span class="selection-tier-index">02</span></div>
+            <span class="selection-tier-key">已知 Overage</span>
+            <p>仅当没有就绪的首选账户时进入。</p>
+          </div>
+          <div class="selection-route-link" aria-hidden="true"><span>→</span></div>
+          <div class="selection-tier fallback" role="listitem">
+            <div class="selection-tier-top"><strong>最后兜底</strong><span class="selection-tier-index">03</span></div>
+            <span class="selection-tier-key">60s cooldown</span>
+            <p>无就绪候选时，才考虑仍可路由的冷却账户。</p>
+          </div>
+        </div>
+
+        <div class="selection-process">
+          <div class="selection-section-heading">
+            <span class="selection-eyebrow">REQUEST PATH · 01 → 04</span>
+            <span class="selection-principle">从候选门禁到发送前复核</span>
+          </div>
+          <ol class="selection-steps">
+            <li>
+              <div class="selection-step-head"><span class="selection-step-title">过滤候选</span><span class="selection-step-meta">FILTER + MODEL</span></div>
+              <p>排除已禁用、凭据不可用、已尝试和已确认 <code>Depleted</code> 的账户。关闭 Overage 的 <code>Unknown</code> 必须刷新 Usage 并确认 Base 余额为正；不支持目标模型则在发送前跳过。</p>
+            </li>
+            <li>
+              <div class="selection-step-head"><span class="selection-step-title">同层选号</span><span class="selection-step-meta">AFFINITY / RR</span></div>
+              <p>有效 <code>x-claude-code-session-id</code> 使用 rendezvous hash；否则按 round-robin 轮询。额度层级始终优先于会话亲和。</p>
+            </li>
+            <li>
+              <div class="selection-step-head"><span class="selection-step-title">失败转移</span><span class="selection-step-meta">FAILOVER · 60S</span></div>
+              <p>账户级失败会让当前账户进入 60 秒冷却并继续选号；首选账户不可用或失败后，仍可降级到 Overage。</p>
+            </li>
+            <li>
+              <div class="selection-step-head"><span class="selection-step-title">发送前复核</span><span class="selection-step-meta">≤8 SENDS · ≤8 REPICKS</span></div>
+              <p>发送前重查已选账户和号池：硬失效不发送；更高层就绪则重选；未发送的低层仍作后备。每个请求最多 8 次物理发送和 8 次发送前换号；达到防抖上限后，只允许仍有效的已选账户发送。</p>
+            </li>
+          </ol>
+        </div>
+
+        <div class="selection-reconcile">
+          <span class="selection-reconcile-label">USAGE SYNC</span>
+          <p><strong>额度校准：</strong>服务启动后立即执行，随后每 30 分钟刷新相关账户的 Usage。严格 Unknown / Depleted 使用保守探测；允许 Overage 的可路由账户使用权威观察；Depleted 只有观察到正 Base 余额才恢复。</p>
+        </div>
+        <p class="selection-note"><span class="selection-note-label">STATIC RULE</span><span>这是静态规则说明，不代表某个请求的实时选号轨迹，也不改变账号卡片展示的原始 Usage 数据。</span></p>
+      </div>
+    </details>
     <span id="refresh-all-msg" class="muted" style="font-size:12px"></span>
     <div class="status-bar" id="acct-status"><span class="spinner"></span><span id="acct-status-text">正在加载账号额度…</span></div>
     <div class="accounts" id="accounts"></div>

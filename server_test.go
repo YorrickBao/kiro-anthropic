@@ -159,7 +159,7 @@ func TestUsageObservedAndReadOnlyWaitersShareFetch(t *testing.T) {
 	require.NoError(t, <-readErr)
 	require.NoError(t, <-observedErr)
 	assert.Equal(t, int32(1), calls.Load())
-	assert.Equal(t, quotaAvailable, selectorQuota(t, s.selector, "acc"))
+	assert.Equal(t, quotaBase, selectorQuota(t, s.selector, "acc"))
 }
 
 func TestUsageWaiterCancellationDoesNotCancelSharedFetch(t *testing.T) {
@@ -191,7 +191,7 @@ func TestUsageWaiterCancellationDoesNotCancelSharedFetch(t *testing.T) {
 	close(release)
 	require.NoError(t, <-otherErr)
 	assert.Equal(t, int32(1), calls.Load())
-	assert.Equal(t, quotaAvailable, selectorQuota(t, s.selector, "acc"))
+	assert.Equal(t, quotaBase, selectorQuota(t, s.selector, "acc"))
 }
 
 func TestUsageFetchRetriesAfterAccountRevisionChanges(t *testing.T) {
@@ -237,7 +237,7 @@ func TestUsageFetchRetriesAfterAccountRevisionChanges(t *testing.T) {
 	require.True(t, exists)
 	assert.Equal(t, rt.Revision, cached.revision)
 	assert.Equal(t, float64(50), cached.usage.Credit.Remaining)
-	assert.Equal(t, quotaAvailable, selectorQuota(t, s.selector, "acc"))
+	assert.Equal(t, quotaBase, selectorQuota(t, s.selector, "acc"))
 }
 
 func TestAggregateModelUsageRejectsMixedAccountRevisions(t *testing.T) {
@@ -309,6 +309,24 @@ func TestUsageFetchRetriesWithNewGeneration(t *testing.T) {
 	assert.Equal(t, int32(2), calls.Load())
 	assert.Equal(t, quotaDepleted, selectorQuota(t, s.selector, "acc"))
 	assert.True(t, s.selector.isReactivelyDepleted("acc", lease.revision))
+}
+
+func TestUsageTargetStampMismatchDoesNotFetchOrRetry(t *testing.T) {
+	var calls atomic.Int32
+	s := newUsageBackedServer(t, false, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		writeUsageResponse(w, 50)
+	})
+	targets := s.selector.reconcileTargets()
+	require.Len(t, targets, 1)
+	lease := requireLease(t, s.selector.pick(map[string]bool{}))
+	s.selector.recordFailure(lease)
+
+	_, err := s.refreshUsageTarget(context.Background(), targets[0], nil)
+
+	require.ErrorIs(t, err, errUsageObservationStale)
+	assert.Equal(t, int32(0), calls.Load())
+	assert.Equal(t, quotaUnknown, selectorQuota(t, s.selector, "acc"))
 }
 
 func TestUsageCacheIgnoresOldRevision(t *testing.T) {

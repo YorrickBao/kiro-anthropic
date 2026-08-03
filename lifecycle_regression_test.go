@@ -82,7 +82,7 @@ func TestSelectorPolicyRevisionPreservesReactiveDepletion(t *testing.T) {
 	assert.Nil(t, s.pick(map[string]bool{}).lease)
 	overageRevision := runtimeRevision(t, s.store, "acc")
 	assert.True(t, s.isReactivelyDepleted("acc", overageRevision))
-	assert.Contains(t, s.probeIDs(), "acc")
+	assert.Contains(t, reconciliationTargetIDs(s), "acc")
 }
 
 func TestSelectorCredentialLifecycleResetsReactiveDepletion(t *testing.T) {

@@ -141,7 +141,8 @@ type quotaEligibility uint8
 
 const (
 	quotaUnknown quotaEligibility = iota
-	quotaAvailable
+	quotaBase
+	quotaOverage
 	quotaDepleted
 )
 
@@ -182,6 +183,31 @@ type usageStamp struct {
 	generation     uint64
 	overageEnabled bool
 }
+
+// usageReconcileTarget pins both the selector state and the observation rules
+// chosen by the periodic reconciler. A queued target is discarded if its stamp
+// changes before or during the fetch.
+type usageReconcileTarget struct {
+	stamp      usageStamp
+	source     usageObservationSource
+	priorQuota quotaEligibility
+}
+
+type leaseSendStatus uint8
+
+const (
+	leaseSendInvalid leaseSendStatus = iota
+	leaseSendReady
+	leaseSendSuperseded
+)
+
+type leaseRoutingClass uint8
+
+const (
+	leaseRoutingFallback leaseRoutingClass = iota
+	leaseRoutingOverage
+	leaseRoutingPreferred
+)
 
 // pickResult either carries a directly routable lease or identifies one strict
 // unknown account that must receive a fresh usage check before selection retries.
@@ -233,11 +259,11 @@ func (s *accountSelector) stateForRuntimeLocked(rt accountRuntime) *selectorAcco
 	}
 	if st != nil && st.lifecycle == rt.Lifecycle {
 		// Disabled/overage policy mutations invalidate leases via Revision while
-		// retaining sticky depletion and cooldown for the same credentials. A
-		// quotaAvailable state may have depended only on overage, so a strict
-		// snapshot must prove positive base credit again before it can route.
+		// retaining sticky depletion and cooldown for the same credentials. Preserve
+		// the existing conservative policy behavior: a routable state must prove
+		// positive base credit again after overage is disabled.
 		st.revision = rt.Revision
-		if !rt.Account.OverageEnabled && st.quota == quotaAvailable {
+		if !rt.Account.OverageEnabled && (st.quota == quotaBase || st.quota == quotaOverage) {
 			st.quota = quotaUnknown
 		}
 		st.generation = s.nextGenerationLocked()
@@ -278,11 +304,12 @@ func (s *accountSelector) pick(tried map[string]bool) pickResult {
 // pickFor chooses the next immediately eligible account. With affinityKey it
 // uses rendezvous hashing so one client session returns to the same eligible
 // account without storing session state. Without affinityKey it retains the
-// existing round-robin order. Strict no-overage accounts are selectable only
-// in quotaAvailable. If no account can be routed immediately, verifyID names a
-// strict quotaUnknown account that should receive a fresh GetUsage before
-// selection retries. Only cooldown participates in the all-skipped fallback;
-// depleted accounts are never fallback candidates.
+// existing round-robin order. Ready base/unknown accounts are preferred over
+// ready accounts known to be using overage. Strict no-overage accounts are
+// selectable only in quotaBase. If no account can be routed immediately,
+// verifyID names a strict quotaUnknown account that should receive a fresh
+// GetUsage before selection retries. Only cooldown participates in the
+// all-skipped fallback; depleted accounts are never fallback candidates.
 func (s *accountSelector) pickFor(tried map[string]bool, affinityKey string) pickResult {
 	list := s.store.RuntimeList()
 	if len(list) == 0 {
@@ -295,8 +322,12 @@ func (s *accountSelector) pickFor(tried map[string]bool, affinityKey string) pic
 
 	affinity := affinityKey != ""
 	now := time.Now()
-	var selected *accountLease
-	var selectedScore uint64
+	var preferred *accountLease
+	var preferredScore uint64
+	var overage *accountLease
+	var overageScore uint64
+	var overagePos int
+	var overageKnownDepleted bool
 	var verifyID string
 	var verifyScore uint64
 	knownDepleted := false
@@ -359,17 +390,40 @@ func (s *accountSelector) pickFor(tried map[string]bool, affinityKey string) pic
 			continue
 		}
 
+		isOverage := st.quota == quotaOverage
 		if !affinity {
-			s.index = (s.index + i + 1) % n
+			if isOverage {
+				if overage == nil {
+					overage = lease
+					overagePos = pos
+					overageKnownDepleted = knownDepleted
+				}
+				continue
+			}
+			s.index = (pos + 1) % n
 			return pickResult{lease: lease, knownDepleted: knownDepleted}
 		}
+
 		score := accountAffinityScore(affinityKey, a.ID)
-		if selected == nil || score > selectedScore || (score == selectedScore && a.ID < selected.creds.id) {
-			selected, selectedScore = lease, score
+		if isOverage {
+			if overage == nil || score > overageScore || (score == overageScore && a.ID < overage.creds.id) {
+				overage, overageScore = lease, score
+			}
+			continue
+		}
+		if preferred == nil || score > preferredScore || (score == preferredScore && a.ID < preferred.creds.id) {
+			preferred, preferredScore = lease, score
 		}
 	}
-	if selected != nil {
-		return pickResult{lease: selected, knownDepleted: knownDepleted}
+	if preferred != nil {
+		return pickResult{lease: preferred, knownDepleted: knownDepleted}
+	}
+	if overage != nil {
+		if !affinity {
+			s.index = (overagePos + 1) % n
+			knownDepleted = overageKnownDepleted
+		}
+		return pickResult{lease: overage, knownDepleted: knownDepleted}
 	}
 	if verifyID != "" {
 		return pickResult{verifyID: verifyID, knownDepleted: knownDepleted}
@@ -452,28 +506,75 @@ func (s *accountSelector) listAll() []*accountCreds {
 	return out
 }
 
-// revalidate checks a lease immediately before a runtime send. It linearizes
-// account mutation at AccountStore.mu without holding either lock across I/O.
-func (s *accountSelector) revalidate(lease *accountLease) bool {
+// validateForSend checks a lease immediately before a runtime send. It
+// linearizes account mutation at AccountStore.mu without holding either lock
+// across I/O. A ready account in a strictly higher routing class may supersede
+// an otherwise valid lease; the scan never advances the round-robin cursor.
+func (s *accountSelector) validateForSend(lease *accountLease, tried map[string]bool) leaseSendStatus {
 	if lease == nil || lease.creds == nil {
-		return false
+		return leaseSendInvalid
 	}
-	return s.store.withRuntime(lease.creds.id, func(rt accountRuntime) bool {
-		if rt.Revision != lease.revision || !accountUsable(rt.Account) {
-			return false
-		}
+	status := leaseSendInvalid
+	s.store.withRuntimeList(func(list []accountRuntime) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		s.pruneStatesLocked(list)
+
+		var selected *accountRuntime
+		for i := range list {
+			if list[i].Account.ID == lease.creds.id {
+				selected = &list[i]
+				break
+			}
+		}
+		if selected == nil || selected.Revision != lease.revision || !accountUsable(selected.Account) {
+			return
+		}
 		st := s.states[lease.creds.id]
 		if st == nil || st.revision != lease.revision || st.generation != lease.generation {
-			return false
+			return
 		}
-		if st.quota == quotaDepleted || (!rt.Account.OverageEnabled && st.quota != quotaAvailable) {
-			return false
+		if st.quota == quotaDepleted || (!selected.Account.OverageEnabled && st.quota != quotaBase) {
+			return
 		}
-		cooling := time.Now().Before(st.cooldownUntil)
-		return cooling == lease.fallback
+		now := time.Now()
+		cooling := now.Before(st.cooldownUntil)
+		if cooling != lease.fallback {
+			return
+		}
+
+		selectedClass := leaseRoutingPreferred
+		switch {
+		case lease.fallback:
+			selectedClass = leaseRoutingFallback
+		case st.quota == quotaOverage:
+			selectedClass = leaseRoutingOverage
+		}
+		status = leaseSendReady
+
+		for _, rt := range list {
+			a := rt.Account
+			if a.ID == lease.creds.id || tried[a.ID] || !accountUsable(a) {
+				continue
+			}
+			candidate := s.stateForRuntimeLocked(rt)
+			if candidate == nil || candidate.quota == quotaDepleted || now.Before(candidate.cooldownUntil) {
+				continue
+			}
+			if candidate.quota == quotaUnknown && !a.OverageEnabled {
+				continue
+			}
+			candidateClass := leaseRoutingPreferred
+			if candidate.quota == quotaOverage {
+				candidateClass = leaseRoutingOverage
+			}
+			if candidateClass > selectedClass {
+				status = leaseSendSuperseded
+				return
+			}
+		}
 	})
+	return status
 }
 
 // recordSuccess clears cooldown only when the exact selected generation remains
@@ -568,9 +669,10 @@ func depletedDeadline(u *kiroUsage, now time.Time) time.Time {
 }
 
 // applyUsage applies a GetUsage result only if the account revision and selector
-// generation still match the pre-fetch stamp. Positive base Remaining is the
-// sole way to admit or recover a strict account and the sole way to clear a
-// reactive depletion. Overage-enabled unknown accounts remain availability-first.
+// generation still match the pre-fetch stamp. Positive base Remaining assigns
+// the preferred base tier and is the sole way to admit or recover a strict
+// account or clear a reactive depletion. Overage-enabled unknown accounts remain
+// availability-first until an authoritative observation classifies them.
 func (s *accountSelector) applyUsage(stamp usageStamp, u *kiroUsage, source usageObservationSource) bool {
 	if stamp.id == "" || u == nil || u.Credit == nil {
 		return false
@@ -588,8 +690,8 @@ func (s *accountSelector) applyUsage(stamp usageStamp, u *kiroUsage, source usag
 
 		now := time.Now()
 		if u.Credit.Remaining > 0 {
-			changed := st.quota != quotaAvailable || st.reactive || !st.retryAfter.IsZero()
-			st.quota = quotaAvailable
+			changed := st.quota != quotaBase || st.reactive || !st.retryAfter.IsZero()
+			st.quota = quotaBase
 			st.reactive = false
 			st.retryAfter = time.Time{}
 			if changed {
@@ -603,8 +705,8 @@ func (s *accountSelector) applyUsage(stamp usageStamp, u *kiroUsage, source usag
 		// transition because upstream may clamp usage at the base limit.
 		if !st.reactive && source != usageObservationProbe && stamp.overageEnabled &&
 			overageActive(u) && overageRemaining(u.Credit) > 0 {
-			changed := st.quota != quotaAvailable || !st.retryAfter.IsZero()
-			st.quota = quotaAvailable
+			changed := st.quota != quotaOverage || !st.retryAfter.IsZero()
+			st.quota = quotaOverage
 			st.retryAfter = time.Time{}
 			if changed {
 				s.mutateLocked(st)
@@ -623,29 +725,49 @@ func (s *accountSelector) applyUsage(stamp usageStamp, u *kiroUsage, source usag
 	})
 }
 
-// probeIDs returns strict unknown accounts plus every depleted account. Disabled
-// or unusable accounts are omitted. Probe observations remain conservative: a
-// base-zero overage snapshot cannot unlock an account, reactive or otherwise.
-func (s *accountSelector) probeIDs() []string {
-	list := s.store.RuntimeList()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.pruneStatesLocked(list)
-	ids := make([]string, 0, len(list))
-	for _, rt := range list {
-		a := rt.Account
-		if !accountUsable(a) {
-			continue
+// reconcileTargets returns the accounts whose quota class must be refreshed.
+// Depleted and strict unknown accounts use conservative Probe semantics;
+// routable overage-enabled accounts use authoritative observations so periodic
+// reconciliation can detect both base exhaustion and base-credit recovery.
+func (s *accountSelector) reconcileTargets() []usageReconcileTarget {
+	var targets []usageReconcileTarget
+	s.store.withRuntimeList(func(list []accountRuntime) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.pruneStatesLocked(list)
+		targets = make([]usageReconcileTarget, 0, len(list))
+		for _, rt := range list {
+			a := rt.Account
+			if !accountUsable(a) {
+				continue
+			}
+			st := s.stateForRuntimeLocked(rt)
+			if st == nil {
+				continue
+			}
+
+			var source usageObservationSource
+			switch {
+			case st.quota == quotaDepleted:
+				source = usageObservationProbe
+			case !a.OverageEnabled && st.quota == quotaUnknown:
+				source = usageObservationProbe
+			case a.OverageEnabled && st.quota != quotaDepleted:
+				source = usageObservationAuthoritative
+			default:
+				continue
+			}
+			targets = append(targets, usageReconcileTarget{
+				stamp: usageStamp{
+					id: a.ID, revision: rt.Revision, generation: st.generation,
+					overageEnabled: a.OverageEnabled,
+				},
+				source:     source,
+				priorQuota: st.quota,
+			})
 		}
-		st := s.stateForRuntimeLocked(rt)
-		if st == nil {
-			continue
-		}
-		if (!a.OverageEnabled && st.quota == quotaUnknown) || st.quota == quotaDepleted {
-			ids = append(ids, a.ID)
-		}
-	}
-	return ids
+	})
+	return targets
 }
 
 // forget discards selector state after account removal. Old observations remain

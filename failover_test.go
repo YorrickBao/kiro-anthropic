@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -197,6 +199,32 @@ func TestOpenStreamFailsOverToHealthyAccount(t *testing.T) {
 	assert.Contains(t, rt.seen, "Bearer good1", "tried the failing account")
 	assert.Contains(t, rt.seen, "Bearer good2", "then the healthy one")
 	assert.Equal(t, "arn:x", kreq.ProfileArn)
+}
+
+func TestOpenStreamPrefersBaseBeforeOverage(t *testing.T) {
+	rt := newFakeRuntime(t)
+	s := serverWithPool(t, rt, "overage", "base")
+	require.True(t, applyFreshUsage(t, s.selector, "overage", testOverageUsage(), usageObservationAuthoritative))
+	require.True(t, applyFreshUsage(t, s.selector, "base", testBaseUsage(), usageObservationAuthoritative))
+
+	stream, err := s.openStream(context.Background(), &kiroRequest{}, nil)
+	require.NoError(t, err)
+	require.NotNil(t, stream)
+	stream.Close()
+	assert.Equal(t, []string{"Bearer base"}, rt.seen)
+}
+
+func TestOpenStreamFallsBackToOverageAfterBaseFailure(t *testing.T) {
+	rt := newFakeRuntime(t, "Bearer base")
+	s := serverWithPool(t, rt, "overage", "base")
+	require.True(t, applyFreshUsage(t, s.selector, "overage", testOverageUsage(), usageObservationAuthoritative))
+	require.True(t, applyFreshUsage(t, s.selector, "base", testBaseUsage(), usageObservationAuthoritative))
+
+	stream, err := s.openStream(context.Background(), &kiroRequest{}, nil)
+	require.NoError(t, err)
+	require.NotNil(t, stream)
+	stream.Close()
+	assert.Equal(t, []string{"Bearer base", "Bearer overage"}, rt.seen)
 }
 
 func TestMessagesUsesClaudeCodeSessionAffinity(t *testing.T) {
@@ -888,6 +916,129 @@ func TestOpenStreamRevalidatesLeaseAfterModelLookup(t *testing.T) {
 			assert.Empty(t, rt.sendTokens, "stale lease must not reach runtime")
 		})
 	}
+}
+
+func TestOpenStreamRepicksWhenBaseEntersOverageBeforeSend(t *testing.T) {
+	rt := newFakeRuntime(t)
+	for _, id := range []string{"base", "overage"} {
+		rt.modelsFor["Bearer "+id] = []kiroModelInfo{{ModelID: "gpt-5.6-sol"}}
+	}
+	s := serverWithPool(t, rt, "overage", "base")
+	require.True(t, applyFreshUsage(t, s.selector, "overage", testOverageUsage(), usageObservationAuthoritative))
+	require.True(t, applyFreshUsage(t, s.selector, "base", testBaseUsage(), usageObservationAuthoritative))
+
+	mutated := make(chan bool, 1)
+	var once sync.Once
+	rt.modelsHook = func(token string) {
+		if token != "Bearer base" {
+			return
+		}
+		once.Do(func() {
+			_, stamp, ok := s.selector.usageTarget("base")
+			mutated <- ok && s.selector.applyUsage(stamp, testOverageUsage(), usageObservationAuthoritative)
+		})
+	}
+
+	stream, err := s.openStream(context.Background(), &kiroRequest{}, msgAreq("gpt-5.6-sol"))
+	require.NoError(t, err)
+	require.NotNil(t, stream)
+	stream.Close()
+	assert.True(t, <-mutated)
+	assert.Equal(t, []string{"Bearer overage"}, rt.sendTokens,
+		"the stale base lease must be repicked before runtime traffic")
+}
+
+func TestOpenStreamRepicksWhenDifferentAccountBecomesBaseBeforeSend(t *testing.T) {
+	rt := newFakeRuntime(t)
+	for _, id := range []string{"selected", "recovered"} {
+		rt.modelsFor["Bearer "+id] = []kiroModelInfo{{ModelID: "gpt-5.6-sol"}}
+	}
+	s := serverWithPool(t, rt, "selected", "recovered")
+	for _, id := range []string{"selected", "recovered"} {
+		require.True(t, applyFreshUsage(t, s.selector, id, testOverageUsage(), usageObservationAuthoritative))
+	}
+
+	mutated := make(chan bool, 1)
+	var once sync.Once
+	rt.modelsHook = func(token string) {
+		if token != "Bearer selected" {
+			return
+		}
+		once.Do(func() {
+			_, stamp, ok := s.selector.usageTarget("recovered")
+			mutated <- ok && s.selector.applyUsage(stamp, testBaseUsage(), usageObservationAuthoritative)
+		})
+	}
+
+	stream, err := s.openStream(context.Background(), &kiroRequest{}, msgAreq("gpt-5.6-sol"))
+	require.NoError(t, err)
+	require.NotNil(t, stream)
+	stream.Close()
+	assert.True(t, <-mutated)
+	assert.Equal(t, []string{"Bearer recovered"}, rt.sendTokens,
+		"a ready Base account must supersede the previously selected Overage lease")
+}
+
+func TestOpenStreamRequeuedOverageRemainsFallbackAfterPreferredModelSkip(t *testing.T) {
+	rt := newFakeRuntime(t)
+	rt.modelsFor["Bearer selected"] = []kiroModelInfo{{ModelID: "gpt-5.6-sol"}}
+	rt.modelsFor["Bearer preferred"] = []kiroModelInfo{{ModelID: "claude-opus-4.8"}}
+	s := serverWithPool(t, rt, "selected", "preferred")
+	for _, id := range []string{"selected", "preferred"} {
+		require.True(t, applyFreshUsage(t, s.selector, id, testOverageUsage(), usageObservationAuthoritative))
+	}
+
+	mutated := make(chan bool, 1)
+	var once sync.Once
+	rt.modelsHook = func(token string) {
+		if token != "Bearer selected" {
+			return
+		}
+		once.Do(func() {
+			_, stamp, ok := s.selector.usageTarget("preferred")
+			mutated <- ok && s.selector.applyUsage(stamp, testBaseUsage(), usageObservationAuthoritative)
+		})
+	}
+
+	stream, err := s.openStream(context.Background(), &kiroRequest{}, msgAreq("gpt-5.6-sol"))
+	require.NoError(t, err)
+	require.NotNil(t, stream)
+	stream.Close()
+	assert.True(t, <-mutated)
+	assert.Equal(t, []string{"Bearer selected"}, rt.sendTokens,
+		"the unsent Overage lease must remain available after the preferred account is model-skipped")
+}
+
+func TestOpenStreamSoftSupersessionCapAvoidsLivelock(t *testing.T) {
+	rt := newFakeRuntime(t)
+	rt.modelsFor["Bearer selected"] = []kiroModelInfo{{ModelID: "gpt-5.6-sol"}}
+	s := serverWithPool(t, rt, "selected")
+	require.True(t, applyFreshUsage(t, s.selector, "selected", testOverageUsage(), usageObservationAuthoritative))
+
+	candidate := 0
+	rt.modelsHook = func(token string) {
+		if token == "Bearer selected" {
+			id := fmt.Sprintf("preferred-%d", candidate)
+			candidate++
+			rt.modelsFor["Bearer "+id] = []kiroModelInfo{{ModelID: "claude-opus-4.8"}}
+			_ = s.accounts.Add(&StoredAccount{
+				ID: id, AccessToken: id, ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+				ProfileArn: "arn:" + id, OverageEnabled: true, CreatedAt: fmt.Sprintf("%03d", candidate),
+			})
+			return
+		}
+		if strings.HasPrefix(token, "Bearer preferred-") {
+			s.invalidateModels("selected")
+		}
+	}
+
+	stream, err := s.openStream(context.Background(), &kiroRequest{}, msgAreq("gpt-5.6-sol"))
+	require.NoError(t, err)
+	require.NotNil(t, stream)
+	stream.Close()
+	assert.Equal(t, maxPreSendLeaseRefreshes+1, candidate)
+	assert.Equal(t, []string{"Bearer selected"}, rt.sendTokens,
+		"a hard-valid Overage lease may send once the soft-supersession churn cap is reached")
 }
 
 func TestOpenStreamRepicksFallbackLeaseAfterCooldownExpires(t *testing.T) {

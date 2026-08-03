@@ -77,6 +77,8 @@ type usageRequestMode struct {
 	observeSelector  bool
 	source           usageObservationSource
 	expectedRevision uint64
+	expectedStamp    *usageStamp
+	fetchLimiter     chan struct{}
 }
 
 // Control-plane fetches are bounded independently of any one waiter. A
@@ -534,10 +536,14 @@ func (s *Server) accountUsage(ctx context.Context, id string, mode usageRequestM
 		return nil, fmt.Errorf("account store is not configured")
 	}
 	allowCache := mode.allowCache
+	pinned := mode.expectedStamp != nil
 	for attempt := 0; ; attempt++ {
 		creds, stamp, ok := s.selector.usageTarget(id)
 		if !ok {
 			return nil, fmt.Errorf("account not found: %s", id)
+		}
+		if pinned && stamp != *mode.expectedStamp {
+			return nil, fmt.Errorf("%w: %s", errUsageObservationStale, id)
 		}
 		if mode.expectedRevision != 0 && stamp.revision != mode.expectedRevision {
 			return nil, fmt.Errorf("%w: %s", errAccountRevisionChanged, id)
@@ -564,6 +570,23 @@ func (s *Server) accountUsage(ctx context.Context, id string, mode usageRequestM
 		ch := s.usageGroup.DoChan(key, func() (any, error) {
 			fetchCtx, cancel := s.controlPlaneContext(usageFetchTimeout)
 			defer cancel()
+			if mode.fetchLimiter != nil {
+				select {
+				case mode.fetchLimiter <- struct{}{}:
+					defer func() { <-mode.fetchLimiter }()
+				case <-fetchCtx.Done():
+					return nil, fetchCtx.Err()
+				}
+			}
+			// A periodic target can wait behind other live fetches after its caller
+			// times out. Recheck the full stamp at the actual I/O boundary so queued
+			// work never fetches under an obsolete observation source.
+			if pinned {
+				_, currentStamp, current := s.selector.usageTarget(id)
+				if !current || currentStamp != *mode.expectedStamp {
+					return nil, fmt.Errorf("%w: %s", errUsageObservationStale, id)
+				}
+			}
 			u, err := s.kiro.GetUsage(fetchCtx, creds)
 			if err != nil {
 				return nil, err
@@ -596,13 +619,18 @@ func (s *Server) accountUsage(ctx context.Context, id string, mode usageRequestM
 			return nil, ctx.Err()
 		case shared := <-ch:
 			if shared.Err != nil {
+				if !pinned && mode.source == usageObservationAuthoritative &&
+					errors.Is(shared.Err, errUsageObservationStale) && attempt < maxUsageObservationRetries {
+					allowCache = false
+					continue
+				}
 				return nil, shared.Err
 			}
 			result = shared.Val.(usageFetchResult)
 		}
 		rt, current := s.accounts.Runtime(id)
 		if !current || rt.Revision != result.stamp.revision {
-			if mode.expectedRevision == 0 && mode.source == usageObservationAuthoritative && attempt < maxUsageObservationRetries {
+			if !pinned && mode.expectedRevision == 0 && mode.source == usageObservationAuthoritative && attempt < maxUsageObservationRetries {
 				allowCache = false
 				continue
 			}
@@ -615,7 +643,7 @@ func (s *Server) accountUsage(ctx context.Context, id string, mode usageRequestM
 			return result.usage, nil
 		}
 		if mode.observeSelector && !s.selector.applyUsage(result.stamp, result.usage, mode.source) {
-			if mode.source == usageObservationAuthoritative && attempt < maxUsageObservationRetries {
+			if !pinned && mode.source == usageObservationAuthoritative && attempt < maxUsageObservationRetries {
 				allowCache = false
 				continue
 			}
@@ -649,6 +677,16 @@ func (s *Server) ensureUsageReadOnly(ctx context.Context, creds *accountCreds) (
 func (s *Server) refreshUsage(ctx context.Context, id string, source usageObservationSource) (*kiroUsage, error) {
 	return s.accountUsage(ctx, id, usageRequestMode{
 		observeSelector: true, source: source,
+	})
+}
+
+// refreshUsageTarget forces a fresh observation using the source selected by
+// the periodic reconciler. The full stamp prevents queued work from fetching or
+// applying data after account policy or selector state has changed.
+func (s *Server) refreshUsageTarget(ctx context.Context, target usageReconcileTarget, fetchLimiter chan struct{}) (*kiroUsage, error) {
+	return s.accountUsage(ctx, target.stamp.id, usageRequestMode{
+		observeSelector: true, source: target.source, expectedStamp: &target.stamp,
+		fetchLimiter: fetchLimiter,
 	})
 }
 
@@ -1224,6 +1262,7 @@ var errModelUnavailable = fmt.Errorf("requested model is not available on any ac
 
 var (
 	errLeaseInvalid             = errors.New("account lease changed before runtime send")
+	errLeaseSuperseded          = errors.New("higher-priority account became ready before runtime send")
 	errRuntimeAttemptsExhausted = errors.New("runtime send attempt limit reached")
 )
 
@@ -1394,9 +1433,15 @@ dispatch:
 					// Model/profile resolution, credential refresh, and earlier sends can
 					// block while account policy or quota changes. Linearize immediately
 					// before every physical runtime request, including auth and thinking
-					// retries.
-					if !s.selector.revalidate(lease) {
+					// retries. At the churn cap, a hard-valid soft-superseded lease may
+					// send to avoid livelock; hard-invalid leases never do.
+					switch s.selector.validateForSend(lease, tried) {
+					case leaseSendInvalid:
 						return errLeaseInvalid
+					case leaseSendSuperseded:
+						if preSendLeaseRefreshes < maxPreSendLeaseRefreshes {
+							return errLeaseSuperseded
+						}
 					}
 					if runtimeAttempts >= maxAccountAttempts {
 						return errRuntimeAttemptsExhausted
@@ -1416,6 +1461,24 @@ dispatch:
 				}
 				return stream, err
 			})
+			// withReasoningRetry mutates kreq before its second physical send. Record
+			// that state before any lease-gate branch repicks and rebuilds the request.
+			if hadReasoning && !hasReasoningInHistory(kreq) {
+				reasoningStripped = true
+			}
+			if errors.Is(sendErr, errLeaseSuperseded) {
+				if lastSendErr != nil {
+					lastErr = lastSendErr
+				}
+				// Preserve an unsent lower-tier account as a fallback if the newly
+				// preferred account cannot serve the model or fails before sending.
+				if runtimeAttempts == leaseRuntimeAttempts {
+					requeueUnsent(creds.id)
+				} else {
+					preSendLeaseRefreshes++
+				}
+				continue dispatch
+			}
 			if errors.Is(sendErr, errLeaseInvalid) ||
 				(errors.Is(sendErr, errAccountRevisionChanged) && runtimeAttempts == leaseRuntimeAttempts) {
 				if lastSendErr != nil {
@@ -1435,9 +1498,6 @@ dispatch:
 					lastErr = lastSendErr
 				}
 				break dispatch
-			}
-			if hadReasoning && !hasReasoningInHistory(kreq) {
-				reasoningStripped = true
 			}
 
 			if sendErr == nil {

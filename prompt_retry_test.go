@@ -312,6 +312,46 @@ func TestOpenStreamKeepsReasoningStrippedAfterPromptTrim(t *testing.T) {
 	assertSingleAccount(t, tokens)
 }
 
+func TestOpenStreamKeepsReasoningStrippedAfterLeaseSupersession(t *testing.T) {
+	var s *Server
+	promoted := make(chan bool, 1)
+	runtime := newScriptedPromptRuntime(t, func(call int, _ *kiroRequest, _ *http.Request) scriptedRuntimeReply {
+		if call == 1 {
+			_, stamp, ok := s.selector.usageTarget("recovered")
+			promoted <- ok && s.selector.applyUsage(stamp, testBaseUsage(), usageObservationAuthoritative)
+			return scriptedRuntimeReply{
+				status: http.StatusBadRequest,
+				body:   []byte(`{"message":"bad signature","reason":"THINKING_SIGNATURE_INVALID"}`),
+			}
+		}
+		return successfulStreamReply()
+	})
+	s = serverWithPool(t, runtime.fake, "selected", "recovered")
+	for _, id := range []string{"selected", "recovered"} {
+		require.True(t, applyFreshUsage(t, s.selector, id, testOverageUsage(), usageObservationAuthoritative))
+	}
+	areq := &anthropicRequest{Model: "claude-opus-4.8", Messages: []anthropicMessage{
+		{Role: "user", Content: json.RawMessage(`"reasoned question"`)},
+		{Role: "assistant", Content: json.RawMessage(`[
+			{"type":"thinking","thinking":"secret","signature":"SIG=="},
+			{"type":"text","text":"reasoned answer"}
+		]`)},
+		{Role: "user", Content: json.RawMessage(`"current"`)},
+	}}
+
+	stream, err := s.openStream(context.Background(), buildPromptRetryRequest(t, s, areq), areq)
+	require.NoError(t, err)
+	require.NotNil(t, stream)
+	require.NoError(t, stream.Close())
+	require.True(t, <-promoted)
+
+	requests, tokens := runtime.snapshot()
+	require.Len(t, requests, 2, "the stripped retry on selected is gated before physical send")
+	assert.Equal(t, []string{"Bearer selected", "Bearer recovered"}, tokens)
+	assert.True(t, requestHasReasoning(requests[0]), "initial selected request carries reasoning")
+	assert.False(t, requestHasReasoning(requests[1]), "repicked account must keep rejected reasoning stripped")
+}
+
 func TestOpenStreamCancellationDuringPromptRetryDoesNotBurnAccounts(t *testing.T) {
 	secondStarted := make(chan struct{}, 1)
 	runtime := newScriptedPromptRuntime(t, func(call int, _ *kiroRequest, request *http.Request) scriptedRuntimeReply {

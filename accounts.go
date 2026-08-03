@@ -584,6 +584,10 @@ func (s *AccountStore) Runtime(id string) (accountRuntime, bool) {
 func (s *AccountStore) RuntimeList() []accountRuntime {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.runtimeListLocked()
+}
+
+func (s *AccountStore) runtimeListLocked() []accountRuntime {
 	out := make([]accountRuntime, 0, len(s.accounts))
 	for id, a := range s.accounts {
 		out = append(out, accountRuntime{
@@ -594,6 +598,14 @@ func (s *AccountStore) RuntimeList() []accountRuntime {
 		return out[i].Account.CreatedAt < out[j].Account.CreatedAt
 	})
 	return out
+}
+
+// withRuntimeList invokes fn with an atomic ordered runtime snapshot while
+// holding the account-store lock. fn must not perform I/O or call AccountStore.
+func (s *AccountStore) withRuntimeList(fn func([]accountRuntime)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fn(s.runtimeListLocked())
 }
 
 // withRuntime invokes fn while holding the account-store lock. It is used for

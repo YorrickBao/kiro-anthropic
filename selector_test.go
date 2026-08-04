@@ -834,6 +834,30 @@ func selectorQuota(t *testing.T, s *accountSelector, id string) quotaEligibility
 	return st.quota
 }
 
+func TestDepletedDeadline(t *testing.T) {
+	now := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	fallback := now.Add(depletedFallbackTTL)
+	future := now.Add(2 * time.Hour)
+
+	tests := []struct {
+		name  string
+		usage *kiroUsage
+		want  time.Time
+	}{
+		{name: "nil usage", want: fallback},
+		{name: "empty reset", usage: &kiroUsage{}, want: fallback},
+		{name: "malformed reset", usage: &kiroUsage{ResetAt: "not-a-timestamp"}, want: fallback},
+		{name: "past reset", usage: &kiroUsage{ResetAt: now.Add(-time.Second).Format(time.RFC3339)}, want: fallback},
+		{name: "equal reset", usage: &kiroUsage{ResetAt: now.Format(time.RFC3339)}, want: fallback},
+		{name: "future reset", usage: &kiroUsage{ResetAt: future.Format(time.RFC3339)}, want: future},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, depletedDeadline(tc.usage, now))
+		})
+	}
+}
+
 func TestIsAccountFailure(t *testing.T) {
 	assert.False(t, isAccountFailure(nil))
 	assert.True(t, isAccountFailure(assertAnError{}))

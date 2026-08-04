@@ -120,6 +120,13 @@ func TestImageFetcherSSRFGuardBlocksLoopback(t *testing.T) {
 	}
 }
 
+func TestGuardImageHostBlocksLocalhost(t *testing.T) {
+	err := guardImageHost(context.Background(), "localhost")
+	if err == nil || !strings.Contains(err.Error(), "blocked image host") {
+		t.Fatalf("guardImageHost(localhost) = %v, want resolved loopback rejection", err)
+	}
+}
+
 func TestGuardedRedirectPolicy(t *testing.T) {
 	f := newImageFetcher(http.DefaultClient) // allowPrivate == false
 	check := f.doWithGuardedRedirects().CheckRedirect

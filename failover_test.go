@@ -192,6 +192,81 @@ func serverWithPool(t *testing.T, rt *fakeRuntime, accessTokens ...string) *Serv
 	return s
 }
 
+func TestMessagesMapsLockedUpstreamError(t *testing.T) {
+	runtimeCalls := make(chan struct{}, maxAccountAttempts)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch target := r.Header.Get("X-Amz-Target"); target {
+		case "KiroControlPlaneBearerService.ListAvailableModels":
+			writeJSON(w, http.StatusOK, map[string]any{
+				"models": []kiroModelInfo{{ModelID: "claude-sonnet-5"}},
+			})
+		case "AmazonCodeWhispererStreamingService.GenerateAssistantResponse":
+			runtimeCalls <- struct{}{}
+			writeJSON(w, http.StatusLocked, map[string]any{"message": "account locked"})
+		default:
+			t.Errorf("unexpected upstream target %q", target)
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"message": "unexpected target"})
+		}
+	}))
+	defer upstream.Close()
+
+	s := serverWithPool(t, &fakeRuntime{srv: upstream}, "acc")
+	body := `{"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusLocked, rec.Code, rec.Body.String())
+	var got struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, "error", got.Type)
+	assert.Equal(t, "api_error", got.Error.Type)
+	assert.Contains(t, got.Error.Message, "account locked")
+	assert.Equal(t, 1, len(runtimeCalls), "locked account should be sent once")
+}
+
+func TestHandleModelsFallback(t *testing.T) {
+	const apiKey = "test-api-key"
+	s := NewServer(&Config{APIKey: apiKey}, http.DefaultClient)
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("x-api-key", apiKey)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var got struct {
+		Data []struct {
+			Type        string `json:"type"`
+			ID          string `json:"id"`
+			DisplayName string `json:"display_name"`
+			CreatedAt   string `json:"created_at"`
+		} `json:"data"`
+		HasMore *bool  `json:"has_more"`
+		FirstID string `json:"first_id"`
+		LastID  string `json:"last_id"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	require.Len(t, got.Data, len(fallbackModels))
+	require.NotNil(t, got.HasMore, "has_more must be present")
+	assert.False(t, *got.HasMore)
+	assert.Equal(t, fallbackModels[0], got.FirstID)
+	assert.Equal(t, fallbackModels[len(fallbackModels)-1], got.LastID)
+	for i, wantID := range fallbackModels {
+		item := got.Data[i]
+		assert.Equal(t, "model", item.Type)
+		assert.Equal(t, wantID, item.ID)
+		assert.Equal(t, wantID, item.DisplayName)
+		_, err := time.Parse(time.RFC3339, item.CreatedAt)
+		assert.NoErrorf(t, err, "created_at for %s", wantID)
+	}
+}
+
 func requireSingleConversationID(t *testing.T, ids []string) string {
 	t.Helper()
 	require.NotEmpty(t, ids)

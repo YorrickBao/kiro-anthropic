@@ -876,6 +876,8 @@ func TestMapUpstreamError(t *testing.T) {
 		{403, 403, "permission_error"},
 		{429, 429, "rate_limit_error"},
 		{400, 400, "invalid_request_error"},
+		{http.StatusPaymentRequired, http.StatusPaymentRequired, "api_error"},
+		{http.StatusLocked, http.StatusLocked, "api_error"},
 		{500, http.StatusBadGateway, "api_error"},
 	}
 	for _, c := range cases {

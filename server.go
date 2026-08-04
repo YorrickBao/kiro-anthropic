@@ -156,7 +156,7 @@ var fallbackModels = []string{
 func NewServer(cfg *Config, client *http.Client) *Server {
 	return &Server{
 		cfg:         cfg,
-		kiro:        NewKiroClient(cfg, client),
+		kiro:        NewKiroClient(client),
 		login:       newLoginManager(client),
 		warmupCtx:   context.Background(),
 		modelsCache: map[string]modelsCacheEntry{},

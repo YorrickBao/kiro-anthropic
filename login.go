@@ -307,7 +307,7 @@ func (m *loginManager) completeLogin(ctx context.Context, state, code string) (*
 // email can be resolved. The returned account has a fresh id; the caller is
 // responsible for dedup and persistence.
 func importLocalCredentials(ctx context.Context, client *http.Client, tokenFile string) (*StoredAccount, error) {
-	tok, _, err := loadToken(tokenFile)
+	tok, err := loadToken(tokenFile)
 	if err != nil {
 		return nil, fmt.Errorf("read token file: %w", err)
 	}

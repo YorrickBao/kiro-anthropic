@@ -346,7 +346,7 @@ func TestDepletedProbeRecoversPositiveUsage(t *testing.T) {
 	newDepletedProbe(s, nil).scan(context.Background())
 
 	assert.Equal(t, quotaBase, selectorQuota(t, s.selector, "acc"))
-	lease := requireLease(t, s.selector.pick(map[string]bool{}))
+	lease := requireLease(t, s.selector.pickFor(map[string]bool{}, ""))
 	assert.Equal(t, "acc", lease.creds.id)
 }
 
@@ -363,7 +363,7 @@ func TestDepletedProbeRetainsZeroAndErrorTargets(t *testing.T) {
 	assert.Equal(t, quotaDepleted, selectorQuota(t, s.selector, "zero"))
 	assert.Equal(t, quotaUnknown, selectorQuota(t, s.selector, "error"))
 	assert.ElementsMatch(t, []string{"zero", "error"}, reconciliationTargetIDs(s.selector))
-	picked := s.selector.pick(map[string]bool{})
+	picked := s.selector.pickFor(map[string]bool{}, "")
 	assert.Nil(t, picked.lease)
 }
 
@@ -371,8 +371,8 @@ func TestDepletedProbeRecoversStickyReactiveTarget(t *testing.T) {
 	s := newProbeTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		writeUsageResponse(w, 50)
 	}, "acc")
-	require.NoError(t, s.accounts.SetOverageEnabled("acc", true))
-	lease := requireLease(t, s.selector.pick(map[string]bool{}))
+	require.NoError(t, discardChanged(s.accounts.SetOverageEnabledChanged("acc", true)))
+	lease := requireLease(t, s.selector.pickFor(map[string]bool{}, ""))
 	s.selector.recordDepleted(lease)
 	require.Contains(t, reconciliationTargetIDs(s.selector), "acc")
 
@@ -385,7 +385,7 @@ func TestDepletedProbeRecoversNonReactiveOverageTarget(t *testing.T) {
 	s := newProbeTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		writeUsageResponse(w, 50)
 	}, "acc")
-	require.NoError(t, s.accounts.SetOverageEnabled("acc", true))
+	require.NoError(t, discardChanged(s.accounts.SetOverageEnabledChanged("acc", true)))
 	assert.True(t, applyFreshUsage(t, s.selector, "acc", &kiroUsage{
 		OverageStatus: "DISABLED",
 		Credit:        &kiroCreditUsage{Remaining: 0},
@@ -397,7 +397,7 @@ func TestDepletedProbeRecoversNonReactiveOverageTarget(t *testing.T) {
 
 	newDepletedProbe(s, nil).scan(context.Background())
 	assert.Equal(t, quotaBase, selectorQuota(t, s.selector, "acc"))
-	assert.NotNil(t, s.selector.pick(map[string]bool{}).lease)
+	assert.NotNil(t, s.selector.pickFor(map[string]bool{}, "").lease)
 }
 
 func TestDepletedProbeReclassifiesOverageEnabledUnknown(t *testing.T) {
@@ -406,7 +406,7 @@ func TestDepletedProbeReclassifiesOverageEnabledUnknown(t *testing.T) {
 		calls.Add(1)
 		writeOverageUsageResponse(w)
 	}, "acc")
-	require.NoError(t, s.accounts.SetOverageEnabled("acc", true))
+	require.NoError(t, discardChanged(s.accounts.SetOverageEnabledChanged("acc", true)))
 
 	newDepletedProbe(s, nil).scan(context.Background())
 
@@ -420,7 +420,7 @@ func TestDepletedProbeReclassifiesBaseAsOverageAndBypassesCache(t *testing.T) {
 		calls.Add(1)
 		writeOverageUsageResponse(w)
 	}, "acc")
-	require.NoError(t, s.accounts.SetOverageEnabled("acc", true))
+	require.NoError(t, discardChanged(s.accounts.SetOverageEnabledChanged("acc", true)))
 	require.True(t, applyFreshUsage(t, s.selector, "acc", testBaseUsage(), usageObservationAuthoritative))
 	revision := runtimeRevision(t, s.accounts, "acc")
 	s.usageMu.Lock()
@@ -442,7 +442,7 @@ func TestDepletedProbeReclassifiesOverageAsBase(t *testing.T) {
 		calls.Add(1)
 		writeUsageResponse(w, 50)
 	}, "acc")
-	require.NoError(t, s.accounts.SetOverageEnabled("acc", true))
+	require.NoError(t, discardChanged(s.accounts.SetOverageEnabledChanged("acc", true)))
 	require.True(t, applyFreshUsage(t, s.selector, "acc", testOverageUsage(), usageObservationAuthoritative))
 
 	newDepletedProbe(s, nil).scan(context.Background())
@@ -457,8 +457,8 @@ func TestDepletedProbeKeepsReactiveDepletionStickyOnBaseZeroOverage(t *testing.T
 		calls.Add(1)
 		writeOverageUsageResponse(w)
 	}, "acc")
-	require.NoError(t, s.accounts.SetOverageEnabled("acc", true))
-	lease := requireLease(t, s.selector.pick(map[string]bool{}))
+	require.NoError(t, discardChanged(s.accounts.SetOverageEnabledChanged("acc", true)))
+	lease := requireLease(t, s.selector.pickFor(map[string]bool{}, ""))
 	s.selector.recordDepleted(lease)
 
 	newDepletedProbe(s, nil).scan(context.Background())
@@ -497,7 +497,7 @@ func TestDepletedProbeRejectsQueuedTargetAfterPolicyChange(t *testing.T) {
 	}
 	// Target b has passed its initial stamp check and is queued behind a's live
 	// fetch. Change its policy before that limiter slot becomes available.
-	require.NoError(t, s.accounts.SetOverageEnabled("b", true))
+	require.NoError(t, discardChanged(s.accounts.SetOverageEnabledChanged("b", true)))
 	current, ok := s.accounts.Runtime("b")
 	require.True(t, ok)
 	unblock()
@@ -535,7 +535,7 @@ func TestDepletedProbeRejectsStaleRevisionResult(t *testing.T) {
 	unblock()
 	<-done
 
-	picked := s.selector.pick(map[string]bool{})
+	picked := s.selector.pickFor(map[string]bool{}, "")
 	assert.Nil(t, picked.lease)
 	assert.Equal(t, "acc", picked.verifyID)
 	assert.Equal(t, quotaUnknown, selectorQuota(t, s.selector, "acc"))

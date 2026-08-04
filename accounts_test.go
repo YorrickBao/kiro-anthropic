@@ -15,6 +15,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func discardChanged(_ bool, err error) error {
+	return err
+}
+
 func TestAccountStoreRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "accounts.json")
@@ -344,7 +348,7 @@ func TestAccountStoreSetDisabled(t *testing.T) {
 	assert.False(t, got.Disabled)
 
 	// Park the account out of the pool.
-	require.NoError(t, s.SetDisabled("id", true))
+	require.NoError(t, discardChanged(s.SetDisabledChanged("id", true)))
 	got, _ = s.Get("id")
 	assert.True(t, got.Disabled)
 
@@ -355,11 +359,11 @@ func TestAccountStoreSetDisabled(t *testing.T) {
 	assert.True(t, got2.Disabled)
 
 	// Re-enable and verify the toggle is reversible.
-	require.NoError(t, s2.SetDisabled("id", false))
+	require.NoError(t, discardChanged(s2.SetDisabledChanged("id", false)))
 	got2, _ = s2.Get("id")
 	assert.False(t, got2.Disabled)
 
-	assert.Error(t, s.SetDisabled("missing", true), "unknown id -> error")
+	assert.Error(t, discardChanged(s.SetDisabledChanged("missing", true)), "unknown id -> error")
 }
 
 func TestAccountStoreSetOverageEnabled(t *testing.T) {
@@ -373,7 +377,7 @@ func TestAccountStoreSetOverageEnabled(t *testing.T) {
 	assert.False(t, got.OverageEnabled)
 
 	// Opt the account into overage.
-	require.NoError(t, s.SetOverageEnabled("id", true))
+	require.NoError(t, discardChanged(s.SetOverageEnabledChanged("id", true)))
 	got, _ = s.Get("id")
 	assert.True(t, got.OverageEnabled)
 
@@ -384,11 +388,11 @@ func TestAccountStoreSetOverageEnabled(t *testing.T) {
 	assert.True(t, got2.OverageEnabled)
 
 	// Re-disable and verify the toggle is reversible.
-	require.NoError(t, s2.SetOverageEnabled("id", false))
+	require.NoError(t, discardChanged(s2.SetOverageEnabledChanged("id", false)))
 	got2, _ = s2.Get("id")
 	assert.False(t, got2.OverageEnabled)
 
-	assert.Error(t, s.SetOverageEnabled("missing", true), "unknown id -> error")
+	assert.Error(t, discardChanged(s.SetOverageEnabledChanged("missing", true)), "unknown id -> error")
 }
 
 func TestAccountStoreRemove(t *testing.T) {
@@ -476,16 +480,16 @@ func TestAccountStoreRuntimeRevisionBoundaries(t *testing.T) {
 	identity := runtimeRevision(t, store, "a")
 	assert.Greater(t, identity, initial, "replacing a resolved profile invalidates old leases and model cache")
 
-	require.NoError(t, store.SetDisabled("a", true))
+	require.NoError(t, discardChanged(store.SetDisabledChanged("a", true)))
 	disabled := runtimeRevision(t, store, "a")
 	assert.Greater(t, disabled, identity)
-	require.NoError(t, store.SetDisabled("a", true))
+	require.NoError(t, discardChanged(store.SetDisabledChanged("a", true)))
 	assert.Equal(t, disabled, runtimeRevision(t, store, "a"), "no-op disable does not bump")
 
-	require.NoError(t, store.SetOverageEnabled("a", true))
+	require.NoError(t, discardChanged(store.SetOverageEnabledChanged("a", true)))
 	overage := runtimeRevision(t, store, "a")
 	assert.Greater(t, overage, disabled)
-	require.NoError(t, store.SetOverageEnabled("a", true))
+	require.NoError(t, discardChanged(store.SetOverageEnabledChanged("a", true)))
 	assert.Equal(t, overage, runtimeRevision(t, store, "a"), "no-op policy toggle does not bump")
 
 	require.NoError(t, store.ReplaceCredentials("a", &StoredAccount{

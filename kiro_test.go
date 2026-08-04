@@ -105,12 +105,11 @@ func TestParseKiroMessage(t *testing.T) {
 	assert.Equal(t, `{"a":1}`, ev.ToolInput)
 	assert.True(t, ev.ToolStop)
 
-	// metadata (terminal frame: authoritative stopReason + conversationId)
+	// metadata (terminal frame: authoritative stopReason)
 	ev = parseKiroMessage(&eventMessage{
 		headers: map[string]string{":event-type": "metadataEvent"},
 		payload: []byte(`{"stopReason":"TOOL_USE","conversationId":"c1"}`)})
 	assert.Equal(t, evMetadata, ev.Kind)
-	assert.Equal(t, "c1", ev.ConversationID)
 	assert.Equal(t, "TOOL_USE", ev.StopReason)
 
 	// exception via message-type header

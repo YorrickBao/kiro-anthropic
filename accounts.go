@@ -320,16 +320,10 @@ func (s *AccountStore) ImportAccounts(incoming []*StoredAccount) (ImportResult, 
 	return res, nil
 }
 
-// SetDisabled toggles whether an account participates in the round-robin pool
-// and persists the store. A disabled account remains stored, refreshed and
-// shown on the admin page; it is only excluded from selection. Returns an error
-// if the id is unknown.
-func (s *AccountStore) SetDisabled(id string, disabled bool) error {
-	_, err := s.SetDisabledChanged(id, disabled)
-	return err
-}
-
-// SetDisabledChanged is SetDisabled plus whether the stored policy changed.
+// SetDisabledChanged toggles whether an account participates in the
+// round-robin pool, persists the store and reports whether the policy changed.
+// A disabled account remains stored, refreshed and shown on the admin page; it
+// is only excluded from selection. Returns an error if the id is unknown.
 func (s *AccountStore) SetDisabledChanged(id string, disabled bool) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -345,15 +339,10 @@ func (s *AccountStore) SetDisabledChanged(id string, disabled bool) (bool, error
 	return true, s.saveLocked()
 }
 
-// SetOverageEnabled toggles whether the account may keep serving after its base
-// credit is exhausted (spending its configured overage) and persists the store.
-// Returns an error if the id is unknown.
-func (s *AccountStore) SetOverageEnabled(id string, enabled bool) error {
-	_, err := s.SetOverageEnabledChanged(id, enabled)
-	return err
-}
-
-// SetOverageEnabledChanged is SetOverageEnabled plus whether the policy changed.
+// SetOverageEnabledChanged toggles whether the account may keep serving after
+// its base credit is exhausted (spending its configured overage), persists the
+// store and reports whether the policy changed. Returns an error if the id is
+// unknown.
 func (s *AccountStore) SetOverageEnabledChanged(id string, enabled bool) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

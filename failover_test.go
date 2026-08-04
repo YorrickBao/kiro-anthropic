@@ -187,7 +187,7 @@ func serverWithPool(t *testing.T, rt *fakeRuntime, accessTokens ...string) *Serv
 	}
 
 	cfg := &Config{}
-	s := &Server{cfg: cfg, kiro: NewKiroClient(cfg, client), modelsCache: map[string]modelsCacheEntry{}}
+	s := &Server{cfg: cfg, kiro: NewKiroClient(client), modelsCache: map[string]modelsCacheEntry{}}
 	s.setAccounts(store, client)
 	return s
 }
@@ -964,7 +964,7 @@ func TestOpenStreamRevalidatesLeaseBeforeAuthRetry(t *testing.T) {
 	s := serverWithPool(t, rt, "acc")
 	mutated := make(chan error, 1)
 	rt.refreshHook = func() {
-		mutated <- s.accounts.SetDisabled("acc", true)
+		mutated <- discardChanged(s.accounts.SetDisabledChanged("acc", true))
 	}
 
 	_, err := s.openStream(context.Background(), &kiroRequest{}, nil)
@@ -1027,7 +1027,7 @@ func TestOpenStreamRevalidatesLeaseAfterModelLookup(t *testing.T) {
 		mutate func(*testing.T, *Server)
 	}{
 		{name: "disable", mutate: func(t *testing.T, s *Server) {
-			require.NoError(t, s.accounts.SetDisabled("acc", true))
+			require.NoError(t, discardChanged(s.accounts.SetDisabledChanged("acc", true)))
 		}},
 		{name: "remove", mutate: func(t *testing.T, s *Server) {
 			require.NoError(t, s.accounts.Remove("acc"))
@@ -1187,7 +1187,7 @@ func TestOpenStreamRepicksFallbackLeaseAfterCooldownExpires(t *testing.T) {
 
 	// Put the sole account in cooldown so pick returns it as the availability
 	// fallback, then expire that cooldown while model preparation is in flight.
-	initial := requireLease(t, s.selector.pick(map[string]bool{}))
+	initial := requireLease(t, s.selector.pickFor(map[string]bool{}, ""))
 	s.selector.recordFailure(initial)
 	rt.modelsHook = func(string) {
 		s.selector.mu.Lock()

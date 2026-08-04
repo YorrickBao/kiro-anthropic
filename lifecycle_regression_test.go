@@ -23,8 +23,8 @@ func TestAccountLifecycleChangesOnlyForCredentialIdentityBoundaries(t *testing.T
 
 	require.NoError(t, store.UpdateLabel("acc", "label"))
 	require.NoError(t, store.UpdateTokens("acc", "new-access", "new-refresh", "2030-01-01T00:00:00Z"))
-	require.NoError(t, store.SetDisabled("acc", true))
-	require.NoError(t, store.SetOverageEnabled("acc", true))
+	require.NoError(t, discardChanged(store.SetDisabledChanged("acc", true)))
+	require.NoError(t, discardChanged(store.SetOverageEnabledChanged("acc", true)))
 	policy, ok := store.Runtime("acc")
 	require.True(t, ok)
 	assert.Greater(t, policy.Revision, initial.Revision)
@@ -69,17 +69,17 @@ func TestAccountLifecycleChangesWhenProfileBecomesKnown(t *testing.T) {
 
 func TestSelectorPolicyRevisionPreservesReactiveDepletion(t *testing.T) {
 	s := newTestSelector(t, "acc")
-	lease := requireLease(t, s.pick(map[string]bool{}))
+	lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 	s.recordDepleted(lease)
 
-	require.NoError(t, s.store.SetOverageEnabled("acc", false))
-	assert.Nil(t, s.pick(map[string]bool{}).lease)
+	require.NoError(t, discardChanged(s.store.SetOverageEnabledChanged("acc", false)))
+	assert.Nil(t, s.pickFor(map[string]bool{}, "").lease)
 	strictRevision := runtimeRevision(t, s.store, "acc")
 	assert.True(t, s.isReactivelyDepleted("acc", strictRevision))
-	assert.Empty(t, s.pick(map[string]bool{}).verifyID, "depleted is not downgraded to unknown")
+	assert.Empty(t, s.pickFor(map[string]bool{}, "").verifyID, "depleted is not downgraded to unknown")
 
-	require.NoError(t, s.store.SetOverageEnabled("acc", true))
-	assert.Nil(t, s.pick(map[string]bool{}).lease)
+	require.NoError(t, discardChanged(s.store.SetOverageEnabledChanged("acc", true)))
+	assert.Nil(t, s.pickFor(map[string]bool{}, "").lease)
 	overageRevision := runtimeRevision(t, s.store, "acc")
 	assert.True(t, s.isReactivelyDepleted("acc", overageRevision))
 	assert.Contains(t, reconciliationTargetIDs(s), "acc")
@@ -87,14 +87,14 @@ func TestSelectorPolicyRevisionPreservesReactiveDepletion(t *testing.T) {
 
 func TestSelectorCredentialLifecycleResetsReactiveDepletion(t *testing.T) {
 	s := newTestSelector(t, "acc")
-	old := requireLease(t, s.pick(map[string]bool{}))
+	old := requireLease(t, s.pickFor(map[string]bool{}, ""))
 	s.recordDepleted(old)
 	stored, ok := s.store.Get("acc")
 	require.True(t, ok)
 	stored.ClientID = "replacement-client"
 	require.NoError(t, s.store.ReplaceCredentials("acc", &stored))
 
-	fresh := requireLease(t, s.pick(map[string]bool{}))
+	fresh := requireLease(t, s.pickFor(map[string]bool{}, ""))
 	assert.NotEqual(t, old.revision, fresh.revision)
 	assert.False(t, s.isReactivelyDepleted("acc", fresh.revision))
 	assert.Equal(t, quotaUnknown, selectorQuota(t, s, "acc"))

@@ -48,13 +48,11 @@
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   td.ctr, th.ctr { text-align: center; }
   .th-hint { color: var(--muted); font-size: 10px; font-weight: 400; }
-  pre { background: #0b0d11; border: 1px solid var(--line); border-radius: 8px; padding: 12px; overflow: auto; font-size: 12px; }
   .err-box { color: var(--err); }
   a { color: var(--accent); }
   .muted { color: var(--muted); }
   .selection-guide {
     --selection-surface: #11151c;
-    --selection-panel: #0e1218;
     --selection-copy: #adb5c5;
     --selection-track: #3b4556;
     margin: 0 0 14px;
@@ -727,13 +725,13 @@ function renderModels(models, body) {
         ? `<span class="pill ok">${esc(m.status)}</span>`
         : `<span class="pill">${esc(m.status)}</span>`;
       const expandable = hasDetail && (m.description || (m.supported_input_types && m.supported_input_types.length) || (m.prompt_caching && m.prompt_caching.supported));
-      const marker = expandable ? `<span class="caret" data-expand="${i}">▶</span>` : "";
+      const marker = expandable ? `<span class="caret">▶</span>` : "";
       // Detail row content
       let detailCells = [];
       if (m.description) detailCells.push(`<dt>描述</dt><dd>${esc(m.description)}</dd>`);
       if (m.supported_input_types && m.supported_input_types.length) detailCells.push(`<dt>输入类型</dt><dd>${esc(m.supported_input_types.join(" / "))}</dd>`);
       if (m.prompt_caching && m.prompt_caching.supported) detailCells.push(`<dt>缓存</dt><dd><span class="pill ok">Prompt Caching</span></dd>`);
-      const mainRow = `<tr class="mrow${expandable ? " expandable" : ""}" ${expandable ? `data-idx="${i}"` : ""}>
+      const mainRow = `<tr${expandable ? ` class="expandable" data-idx="${i}"` : ""}>
         <td style="white-space:nowrap">${marker}<code>${esc(m.id)}</code><button class="copy" data-copy="${esc(m.id)}" type="button" title="复制">⧉</button></td>
         <td>${esc(m.display_name || "")}</td>
         <td class="num">${ctxTxt}</td>

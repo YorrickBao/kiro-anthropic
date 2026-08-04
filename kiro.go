@@ -23,7 +23,6 @@ type kiroRequest struct {
 	ConversationState            kiroConversationState `json:"conversationState"`
 	ProfileArn                   string                `json:"profileArn,omitempty"`
 	AgentMode                    string                `json:"agentMode,omitempty"`
-	SystemPrompt                 string                `json:"systemPrompt,omitempty"`
 	AdditionalModelRequestFields map[string]any        `json:"additionalModelRequestFields,omitempty"`
 }
 
@@ -144,8 +143,7 @@ type kiroEvent struct {
 	ToolInput string // evToolUse (partial JSON chunk)
 	ToolStop  bool   // evToolUse (final chunk for this tool use)
 
-	ConversationID string // evMetadata
-	StopReason     string // evMetadata (CodeWhisperer stopReason, e.g. END_TURN / TOOL_USE / MAX_TOKENS)
+	StopReason string // evMetadata (CodeWhisperer stopReason, e.g. END_TURN / TOOL_USE / MAX_TOKENS)
 
 	ErrKind   string // evError
 	ErrMsg    string // evError
@@ -160,12 +158,11 @@ type kiroEvent struct {
 // exposes the response as a stream of parsed events. It is account-agnostic:
 // every call takes a kiroCredentials for the account it should act as.
 type KiroClient struct {
-	cfg    *Config
 	client *http.Client
 }
 
-func NewKiroClient(cfg *Config, client *http.Client) *KiroClient {
-	return &KiroClient{cfg: cfg, client: client}
+func NewKiroClient(client *http.Client) *KiroClient {
+	return &KiroClient{client: client}
 }
 
 func (c *KiroClient) runtimeEndpoint(region string) string {
@@ -454,15 +451,12 @@ func parseKiroMessage(msg *eventMessage) *kiroEvent {
 
 	case "metadataEvent":
 		// Terminal frame. stopReason is the backend's authoritative finish
-		// reason (END_TURN / TOOL_USE / MAX_TOKENS / ...); conversationId is
-		// included for completeness though it is usually empty (the live id
-		// arrives in the initial-response frame).
+		// reason (END_TURN / TOOL_USE / MAX_TOKENS / ...).
 		var p struct {
-			ConversationID string `json:"conversationId"`
-			StopReason     string `json:"stopReason"`
+			StopReason string `json:"stopReason"`
 		}
 		_ = json.Unmarshal(msg.payload, &p)
-		return &kiroEvent{Kind: evMetadata, ConversationID: p.ConversationID, StopReason: p.StopReason}
+		return &kiroEvent{Kind: evMetadata, StopReason: p.StopReason}
 
 	default:
 		// codeReferenceEvent, followupPromptEvent, supplementaryWebLinksEvent,

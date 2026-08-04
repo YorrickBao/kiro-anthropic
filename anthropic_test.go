@@ -127,9 +127,10 @@ func TestResolveModelTierAndLegacy(t *testing.T) {
 	assert.Equal(t, "claude-opus-4.8", got, "padded exact id must match exactly")
 }
 
-// buildKiroRequestWithModel must stamp the explicit modelId on every user turn
-// (current, system preamble, each history user turn) and never use areq.Model.
-func TestBuildKiroRequestWithModel(t *testing.T) {
+// buildKiroRequestWithModelAndConversationID must stamp the explicit modelId on
+// every user turn (current, system preamble, each history user turn) and never
+// use areq.Model.
+func TestBuildKiroRequestWithModelAndConversationID(t *testing.T) {
 	const custom = "gpt-5.6-sol"
 	areq := &anthropicRequest{
 		Model:  "claude-opus-4.8", // must be ignored in favor of the explicit id
@@ -140,9 +141,10 @@ func TestBuildKiroRequestWithModel(t *testing.T) {
 			{Role: "user", Content: json.RawMessage(`"again"`)},
 		},
 	}
-	k, err := buildKiroRequestWithModel(&Config{}, areq, custom)
+	k, err := buildKiroRequestWithModelAndConversationID(&Config{}, areq, custom, "test-conversation-id")
 	require.NoError(t, err)
 
+	assert.Equal(t, "test-conversation-id", k.ConversationState.ConversationID)
 	assert.Equal(t, custom, k.ConversationState.CurrentMessage.UserInputMessage.ModelID)
 
 	// history layout: [preamble-user, preamble-assistant, user-hi, assistant-hello]
@@ -158,7 +160,7 @@ func TestBuildKiroRequestWithModel(t *testing.T) {
 
 // When the last message is an assistant prefill, the synthesized current user
 // turn carries the explicit modelId.
-func TestBuildKiroRequestWithModelPrefill(t *testing.T) {
+func TestBuildKiroRequestWithModelAndConversationIDPrefill(t *testing.T) {
 	const custom = "glm-5"
 	areq := &anthropicRequest{
 		Messages: []anthropicMessage{
@@ -166,8 +168,9 @@ func TestBuildKiroRequestWithModelPrefill(t *testing.T) {
 			{Role: "assistant", Content: json.RawMessage(`"partial"`)},
 		},
 	}
-	k, err := buildKiroRequestWithModel(&Config{}, areq, custom)
+	k, err := buildKiroRequestWithModelAndConversationID(&Config{}, areq, custom, "test-conversation-id")
 	require.NoError(t, err)
+	assert.Equal(t, "test-conversation-id", k.ConversationState.ConversationID)
 	assert.Equal(t, custom, k.ConversationState.CurrentMessage.UserInputMessage.ModelID)
 }
 
@@ -373,9 +376,8 @@ func TestBuildKiroRequestBasic(t *testing.T) {
 	k, err := buildKiroRequest(&Config{AgentMode: "vibe"}, areq)
 	require.NoError(t, err)
 	assert.Equal(t, "MANUAL", k.ConversationState.ChatTriggerType)
-	assert.Empty(t, k.SystemPrompt, "system prompt must not be sent as a top-level field (runtime rejects it)")
 	assert.Equal(t, "vibe", k.AgentMode)
-	// The top-level systemPrompt field must not be populated (it 400s), so the
+	// The top-level systemPrompt field must not be modeled (it 400s), so the
 	// marshaled body must not contain it.
 	raw, err := json.Marshal(k)
 	require.NoError(t, err)

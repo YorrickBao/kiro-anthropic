@@ -48,7 +48,7 @@ func testServerWithModels() *Server {
 
 func TestAggregateModelUsageExcludesReactivelyDepletedOverage(t *testing.T) {
 	s := testServerWithModels()
-	require.NoError(t, s.accounts.SetOverageEnabled("acc", true))
+	require.NoError(t, discardChanged(s.accounts.SetOverageEnabledChanged("acc", true)))
 
 	// This is the ambiguous snapshot the selector explicitly handles: upstream
 	// clamps currentUsage at the base limit, so the arithmetic heuristic still
@@ -72,7 +72,7 @@ func TestAggregateModelUsageExcludesReactivelyDepletedOverage(t *testing.T) {
 	// A real depletion response is more authoritative than the optimistic
 	// snapshot. Once parked, the account must disappear from the aggregate just
 	// as it does from normal selector routing.
-	picked := s.selector.pick(map[string]bool{})
+	picked := s.selector.pickFor(map[string]bool{}, "")
 	require.NotNil(t, picked.lease)
 	s.selector.recordDepleted(picked.lease)
 	after := s.aggregateModelUsage(context.Background(), "claude-opus-4.8")
@@ -124,7 +124,7 @@ func TestUsageReadOnlyFetchDoesNotActivateStrictAccount(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, float64(50), u.Credit.Remaining)
 	assert.Equal(t, int32(1), calls.Load())
-	picked := s.selector.pick(map[string]bool{})
+	picked := s.selector.pickFor(map[string]bool{}, "")
 	assert.Nil(t, picked.lease)
 	assert.Equal(t, "acc", picked.verifyID)
 }
@@ -266,7 +266,7 @@ func TestAggregateModelUsageRejectsMixedAccountRevisions(t *testing.T) {
 		aggCh <- s.aggregateModelUsage(context.Background(), "claude-opus-4.8")
 	}()
 	<-modelsStarted
-	require.NoError(t, s.accounts.SetOverageEnabled("acc", false))
+	require.NoError(t, discardChanged(s.accounts.SetOverageEnabledChanged("acc", false)))
 	close(releaseModels)
 	agg := <-aggCh
 
@@ -290,7 +290,7 @@ func TestUsageFetchRetriesWithNewGeneration(t *testing.T) {
 		writeUsageResponse(w, 0)
 	})
 	unblock := cleanupTestRelease(t, release)
-	lease := requireLease(t, s.selector.pick(map[string]bool{}))
+	lease := requireLease(t, s.selector.pickFor(map[string]bool{}, ""))
 	result := make(chan *kiroUsage, 1)
 	fetchErr := make(chan error, 1)
 	go func() {
@@ -319,7 +319,7 @@ func TestUsageTargetStampMismatchDoesNotFetchOrRetry(t *testing.T) {
 	})
 	targets := s.selector.reconcileTargets()
 	require.Len(t, targets, 1)
-	lease := requireLease(t, s.selector.pick(map[string]bool{}))
+	lease := requireLease(t, s.selector.pickFor(map[string]bool{}, ""))
 	s.selector.recordFailure(lease)
 
 	_, err := s.refreshUsageTarget(context.Background(), targets[0], nil)
@@ -340,7 +340,7 @@ func TestUsageCacheIgnoresOldRevision(t *testing.T) {
 		usage:   &kiroUsage{Credit: &kiroCreditUsage{Remaining: 1}},
 		fetched: time.Now(), revision: oldRevision,
 	}
-	require.NoError(t, s.accounts.SetOverageEnabled("acc", true))
+	require.NoError(t, discardChanged(s.accounts.SetOverageEnabledChanged("acc", true)))
 	creds, ok := s.selector.byID("acc")
 	require.True(t, ok)
 
@@ -428,7 +428,7 @@ func TestModelsCacheIgnoresOldRevision(t *testing.T) {
 	s.modelsCache["acc"] = modelsCacheEntry{
 		models: []kiroModelInfo{{ModelID: "stale-model"}}, fetched: time.Now(), revision: oldRevision,
 	}
-	require.NoError(t, s.accounts.SetOverageEnabled("acc", true))
+	require.NoError(t, discardChanged(s.accounts.SetOverageEnabledChanged("acc", true)))
 	creds, ok := s.selector.byID("acc")
 	require.True(t, ok)
 

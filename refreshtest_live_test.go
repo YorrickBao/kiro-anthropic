@@ -27,7 +27,7 @@ func TestLiveRefreshRace(t *testing.T) {
 	}
 	t.Logf("using token file: %s", tokenFile)
 
-	tok, _, err := loadToken(tokenFile)
+	tok, err := loadToken(tokenFile)
 	if err != nil {
 		t.Fatalf("loadToken: %v", err)
 	}

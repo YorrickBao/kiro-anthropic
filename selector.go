@@ -295,12 +295,6 @@ func (s *accountSelector) pruneStatesLocked(list []accountRuntime) {
 	}
 }
 
-// pick preserves the legacy round-robin path for callers without a session
-// affinity key.
-func (s *accountSelector) pick(tried map[string]bool) pickResult {
-	return s.pickFor(tried, "")
-}
-
 // pickFor chooses the next immediately eligible account. With affinityKey it
 // uses rendezvous hashing so one client session returns to the same eligible
 // account without storing session state. Without affinityKey it retains the

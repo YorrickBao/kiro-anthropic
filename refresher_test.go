@@ -408,8 +408,8 @@ func TestStoreRefreshTokenSharesFlightAcrossPolicyRevisions(t *testing.T) {
 	}()
 	<-started
 
-	require.NoError(t, store.SetDisabled("acct", true))
-	require.NoError(t, store.SetOverageEnabled("acct", true))
+	require.NoError(t, discardChanged(store.SetDisabledChanged("acct", true)))
+	require.NoError(t, discardChanged(store.SetOverageEnabledChanged("acct", true)))
 	policy, ok := store.Runtime("acct")
 	require.True(t, ok)
 	assert.Greater(t, policy.Revision, initial.Revision)

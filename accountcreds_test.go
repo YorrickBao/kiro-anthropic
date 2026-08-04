@@ -204,11 +204,11 @@ func TestSelectorUnusableSkippedEvenWhenUsableCoolingDown(t *testing.T) {
 	s := newAccountSelector(store, &http.Client{})
 
 	// Put the only usable account into cooldown.
-	first := s.pick(map[string]bool{})
+	first := s.pickFor(map[string]bool{}, "")
 	require.NotNil(t, first.lease)
 	s.recordFailure(first.lease)
 	// pick must still choose "good" (soonest-recovering usable) and never "dead".
-	picked := s.pick(map[string]bool{})
+	picked := s.pickFor(map[string]bool{}, "")
 	require.NotNil(t, picked.lease)
 	assert.Equal(t, "good", picked.lease.creds.id)
 }
@@ -233,7 +233,7 @@ func TestPeekAnyAllUsableCoolingDownStillReturnsUsable(t *testing.T) {
 		ID: "good", ProfileArn: "arn:x", OverageEnabled: true, CreatedAt: "1",
 	}))
 	s := newAccountSelector(store, &http.Client{})
-	picked := s.pick(map[string]bool{})
+	picked := s.pickFor(map[string]bool{}, "")
 	require.NotNil(t, picked.lease)
 	s.recordFailure(picked.lease)
 

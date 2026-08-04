@@ -22,7 +22,6 @@ type anthropicRequest struct {
 	Messages      []anthropicMessage `json:"messages"`
 	System        json.RawMessage    `json:"system,omitempty"` // string or []block
 	Tools         []anthropicTool    `json:"tools,omitempty"`
-	ToolChoice    json.RawMessage    `json:"tool_choice,omitempty"`
 	Stream        bool               `json:"stream,omitempty"`
 	Temperature   *float64           `json:"temperature,omitempty"`
 	TopP          *float64           `json:"top_p,omitempty"`
@@ -455,12 +454,6 @@ func compareIntSlices(a, b []int) int {
 // fallback and assigning a fresh conversation UUID.
 func buildKiroRequest(cfg *Config, areq *anthropicRequest) (*kiroRequest, error) {
 	return buildKiroRequestWithModelAndConversationID(cfg, areq, mapModel(areq.Model), uuid.NewString())
-}
-
-// buildKiroRequestWithModel is the per-account build entrypoint for callers that
-// do not already own a request-level conversation ID.
-func buildKiroRequestWithModel(cfg *Config, areq *anthropicRequest, modelID string) (*kiroRequest, error) {
-	return buildKiroRequestWithModelAndConversationID(cfg, areq, modelID, uuid.NewString())
 }
 
 // buildKiroRequestWithModelAndConversationID stamps the concrete Kiro modelId on

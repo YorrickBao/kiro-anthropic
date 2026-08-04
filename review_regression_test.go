@@ -305,7 +305,7 @@ func TestUsageOlderGenerationCannotOverwriteNewerCache(t *testing.T) {
 		oldErr <- err
 	}()
 	<-started
-	lease := requireLease(t, s.selector.pick(map[string]bool{}))
+	lease := requireLease(t, s.selector.pickFor(map[string]bool{}, ""))
 	s.selector.recordFailure(lease)
 
 	newer, err := s.ensureUsageReadOnly(context.Background(), creds)
@@ -363,7 +363,7 @@ func TestProbeAndAuthoritativeWaitersPreserveAuthoritativeSemantics(t *testing.T
 		assert.ErrorIs(t, err, errUsageObservationStale)
 	}
 	assert.Equal(t, quotaOverage, selectorQuota(t, s.selector, "acc"))
-	assert.NotNil(t, s.selector.pick(map[string]bool{}).lease)
+	assert.NotNil(t, s.selector.pickFor(map[string]bool{}, "").lease)
 	assert.GreaterOrEqual(t, calls.Load(), int32(1))
 	assert.LessOrEqual(t, calls.Load(), int32(2))
 }

@@ -77,7 +77,7 @@ func TestSelectorRoundRobin(t *testing.T) {
 	s := newTestSelector(t, "a", "b", "c")
 	var got []string
 	for i := 0; i < 6; i++ {
-		lease := requireLease(t, s.pick(map[string]bool{}))
+		lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 		got = append(got, lease.creds.id)
 		s.recordSuccess(lease)
 	}
@@ -107,7 +107,7 @@ func TestSelectorAffinityDoesNotAdvanceRoundRobin(t *testing.T) {
 	_ = requireLease(t, s.pickFor(map[string]bool{}, "session-affinity"))
 
 	assert.Equal(t, "a", requireLease(t, s.pickFor(map[string]bool{}, "")).creds.id)
-	assert.Equal(t, "b", requireLease(t, s.pick(map[string]bool{})).creds.id)
+	assert.Equal(t, "b", requireLease(t, s.pickFor(map[string]bool{}, "")).creds.id)
 }
 
 func TestSelectorAffinityHonorsQuotaAndCooldownGates(t *testing.T) {
@@ -158,35 +158,35 @@ func TestSelectorPeekAnyDoesNotAdvance(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, "a", creds.id)
 	}
-	assert.Equal(t, "a", requireLease(t, s.pick(map[string]bool{})).creds.id)
-	assert.Equal(t, "b", requireLease(t, s.pick(map[string]bool{})).creds.id)
+	assert.Equal(t, "a", requireLease(t, s.pickFor(map[string]bool{}, "")).creds.id)
+	assert.Equal(t, "b", requireLease(t, s.pickFor(map[string]bool{}, "")).creds.id)
 }
 
 func TestSelectorEmptyAndAllTried(t *testing.T) {
 	empty := newTestSelector(t)
-	assert.Nil(t, empty.pick(map[string]bool{}).lease)
-	assert.Empty(t, empty.pick(map[string]bool{}).verifyID)
+	assert.Nil(t, empty.pickFor(map[string]bool{}, "").lease)
+	assert.Empty(t, empty.pickFor(map[string]bool{}, "").verifyID)
 	_, ok := empty.peekAny()
 	assert.False(t, ok)
 
 	s := newTestSelector(t, "a", "b")
-	result := s.pick(map[string]bool{"a": true, "b": true})
+	result := s.pickFor(map[string]bool{"a": true, "b": true}, "")
 	assert.Nil(t, result.lease)
 	assert.Empty(t, result.verifyID)
 }
 
 func TestSelectorCooldownSkipAndFallback(t *testing.T) {
 	s := newTestSelector(t, "a", "b")
-	first := requireLease(t, s.pick(map[string]bool{}))
+	first := requireLease(t, s.pickFor(map[string]bool{}, ""))
 	s.recordFailure(first)
-	next := requireLease(t, s.pick(map[string]bool{}))
+	next := requireLease(t, s.pickFor(map[string]bool{}, ""))
 	assert.NotEqual(t, first.creds.id, next.creds.id)
 	s.recordFailure(next)
 
-	fallback := requireLease(t, s.pick(map[string]bool{}))
+	fallback := requireLease(t, s.pickFor(map[string]bool{}, ""))
 	assert.True(t, fallback.fallback)
 	s.recordSuccess(fallback)
-	assert.True(t, selectorLeaseReady(s, requireLease(t, s.pick(map[string]bool{}))))
+	assert.True(t, selectorLeaseReady(s, requireLease(t, s.pickFor(map[string]bool{}, ""))))
 }
 
 func TestSelectorCooldownFallbackUsesSoonest(t *testing.T) {
@@ -203,17 +203,17 @@ func TestSelectorCooldownFallbackUsesSoonest(t *testing.T) {
 	s.mutateLocked(s.states["b"])
 	s.mu.Unlock()
 
-	lease := requireLease(t, s.pick(map[string]bool{}))
+	lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 	assert.Equal(t, "b", lease.creds.id)
 	assert.True(t, lease.fallback)
 }
 
 func TestSelectorStatePrunedForRemovedAccount(t *testing.T) {
 	s := newTestSelector(t, "a", "b")
-	lease := requireLease(t, s.pick(map[string]bool{}))
+	lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 	s.recordFailure(lease)
 	require.NoError(t, s.store.Remove(lease.creds.id))
-	_ = s.pick(map[string]bool{})
+	_ = s.pickFor(map[string]bool{}, "")
 	s.mu.Lock()
 	_, exists := s.states[lease.creds.id]
 	s.mu.Unlock()
@@ -233,7 +233,7 @@ func TestSelectorSkipsUnusableAndDisabledAccounts(t *testing.T) {
 	s := newAccountSelector(store, &http.Client{})
 
 	for i := 0; i < 4; i++ {
-		assert.Equal(t, "good", requireLease(t, s.pick(map[string]bool{})).creds.id)
+		assert.Equal(t, "good", requireLease(t, s.pickFor(map[string]bool{}, "")).creds.id)
 	}
 	assert.False(t, accountUsable(StoredAccount{ProfileArn: "arn:x", Disabled: true}))
 	assert.False(t, accountUsable(StoredAccount{}))
@@ -247,7 +247,7 @@ func TestSelectorConcurrentPick(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if lease := s.pick(map[string]bool{}).lease; lease != nil {
+			if lease := s.pickFor(map[string]bool{}, "").lease; lease != nil {
 				s.recordSuccess(lease)
 			}
 		}()
@@ -285,7 +285,7 @@ func TestSelectorConcurrentSessionAffinityIsStable(t *testing.T) {
 
 func TestSelectorStrictUnknownRequiresVerification(t *testing.T) {
 	s := newStrictTestSelector(t, "a")
-	result := s.pick(map[string]bool{})
+	result := s.pickFor(map[string]bool{}, "")
 	assert.Nil(t, result.lease)
 	assert.Equal(t, "a", result.verifyID)
 	assert.Contains(t, reconciliationTargetIDs(s), "a")
@@ -296,7 +296,7 @@ func TestSelectorFreshPositiveUsageAdmitsStrictAccount(t *testing.T) {
 	assert.True(t, applyFreshUsage(t, s, "a", &kiroUsage{
 		Credit: &kiroCreditUsage{Remaining: 1},
 	}, usageObservationAuthoritative))
-	lease := requireLease(t, s.pick(map[string]bool{}))
+	lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 	assert.Equal(t, "a", lease.creds.id)
 	assert.True(t, selectorLeaseReady(s, lease))
 }
@@ -310,7 +310,7 @@ func TestSelectorStrictZeroUsageRemainsBlockedAfterRetryTime(t *testing.T) {
 	s.mu.Lock()
 	s.states["a"].retryAfter = time.Now().Add(-time.Hour)
 	s.mu.Unlock()
-	result := s.pick(map[string]bool{})
+	result := s.pickFor(map[string]bool{}, "")
 	assert.Nil(t, result.lease)
 	assert.Empty(t, result.verifyID, "known depletion is not treated as unknown")
 	assert.True(t, s.isDepleted("a"))
@@ -322,7 +322,7 @@ func TestSelectorRuntimeSuccessCannotAdmitUnknownOrDepleted(t *testing.T) {
 	require.True(t, ok)
 	unknownLease := &accountLease{creds: creds, revision: stamp.revision, generation: stamp.generation}
 	s.recordSuccess(unknownLease)
-	assert.Equal(t, "a", s.pick(map[string]bool{}).verifyID)
+	assert.Equal(t, "a", s.pickFor(map[string]bool{}, "").verifyID)
 
 	assert.True(t, s.applyUsage(stamp, &kiroUsage{
 		Credit: &kiroCreditUsage{Remaining: 0},
@@ -331,25 +331,25 @@ func TestSelectorRuntimeSuccessCannotAdmitUnknownOrDepleted(t *testing.T) {
 	require.True(t, ok)
 	depletedLease := &accountLease{creds: creds, revision: depletedStamp.revision, generation: depletedStamp.generation}
 	s.recordSuccess(depletedLease)
-	assert.Nil(t, s.pick(map[string]bool{}).lease)
+	assert.Nil(t, s.pickFor(map[string]bool{}, "").lease)
 	assert.True(t, s.isDepleted("a"))
 }
 
 func TestSelectorOverageUnknownIsEligible(t *testing.T) {
 	s := newTestSelector(t, "a")
-	lease := requireLease(t, s.pick(map[string]bool{}))
+	lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 	assert.Equal(t, "a", lease.creds.id)
 	assert.Equal(t, quotaUnknown, selectorQuota(t, s, "a"))
 }
 
 func TestSelectorReactiveDepletionIsStickyAndNeverFallback(t *testing.T) {
 	s := newTestSelector(t, "a", "b")
-	a := requireLease(t, s.pick(map[string]bool{}))
-	b := requireLease(t, s.pick(map[string]bool{}))
+	a := requireLease(t, s.pickFor(map[string]bool{}, ""))
+	b := requireLease(t, s.pickFor(map[string]bool{}, ""))
 	s.recordDepleted(a)
 	s.recordDepleted(b)
 
-	result := s.pick(map[string]bool{})
+	result := s.pickFor(map[string]bool{}, "")
 	assert.Nil(t, result.lease)
 	assert.Empty(t, result.verifyID)
 	assert.True(t, s.isReactivelyDepleted("a", a.revision))
@@ -358,11 +358,11 @@ func TestSelectorReactiveDepletionIsStickyAndNeverFallback(t *testing.T) {
 
 func TestSelectorOldSuccessCannotClearNewerDepletion(t *testing.T) {
 	s := newTestSelector(t, "a")
-	lease := requireLease(t, s.pick(map[string]bool{}))
+	lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 	s.recordDepleted(lease)
 	s.recordSuccess(lease)
 	assert.True(t, s.isReactivelyDepleted("a", lease.revision))
-	assert.Nil(t, s.pick(map[string]bool{}).lease)
+	assert.Nil(t, s.pickFor(map[string]bool{}, "").lease)
 }
 
 func TestSelectorStaleUsageCannotClearReactiveDepletion(t *testing.T) {
@@ -381,24 +381,24 @@ func TestSelectorStaleUsageCannotClearReactiveDepletion(t *testing.T) {
 
 func TestSelectorFreshBaseUsageRecoversReactiveDepletion(t *testing.T) {
 	s := newTestSelector(t, "a")
-	lease := requireLease(t, s.pick(map[string]bool{}))
+	lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 	s.recordDepleted(lease)
 	assert.True(t, applyFreshUsage(t, s, "a", &kiroUsage{
 		Credit: &kiroCreditUsage{Remaining: 1},
 	}, usageObservationProbe))
-	assert.NotNil(t, s.pick(map[string]bool{}).lease)
+	assert.NotNil(t, s.pickFor(map[string]bool{}, "").lease)
 }
 
 func TestSelectorBaseZeroCannotRecoverReactiveOverage(t *testing.T) {
 	s := newTestSelector(t, "a")
-	lease := requireLease(t, s.pick(map[string]bool{}))
+	lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 	s.recordDepleted(lease)
 	clamped := &kiroUsage{
 		OverageStatus: "ENABLED",
 		Credit:        &kiroCreditUsage{Remaining: 0, Used: 100, Limit: 100, OverageCap: 100},
 	}
 	assert.True(t, applyFreshUsage(t, s, "a", clamped, usageObservationAuthoritative))
-	assert.Nil(t, s.pick(map[string]bool{}).lease)
+	assert.Nil(t, s.pickFor(map[string]bool{}, "").lease)
 	assert.True(t, s.isReactivelyDepleted("a", lease.revision))
 }
 
@@ -409,7 +409,7 @@ func TestSelectorOverageUsageCanAuthorizeBeforeReactiveFailure(t *testing.T) {
 		Credit:        &kiroCreditUsage{Remaining: 0, Used: 120, Limit: 100, OverageCap: 100},
 	}, usageObservationAuthoritative))
 	assert.Equal(t, quotaOverage, selectorQuota(t, s, "a"))
-	assert.NotNil(t, s.pick(map[string]bool{}).lease)
+	assert.NotNil(t, s.pickFor(map[string]bool{}, "").lease)
 }
 
 func TestSelectorPrefersBaseTierRoundRobin(t *testing.T) {
@@ -420,13 +420,13 @@ func TestSelectorPrefersBaseTierRoundRobin(t *testing.T) {
 
 	var got []string
 	for i := 0; i < 4; i++ {
-		lease := requireLease(t, s.pick(map[string]bool{}))
+		lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 		got = append(got, lease.creds.id)
 		s.recordSuccess(lease)
 	}
 	assert.Equal(t, []string{"base-a", "base-b", "base-a", "base-b"}, got)
 
-	fallback := requireLease(t, s.pick(map[string]bool{"base-a": true, "base-b": true}))
+	fallback := requireLease(t, s.pickFor(map[string]bool{"base-a": true, "base-b": true}, ""))
 	assert.Equal(t, "overage", fallback.creds.id)
 	assert.False(t, fallback.fallback)
 }
@@ -439,7 +439,7 @@ func TestSelectorRoundRobinsWithinOverageTier(t *testing.T) {
 
 	var got []string
 	for i := 0; i < 4; i++ {
-		got = append(got, requireLease(t, s.pick(map[string]bool{})).creds.id)
+		got = append(got, requireLease(t, s.pickFor(map[string]bool{}, "")).creds.id)
 	}
 	assert.Equal(t, []string{"a", "b", "a", "b"}, got)
 }
@@ -482,7 +482,7 @@ func TestSelectorOverageUnknownRemainsPreferredCandidate(t *testing.T) {
 	s := newTestSelector(t, "overage", "unknown")
 	require.True(t, applyFreshUsage(t, s, "overage", testOverageUsage(), usageObservationAuthoritative))
 
-	lease := requireLease(t, s.pick(map[string]bool{}))
+	lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 	assert.Equal(t, "unknown", lease.creds.id)
 	assert.Equal(t, quotaUnknown, selectorQuota(t, s, "unknown"))
 }
@@ -492,11 +492,11 @@ func TestSelectorTierPreferenceHonorsCooldown(t *testing.T) {
 		s := newTestSelector(t, "base", "overage")
 		require.True(t, applyFreshUsage(t, s, "base", testBaseUsage(), usageObservationAuthoritative))
 		require.True(t, applyFreshUsage(t, s, "overage", testOverageUsage(), usageObservationAuthoritative))
-		base := requireLease(t, s.pick(map[string]bool{}))
+		base := requireLease(t, s.pickFor(map[string]bool{}, ""))
 		require.Equal(t, "base", base.creds.id)
 		s.recordFailure(base)
 
-		lease := requireLease(t, s.pick(map[string]bool{}))
+		lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 		assert.Equal(t, "overage", lease.creds.id)
 		assert.False(t, lease.fallback)
 	})
@@ -513,7 +513,7 @@ func TestSelectorTierPreferenceHonorsCooldown(t *testing.T) {
 		s.mutateLocked(s.states["overage"])
 		s.mu.Unlock()
 
-		lease := requireLease(t, s.pick(map[string]bool{}))
+		lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 		assert.Equal(t, "overage", lease.creds.id)
 		assert.True(t, lease.fallback)
 	})
@@ -522,7 +522,7 @@ func TestSelectorTierPreferenceHonorsCooldown(t *testing.T) {
 func TestSelectorQuotaTierChangesFenceLeases(t *testing.T) {
 	s := newTestSelector(t, "a")
 	require.True(t, applyFreshUsage(t, s, "a", testBaseUsage(), usageObservationAuthoritative))
-	base := requireLease(t, s.pick(map[string]bool{}))
+	base := requireLease(t, s.pickFor(map[string]bool{}, ""))
 
 	require.True(t, applyFreshUsage(t, s, "a", testBaseUsage(), usageObservationAuthoritative))
 	assert.True(t, selectorLeaseReady(s, base), "same-tier observation must not invalidate the lease")
@@ -530,14 +530,14 @@ func TestSelectorQuotaTierChangesFenceLeases(t *testing.T) {
 	require.True(t, applyFreshUsage(t, s, "a", testOverageUsage(), usageObservationAuthoritative))
 	assert.Equal(t, quotaOverage, selectorQuota(t, s, "a"))
 	assert.False(t, selectorLeaseReady(s, base), "base-to-overage transition must invalidate the old lease")
-	assert.True(t, selectorLeaseReady(s, requireLease(t, s.pick(map[string]bool{}))))
+	assert.True(t, selectorLeaseReady(s, requireLease(t, s.pickFor(map[string]bool{}, ""))))
 }
 
 func TestSelectorProbeCannotAuthorizeOverage(t *testing.T) {
 	s := newTestSelector(t, "a")
 	require.True(t, applyFreshUsage(t, s, "a", testOverageUsage(), usageObservationProbe))
 	assert.Equal(t, quotaDepleted, selectorQuota(t, s, "a"))
-	assert.Nil(t, s.pick(map[string]bool{}).lease)
+	assert.Nil(t, s.pickFor(map[string]bool{}, "").lease)
 }
 
 func TestSelectorDisablingOverageRequiresFreshPositiveBaseUsage(t *testing.T) {
@@ -546,11 +546,11 @@ func TestSelectorDisablingOverageRequiresFreshPositiveBaseUsage(t *testing.T) {
 		OverageStatus: "ENABLED",
 		Credit:        &kiroCreditUsage{Remaining: 0, Used: 120, Limit: 100, OverageCap: 100},
 	}, usageObservationAuthoritative))
-	old := requireLease(t, s.pick(map[string]bool{}))
+	old := requireLease(t, s.pickFor(map[string]bool{}, ""))
 
-	require.NoError(t, s.store.SetOverageEnabled("a", false))
+	require.NoError(t, discardChanged(s.store.SetOverageEnabledChanged("a", false)))
 	assert.False(t, selectorLeaseReady(s, old))
-	result := s.pick(map[string]bool{})
+	result := s.pickFor(map[string]bool{}, "")
 	assert.Nil(t, result.lease)
 	assert.Equal(t, "a", result.verifyID)
 	assert.Equal(t, quotaUnknown, selectorQuota(t, s, "a"))
@@ -558,7 +558,7 @@ func TestSelectorDisablingOverageRequiresFreshPositiveBaseUsage(t *testing.T) {
 	assert.True(t, applyFreshUsage(t, s, "a", &kiroUsage{
 		Credit: &kiroCreditUsage{Remaining: 1},
 	}, usageObservationAuthoritative))
-	assert.NotNil(t, s.pick(map[string]bool{}).lease)
+	assert.NotNil(t, s.pickFor(map[string]bool{}, "").lease)
 }
 
 func TestSelectorPolicyRevisionRejectsOldUsageAndLease(t *testing.T) {
@@ -566,26 +566,26 @@ func TestSelectorPolicyRevisionRejectsOldUsageAndLease(t *testing.T) {
 	creds, stamp, ok := s.usageTarget("a")
 	require.True(t, ok)
 	lease := &accountLease{creds: creds, revision: stamp.revision, generation: stamp.generation}
-	require.NoError(t, s.store.SetOverageEnabled("a", false))
+	require.NoError(t, discardChanged(s.store.SetOverageEnabledChanged("a", false)))
 
 	assert.False(t, s.applyUsage(stamp, &kiroUsage{
 		Credit: &kiroCreditUsage{Remaining: 10},
 	}, usageObservationAuthoritative))
 	s.recordDepleted(lease)
 	assert.False(t, selectorLeaseReady(s, lease))
-	result := s.pick(map[string]bool{})
+	result := s.pickFor(map[string]bool{}, "")
 	assert.Nil(t, result.lease)
 	assert.Equal(t, "a", result.verifyID)
 }
 
 func TestSelectorRemoveReaddRejectsOldLeaseEvents(t *testing.T) {
 	s := newTestSelector(t, "a")
-	old := requireLease(t, s.pick(map[string]bool{}))
+	old := requireLease(t, s.pickFor(map[string]bool{}, ""))
 	require.NoError(t, s.store.Remove("a"))
 	require.NoError(t, s.store.Add(&StoredAccount{
 		ID: "a", ProfileArn: "arn:new", OverageEnabled: true, CreatedAt: "0",
 	}))
-	fresh := requireLease(t, s.pick(map[string]bool{}))
+	fresh := requireLease(t, s.pickFor(map[string]bool{}, ""))
 	require.NotEqual(t, old.revision, fresh.revision)
 
 	s.recordDepleted(old)
@@ -596,25 +596,25 @@ func TestSelectorRemoveReaddRejectsOldLeaseEvents(t *testing.T) {
 func TestSelectorRevalidateRejectsChangedState(t *testing.T) {
 	t.Run("disabled", func(t *testing.T) {
 		s := newTestSelector(t, "a")
-		lease := requireLease(t, s.pick(map[string]bool{}))
-		require.NoError(t, s.store.SetDisabled("a", true))
+		lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
+		require.NoError(t, discardChanged(s.store.SetDisabledChanged("a", true)))
 		assert.False(t, selectorLeaseReady(s, lease))
 	})
 	t.Run("removed", func(t *testing.T) {
 		s := newTestSelector(t, "a")
-		lease := requireLease(t, s.pick(map[string]bool{}))
+		lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 		require.NoError(t, s.store.Remove("a"))
 		assert.False(t, selectorLeaseReady(s, lease))
 	})
 	t.Run("depleted", func(t *testing.T) {
 		s := newTestSelector(t, "a")
-		lease := requireLease(t, s.pick(map[string]bool{}))
+		lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 		s.recordDepleted(lease)
 		assert.False(t, selectorLeaseReady(s, lease))
 	})
 	t.Run("generation changed", func(t *testing.T) {
 		s := newTestSelector(t, "a")
-		lease := requireLease(t, s.pick(map[string]bool{}))
+		lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 		s.recordFailure(lease)
 		assert.False(t, selectorLeaseReady(s, lease))
 	})
@@ -649,9 +649,9 @@ func TestSelectorReconcileTargets(t *testing.T) {
 		"overage-unknown", "overage-base", "overage-active", "overage-depleted", "disabled",
 	)
 	for _, id := range []string{"strict-unknown", "strict-base", "strict-depleted"} {
-		require.NoError(t, s.store.SetOverageEnabled(id, false))
+		require.NoError(t, discardChanged(s.store.SetOverageEnabledChanged(id, false)))
 	}
-	require.NoError(t, s.store.SetDisabled("disabled", true))
+	require.NoError(t, discardChanged(s.store.SetDisabledChanged("disabled", true)))
 	require.True(t, applyFreshUsage(t, s, "strict-base", testBaseUsage(), usageObservationAuthoritative))
 	require.True(t, applyFreshUsage(t, s, "strict-depleted", &kiroUsage{
 		Credit: &kiroCreditUsage{Remaining: 0},
@@ -693,7 +693,7 @@ func TestSelectorValidateForSendPoolPriority(t *testing.T) {
 		for _, id := range []string{"selected", "candidate"} {
 			require.True(t, applyFreshUsage(t, s, id, testOverageUsage(), usageObservationAuthoritative))
 		}
-		lease := requireLease(t, s.pick(map[string]bool{}))
+		lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 		require.Equal(t, "selected", lease.creds.id)
 		require.True(t, applyFreshUsage(t, s, "candidate", testBaseUsage(), usageObservationAuthoritative))
 		s.mu.Lock()
@@ -706,27 +706,27 @@ func TestSelectorValidateForSendPoolPriority(t *testing.T) {
 		after := s.index
 		s.mu.Unlock()
 		assert.Equal(t, before, after)
-		assert.Equal(t, "candidate", requireLease(t, s.pick(map[string]bool{"selected": true})).creds.id)
+		assert.Equal(t, "candidate", requireLease(t, s.pickFor(map[string]bool{"selected": true}, "")).creds.id)
 	})
 
 	t.Run("new overage-enabled unknown supersedes overage", func(t *testing.T) {
 		s := newTestSelector(t, "selected")
 		require.True(t, applyFreshUsage(t, s, "selected", testOverageUsage(), usageObservationAuthoritative))
-		lease := requireLease(t, s.pick(map[string]bool{}))
+		lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 		require.NoError(t, s.store.Add(&StoredAccount{
 			ID: "new", ProfileArn: "arn:new", OverageEnabled: true, CreatedAt: "1",
 		}))
 
 		assert.Equal(t, leaseSendSuperseded, s.validateForSend(lease, map[string]bool{"selected": true}))
-		assert.Equal(t, "new", requireLease(t, s.pick(map[string]bool{"selected": true})).creds.id)
+		assert.Equal(t, "new", requireLease(t, s.pickFor(map[string]bool{"selected": true}, "")).creds.id)
 	})
 
 	t.Run("enabled overage unknown supersedes overage", func(t *testing.T) {
 		s := newTestSelector(t, "selected", "disabled")
-		require.NoError(t, s.store.SetDisabled("disabled", true))
+		require.NoError(t, discardChanged(s.store.SetDisabledChanged("disabled", true)))
 		require.True(t, applyFreshUsage(t, s, "selected", testOverageUsage(), usageObservationAuthoritative))
-		lease := requireLease(t, s.pick(map[string]bool{}))
-		require.NoError(t, s.store.SetDisabled("disabled", false))
+		lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
+		require.NoError(t, discardChanged(s.store.SetDisabledChanged("disabled", false)))
 
 		assert.Equal(t, leaseSendSuperseded, s.validateForSend(lease, map[string]bool{"selected": true}))
 	})
@@ -735,7 +735,7 @@ func TestSelectorValidateForSendPoolPriority(t *testing.T) {
 		s := newTestSelector(t, "selected", "candidate")
 		require.True(t, applyFreshUsage(t, s, "selected", testOverageUsage(), usageObservationAuthoritative))
 		require.True(t, applyFreshUsage(t, s, "candidate", testBaseUsage(), usageObservationAuthoritative))
-		lease := requireLease(t, s.pick(map[string]bool{"candidate": true}))
+		lease := requireLease(t, s.pickFor(map[string]bool{"candidate": true}, ""))
 
 		assert.Equal(t, leaseSendReady, s.validateForSend(lease, map[string]bool{
 			"selected": true, "candidate": true,
@@ -744,9 +744,9 @@ func TestSelectorValidateForSendPoolPriority(t *testing.T) {
 
 	t.Run("strict unknown does not supersede", func(t *testing.T) {
 		s := newTestSelector(t, "selected", "strict")
-		require.NoError(t, s.store.SetOverageEnabled("strict", false))
+		require.NoError(t, discardChanged(s.store.SetOverageEnabledChanged("strict", false)))
 		require.True(t, applyFreshUsage(t, s, "selected", testOverageUsage(), usageObservationAuthoritative))
-		lease := requireLease(t, s.pick(map[string]bool{}))
+		lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 
 		assert.Equal(t, leaseSendReady, s.validateForSend(lease, map[string]bool{"selected": true}))
 	})
@@ -755,10 +755,10 @@ func TestSelectorValidateForSendPoolPriority(t *testing.T) {
 		s := newTestSelector(t, "selected", "candidate")
 		require.True(t, applyFreshUsage(t, s, "selected", testOverageUsage(), usageObservationAuthoritative))
 		require.True(t, applyFreshUsage(t, s, "candidate", testBaseUsage(), usageObservationAuthoritative))
-		candidate := requireLease(t, s.pick(map[string]bool{}))
+		candidate := requireLease(t, s.pickFor(map[string]bool{}, ""))
 		require.Equal(t, "candidate", candidate.creds.id)
 		s.recordFailure(candidate)
-		lease := requireLease(t, s.pick(map[string]bool{}))
+		lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 		require.Equal(t, "selected", lease.creds.id)
 
 		assert.Equal(t, leaseSendReady, s.validateForSend(lease, map[string]bool{"selected": true}))
@@ -769,7 +769,7 @@ func TestSelectorValidateForSendPoolPriority(t *testing.T) {
 		for _, id := range []string{"selected", "candidate"} {
 			require.True(t, applyFreshUsage(t, s, id, testOverageUsage(), usageObservationAuthoritative))
 		}
-		lease := requireLease(t, s.pick(map[string]bool{}))
+		lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 
 		assert.Equal(t, leaseSendReady, s.validateForSend(lease, map[string]bool{lease.creds.id: true}))
 	})
@@ -778,10 +778,10 @@ func TestSelectorValidateForSendPoolPriority(t *testing.T) {
 		s := newTestSelector(t, "a", "b")
 		for _, id := range []string{"a", "b"} {
 			require.True(t, applyFreshUsage(t, s, id, testOverageUsage(), usageObservationAuthoritative))
-			lease := requireLease(t, s.pick(map[string]bool{}))
+			lease := requireLease(t, s.pickFor(map[string]bool{}, ""))
 			s.recordFailure(lease)
 		}
-		fallback := requireLease(t, s.pick(map[string]bool{}))
+		fallback := requireLease(t, s.pickFor(map[string]bool{}, ""))
 		require.True(t, fallback.fallback)
 		other := "a"
 		if fallback.creds.id == other {

@@ -43,35 +43,21 @@ func (t Token) expiry() time.Time {
 	return time.Time{}
 }
 
-// valid reports whether the token is usable at time at.
-func (t Token) valid(at time.Time) bool {
-	exp := t.expiry()
-	if exp.IsZero() {
-		// If we cannot parse expiry, treat the token as usable and let the
-		// backend surface any 403.
-		return t.AccessToken != ""
-	}
-	return exp.After(at)
-}
-
 // clientRegistration mirrors the <clientIdHash>.json cache file.
 type clientRegistration struct {
 	ClientID     string `json:"clientId"`
 	ClientSecret string `json:"clientSecret"`
 }
 
-// loadToken reads the token file into both the typed struct and a raw map (so
-// unknown keys can be inspected).
-func loadToken(path string) (Token, map[string]json.RawMessage, error) {
+// loadToken reads the token file into its typed representation.
+func loadToken(path string) (Token, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return Token{}, nil, err
+		return Token{}, err
 	}
 	var tok Token
 	if err := json.Unmarshal(data, &tok); err != nil {
-		return Token{}, nil, fmt.Errorf("parse token json: %w", err)
+		return Token{}, fmt.Errorf("parse token json: %w", err)
 	}
-	raw := map[string]json.RawMessage{}
-	_ = json.Unmarshal(data, &raw)
-	return tok, raw, nil
+	return tok, nil
 }

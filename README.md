@@ -1,3 +1,5 @@
+
+
 # kiro-anthropic
 
 [![CI](https://github.com/YorrickBao/kiro-anthropic/actions/workflows/ci.yml/badge.svg)](https://github.com/YorrickBao/kiro-anthropic/actions/workflows/ci.yml)
@@ -209,6 +211,7 @@ http://127.0.0.1:27890/health      # 健康检查
 - `HTTPS_PROXY` / `HTTP_PROXY` / `https_proxy` / `http_proxy`：出站代理（被 `--proxy` 覆盖）。
 - `KIRO_DEBUG=1`：把发往 Kiro 的完整请求体打到 stderr，便于排查（不含密钥）。
 - `KIRO_DEBUG_STREAM=1`：把 Kiro 返回的每一帧事件（`:event-type` 与原始 payload）打到 stderr，便于排查思考/工具流。
+- `GITHUB_TOKEN`：设置后可提高 `upgrade` 命令下载 GitHub Release 时的 API 限流额度（未鉴权时限制为 60 次/小时）。
 
 ---
 

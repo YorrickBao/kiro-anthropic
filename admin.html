@@ -31,6 +31,7 @@
   .wrap { padding: 20px 24px; max-width: 1100px; margin: 0 auto; display: grid; gap: 18px; }
   .card { min-width: 0; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
   .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 14px; }
+  .order-hint { text-transform: none; letter-spacing: 0; font-size: 11px; font-weight: 400; color: var(--muted); }
   .kv { display: grid; grid-template-columns: 150px 1fr; gap: 6px 14px; }
   .kv dt { color: var(--muted); }
   .kv dd { margin: 0; word-break: break-all; }
@@ -261,6 +262,10 @@
   @media (prefers-reduced-motion: reduce) { .acct.enabled::before { animation: none; } }
   .acct-btns { display: inline-flex; gap: 8px; opacity: 0; pointer-events: none; transition: opacity .15s; }
   .acct:hover .acct-btns, .acct:focus-within .acct-btns { opacity: 1; pointer-events: auto; }
+  /* position controls (↑/↓): wider click targets than the glyph needs, and a
+     hairline separator sets them apart from the per-account action buttons */
+  .acct-btns button[data-up], .acct-btns button[data-down] { min-width: 30px; padding-left: 0; padding-right: 0; text-align: center; }
+  .acct-btns .btn-sep { width: 1px; align-self: stretch; background: var(--line); }
   .switch { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; font-size: 12.5px; }
   .switch input { appearance: none; -webkit-appearance: none; width: 34px; height: 18px; border-radius: 999px;
     background: #2a2f3a; border: 1px solid var(--line); position: relative; margin: 0; transition: background .15s; cursor: pointer; }
@@ -271,6 +276,13 @@
   .switch input:disabled { opacity: .5; cursor: default; }
   .acct .top { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
   .acct .email { font-weight: 600; word-break: break-all; }
+  /* rank chip: the manual display position. Mono + squared corners read as an
+     index (this list is an ordered sequence the admin curates), set apart from
+     the rounded status pills on the right. Muted: the email stays the anchor. */
+  .acct .rank {
+    font: 600 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 1px 7px; flex: none;
+  }
   /* margin-top:auto pins the action bar to the card bottom so a short card
      (e.g. usage fetch failed → one-line error) keeps its buttons aligned with
      taller peers in the same grid row, which stretch to equal height. */
@@ -341,6 +353,7 @@
   </section>
   <section class="card">
     <h2 style="display:flex;align-items:center;gap:10px">账号（启用 <span id="acct-enabled">0</span> / 共 <span id="acct-count">0</span>）
+      <span class="order-hint">排序仅影响展示，不影响请求分发</span>
       <span style="flex:1"></span>
       <button id="export-btn" class="ghost" type="button" style="text-transform:none;font-size:12px" title="导出全部号池凭据为 JSON 文件，用于迁移到其他服务器">导出号池</button>
       <button id="import-file-btn" class="ghost" type="button" style="text-transform:none;font-size:12px" title="从导出的 JSON 文件导入号池凭据（按身份合并去重）">导入号池</button>
@@ -632,6 +645,7 @@ function renderAccounts(accounts) {
   }
   el.innerHTML = accounts.map((a, i) => `<div class="acct${a.disabled ? "" : " enabled"}">
     <div class="top">
+      <span class="rank" title="展示顺序（用卡片下方的 ↑/↓ 调整）">#${i + 1}</span>
       <span class="email">${esc(a.email || "(无邮箱)")}</span>
       <span class="spacer" style="flex:1"></span>
       ${expiryPill(a.expiry_state, a.expires_in_seconds)}
@@ -658,6 +672,7 @@ function renderAccounts(accounts) {
       <span class="acct-btns">
         <button class="ghost" data-up="${esc(a.id)}" type="button" title="上移（仅影响展示顺序）"${i === 0 ? " disabled" : ""}>↑</button>
         <button class="ghost" data-down="${esc(a.id)}" type="button" title="下移（仅影响展示顺序）"${i === accounts.length - 1 ? " disabled" : ""}>↓</button>
+        <span class="btn-sep" aria-hidden="true"></span>
         <button class="ghost" data-models="${esc(a.id)}" type="button">模型</button>
         <button class="ghost" data-refresh="${esc(a.id)}" type="button">刷新令牌</button>
         <button class="ghost" data-refresh-id="${esc(a.id)}" type="button">刷新身份</button>

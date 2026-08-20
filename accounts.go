@@ -60,6 +60,13 @@ type StoredAccount struct {
 	UserID    string `json:"userId,omitempty"`
 	CreatedAt string `json:"createdAt,omitempty"`
 
+	// Order is the admin-page display position (1-based, dense after a Reorder).
+	// Zero means "never manually ordered" and sorts after every ordered account
+	// (see accountDisplayLess), so accounts added after a reorder land at the end
+	// with no special handling in the add/import paths. Display-only: never
+	// consulted by routing.
+	Order int `json:"order,omitempty"`
+
 	// Disabled omits the account from the round-robin pool: it is still stored,
 	// refreshed and shown on the admin page with usage, but never selected to
 	// serve requests. Defaults to false (opt-out), preserving legacy behaviour.
@@ -170,13 +177,15 @@ func (s *AccountStore) load() error {
 	return nil
 }
 
-// saveLocked writes the current accounts to disk atomically. Caller holds s.mu.
+// saveLocked writes the current accounts to disk atomically, in admin display
+// order (load() discards the array order into a map, so this is for human
+// readability of the file only). Caller holds s.mu.
 func (s *AccountStore) saveLocked() error {
 	list := make([]*StoredAccount, 0, len(s.accounts))
 	for _, a := range s.accounts {
 		list = append(list, a)
 	}
-	sort.Slice(list, func(i, j int) bool { return list[i].CreatedAt < list[j].CreatedAt })
+	sort.Slice(list, func(i, j int) bool { return accountDisplayLess(list[i], list[j]) })
 
 	out, err := json.MarshalIndent(accountsFile{Accounts: list}, "", "  ")
 	if err != nil {
@@ -368,6 +377,49 @@ func (s *AccountStore) UpdateLabel(id, label string) error {
 		return fmt.Errorf("account %s not found", id)
 	}
 	a.Label = label
+	return s.saveLocked()
+}
+
+// Reorder assigns the admin-page display order from ids, the caller's full
+// desired order. Display-only: no runtime/lifecycle/credential revision is
+// bumped and routing (RuntimeList) is unaffected. Every id must exist and be
+// unique; accounts missing from ids keep their current relative display order
+// after the listed ones (e.g. accounts added concurrently land at the end).
+// Orders are 1-based and dense across all accounts after the call; 0 means
+// never-ordered (sorts last, see accountDisplayLess). Validation runs before
+// any mutation, so a failed call leaves the store untouched.
+func (s *AccountStore) Reorder(ids []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(ids) == 0 {
+		return errors.New("ids must not be empty")
+	}
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if _, ok := s.accounts[id]; !ok {
+			return fmt.Errorf("account %s not found", id)
+		}
+		if seen[id] {
+			return fmt.Errorf("duplicate account id %s", id)
+		}
+		seen[id] = true
+	}
+	next := 1
+	for _, id := range ids {
+		s.accounts[id].Order = next
+		next++
+	}
+	rest := make([]*StoredAccount, 0, len(s.accounts)-len(ids))
+	for _, a := range s.accounts {
+		if !seen[a.ID] {
+			rest = append(rest, a)
+		}
+	}
+	sort.Slice(rest, func(i, j int) bool { return accountDisplayLess(rest[i], rest[j]) })
+	for _, a := range rest {
+		a.Order = next
+		next++
+	}
 	return s.saveLocked()
 }
 
@@ -569,7 +621,9 @@ func (s *AccountStore) Runtime(id string) (accountRuntime, bool) {
 }
 
 // RuntimeList returns atomic account-and-revision snapshots ordered by account
-// creation time, matching List's stable routing order.
+// creation time. This creation-time order is the routing order (the round-robin
+// cursor iterates it) and is intentionally independent of the admin display
+// order in List: manual reordering must never affect request distribution.
 func (s *AccountStore) RuntimeList() []accountRuntime {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -752,7 +806,27 @@ func (s *AccountStore) findDuplicateLocked(candidate StoredAccount) (string, boo
 	return "", false
 }
 
-// List returns copies of all stored accounts, ordered by creation time.
+// accountDisplayLess reports the admin display order: accounts with a manual
+// order come first ascending (Order is 1-based); never-ordered accounts
+// (Order 0) come last, by creation time then id. RuntimeList deliberately does
+// NOT use this — its creation-time order feeds round-robin routing and must
+// stay independent of display order.
+func accountDisplayLess(a, b *StoredAccount) bool {
+	if a.Order == 0 || b.Order == 0 {
+		if a.Order != b.Order {
+			return b.Order == 0
+		}
+	} else if a.Order != b.Order {
+		return a.Order < b.Order
+	}
+	if a.CreatedAt != b.CreatedAt {
+		return a.CreatedAt < b.CreatedAt
+	}
+	return a.ID < b.ID
+}
+
+// List returns copies of all stored accounts, in admin display order (manual
+// order, then creation time).
 func (s *AccountStore) List() []StoredAccount {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -760,7 +834,7 @@ func (s *AccountStore) List() []StoredAccount {
 	for _, a := range s.accounts {
 		out = append(out, *a)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt < out[j].CreatedAt })
+	sort.Slice(out, func(i, j int) bool { return accountDisplayLess(&out[i], &out[j]) })
 	return out
 }
 

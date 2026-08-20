@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +40,7 @@ func (s *Server) AdminHandler() http.Handler {
 	r.Post("/api/login/start", s.handleLoginStart)
 	r.Post("/api/accounts/delete", s.handleAccountDelete)
 	r.Post("/api/accounts/label", s.handleAccountLabel)
+	r.Post("/api/accounts/reorder", s.handleAccountReorder)
 	r.Post("/api/accounts/disable", s.handleAccountDisable)
 	r.Post("/api/accounts/overage", s.handleAccountOverage)
 	r.Post("/api/accounts/import", s.handleAccountImport)
@@ -173,6 +175,12 @@ func (s *Server) accountsStatus(ctx context.Context, now time.Time) []map[string
 		return []map[string]any{}
 	}
 	credsList := s.selector.listAll()
+	// Re-sort into the store's admin display order (accountDisplayLess) so the
+	// panel reflects manual reordering. listAll's own creation-time order is the
+	// routing order for the round-robin cursor and must stay independent of it.
+	sort.Slice(credsList, func(i, j int) bool {
+		return accountDisplayLess(&credsList[i].acct, &credsList[j].acct)
+	})
 	results := make([]map[string]any, len(credsList))
 	if len(credsList) == 0 {
 		return results
@@ -576,6 +584,32 @@ func (s *Server) handleAccountLabel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.accounts.UpdateLabel(body.ID, strings.TrimSpace(body.Label)); err != nil {
+		adminError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleAccountReorder sets the admin-page display order of the pool from the
+// full ordered id list. Display-only: routing keeps its own creation-time
+// order and no runtime revisions are bumped.
+func (s *Server) handleAccountReorder(w http.ResponseWriter, r *http.Request) {
+	if s.accounts == nil {
+		adminError(w, http.StatusServiceUnavailable, "account store is not configured")
+		return
+	}
+	var body struct {
+		IDs []string `json:"ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		adminError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if len(body.IDs) == 0 {
+		adminError(w, http.StatusBadRequest, "ids is required")
+		return
+	}
+	if err := s.accounts.Reorder(body.IDs); err != nil {
 		adminError(w, http.StatusNotFound, err.Error())
 		return
 	}

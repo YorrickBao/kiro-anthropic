@@ -476,6 +476,7 @@ const fmtDate = (s) => { if (!s) return "—"; const d = new Date(s); return isN
 
 let lastUpdateCheck = 0;
 let loaded = false; // whether the first status poll has completed successfully
+let currentAccounts = []; // accounts from the last status poll, in display order
 
 // setStatusBar toggles the inline loading/error indicator above the account grid.
 function setStatusBar(text, isErr) {
@@ -629,7 +630,7 @@ function renderAccounts(accounts) {
     el.innerHTML = '<span class="muted">尚无账号。请在上方登录或导入本机凭据。</span>';
     return;
   }
-  el.innerHTML = accounts.map(a => `<div class="acct${a.disabled ? "" : " enabled"}">
+  el.innerHTML = accounts.map((a, i) => `<div class="acct${a.disabled ? "" : " enabled"}">
     <div class="top">
       <span class="email">${esc(a.email || "(无邮箱)")}</span>
       <span class="spacer" style="flex:1"></span>
@@ -655,6 +656,8 @@ function renderAccounts(accounts) {
       </label>
       <span style="flex:1"></span>
       <span class="acct-btns">
+        <button class="ghost" data-up="${esc(a.id)}" type="button" title="上移（仅影响展示顺序）"${i === 0 ? " disabled" : ""}>↑</button>
+        <button class="ghost" data-down="${esc(a.id)}" type="button" title="下移（仅影响展示顺序）"${i === accounts.length - 1 ? " disabled" : ""}>↓</button>
         <button class="ghost" data-models="${esc(a.id)}" type="button">模型</button>
         <button class="ghost" data-refresh="${esc(a.id)}" type="button">刷新令牌</button>
         <button class="ghost" data-refresh-id="${esc(a.id)}" type="button">刷新身份</button>
@@ -664,6 +667,8 @@ function renderAccounts(accounts) {
   </div>`).join("");
   el.querySelectorAll("button[data-del]").forEach(b => b.addEventListener("click", () => deleteAccount(b.dataset.del)));
   el.querySelectorAll("button[data-edit]").forEach(b => b.addEventListener("click", () => editLabel(b.dataset.edit, b.dataset.label)));
+  el.querySelectorAll("button[data-up]").forEach(b => b.addEventListener("click", () => moveAccount(b.dataset.up, -1, b)));
+  el.querySelectorAll("button[data-down]").forEach(b => b.addEventListener("click", () => moveAccount(b.dataset.down, 1, b)));
   el.querySelectorAll("button[data-models]").forEach(b => b.addEventListener("click", () => openModels(b.dataset.models, b)));
   el.querySelectorAll("button[data-refresh]").forEach(b => b.addEventListener("click", () => refreshAccount(b.dataset.refresh, b)));
   el.querySelectorAll("button[data-refresh-id]").forEach(b => b.addEventListener("click", () => refreshIdentity(b.dataset.refreshId, b)));
@@ -887,6 +892,31 @@ async function toggleAccount(id, enable, cb) {
   }
 }
 
+// moveAccount moves one account one slot up (-1) or down (+1) in the display
+// order and posts the resulting full id list. Display-only: request routing is
+// unaffected.
+async function moveAccount(id, dir, btn) {
+  if (!id) return;
+  const ids = currentAccounts.map(a => a.id);
+  const i = ids.indexOf(id), j = i + dir;
+  if (i < 0 || j < 0 || j >= ids.length) return;
+  [ids[i], ids[j]] = [ids[j], ids[i]];
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch("/api/accounts/reorder", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids })
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error((d.error && d.error.message) || ("HTTP " + res.status));
+    await tick();
+  } catch (e) {
+    alert("排序失败: " + e.message);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function toggleOverage(id, enable, cb) {
   if (!id) return;
   // `enable` is the checkbox's new (checked) state, sent as overageEnabled
@@ -1079,6 +1109,7 @@ async function tick() {
     $("ver").textContent = d.version
       ? (d.version.startsWith("v") ? d.version : "v" + d.version)
       : "";
+    currentAccounts = d.accounts || [];
     renderAccounts(d.accounts);
     $("updated").textContent = "更新于 " + new Date().toLocaleTimeString();
     loaded = true;

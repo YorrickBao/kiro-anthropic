@@ -303,6 +303,59 @@ func TestAccountStoreUpdateLabel(t *testing.T) {
 	assert.Error(t, s.UpdateLabel("missing", "x"))
 }
 
+func accountListIDs(list []StoredAccount) []string {
+	ids := make([]string, 0, len(list))
+	for _, a := range list {
+		ids = append(ids, a.ID)
+	}
+	return ids
+}
+
+func TestAccountStoreReorderDisplayOrder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "accounts.json")
+	s, err := NewAccountStore(path)
+	require.NoError(t, err)
+	require.NoError(t, s.Add(&StoredAccount{ID: "a", CreatedAt: "2020-01-01T00:00:00Z"}))
+	require.NoError(t, s.Add(&StoredAccount{ID: "b", CreatedAt: "2020-01-02T00:00:00Z"}))
+	require.NoError(t, s.Add(&StoredAccount{ID: "c", CreatedAt: "2020-01-03T00:00:00Z"}))
+
+	// Backward compat: no manual order yet, so List keeps creation-time order.
+	assert.Equal(t, []string{"a", "b", "c"}, accountListIDs(s.List()))
+
+	revs := map[string]uint64{
+		"a": runtimeRevision(t, s, "a"),
+		"b": runtimeRevision(t, s, "b"),
+		"c": runtimeRevision(t, s, "c"),
+	}
+
+	// Reorder applies and persists across a reload.
+	require.NoError(t, s.Reorder([]string{"c", "a", "b"}))
+	assert.Equal(t, []string{"c", "a", "b"}, accountListIDs(s.List()))
+	s2, err := NewAccountStore(path)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"c", "a", "b"}, accountListIDs(s2.List()))
+
+	// Display-only: no runtime revision moved.
+	for id, before := range revs {
+		assert.Equal(t, before, runtimeRevision(t, s, id), "reorder must not bump the runtime revision of %s", id)
+	}
+
+	// Validation runs before mutation: bad calls leave the order untouched.
+	assert.Error(t, s.Reorder(nil))
+	assert.Error(t, s.Reorder([]string{"a", "ghost"}))
+	assert.Error(t, s.Reorder([]string{"a", "a"}))
+	assert.Equal(t, []string{"c", "a", "b"}, accountListIDs(s.List()))
+
+	// Accounts added after a reorder land at the end (Order 0 = never-ordered).
+	require.NoError(t, s.Add(&StoredAccount{ID: "d", CreatedAt: "2020-01-04T00:00:00Z"}))
+	assert.Equal(t, []string{"c", "a", "b", "d"}, accountListIDs(s.List()))
+
+	// Partial reorder: unlisted accounts keep their relative order after the
+	// listed ones.
+	require.NoError(t, s.Reorder([]string{"d"}))
+	assert.Equal(t, []string{"d", "c", "a", "b"}, accountListIDs(s.List()))
+}
+
 func TestAccountStoreUpdateIdentity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "accounts.json")
 	s, err := NewAccountStore(path)

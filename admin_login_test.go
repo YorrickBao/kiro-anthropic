@@ -208,6 +208,48 @@ func TestAdminStatusPerAccount(t *testing.T) {
 	assert.NotContains(t, rr.Body.String(), "refresh_token")
 }
 
+func TestAdminAccountReorderEndpoint(t *testing.T) {
+	s, h, _ := newAdminTestServer(t)
+	require.NoError(t, s.accounts.Add(&StoredAccount{ID: "a1", CreatedAt: "2020-01-01T00:00:00Z"}))
+	require.NoError(t, s.accounts.Add(&StoredAccount{ID: "a2", CreatedAt: "2020-01-02T00:00:00Z"}))
+	require.NoError(t, s.accounts.Add(&StoredAccount{ID: "a3", CreatedAt: "2020-01-03T00:00:00Z"}))
+
+	listIDs := func(target string) []string {
+		rr := doAdmin(h, http.MethodGet, target, "")
+		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+		var resp struct {
+			Accounts []map[string]any `json:"accounts"`
+		}
+		require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+		ids := make([]string, 0, len(resp.Accounts))
+		for _, a := range resp.Accounts {
+			ids = append(ids, a["id"].(string))
+		}
+		return ids
+	}
+
+	// Before any reorder both surfaces follow creation-time order.
+	assert.Equal(t, []string{"a1", "a2", "a3"}, listIDs("/api/accounts.json"))
+	assert.Equal(t, []string{"a1", "a2", "a3"}, listIDs("/api/status.json"))
+
+	rr := doAdmin(h, http.MethodPost, "/api/accounts/reorder", `{"ids":["a3","a1","a2"]}`)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var resp struct {
+		OK bool `json:"ok"`
+	}
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	assert.True(t, resp.OK)
+
+	// The stored list and the status panel both reflect the new display order.
+	assert.Equal(t, []string{"a3", "a1", "a2"}, listIDs("/api/accounts.json"))
+	assert.Equal(t, []string{"a3", "a1", "a2"}, listIDs("/api/status.json"))
+
+	// Bad body -> 400, empty ids -> 400, unknown id -> 404.
+	assert.Equal(t, http.StatusBadRequest, doAdmin(h, http.MethodPost, "/api/accounts/reorder", `{`).Code)
+	assert.Equal(t, http.StatusBadRequest, doAdmin(h, http.MethodPost, "/api/accounts/reorder", `{"ids":[]}`).Code)
+	assert.Equal(t, http.StatusNotFound, doAdmin(h, http.MethodPost, "/api/accounts/reorder", `{"ids":["a1","ghost"]}`).Code)
+}
+
 func TestAdminCallbackStateMismatch(t *testing.T) {
 	_, h, _ := newAdminTestServer(t)
 	cb := doAdmin(h, http.MethodGet, "/oauth/callback?code=x&state=unknown", "")

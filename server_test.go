@@ -1115,3 +1115,14 @@ func TestHandleModelsPagination(t *testing.T) {
 	s.handleModels(rr, httptest.NewRequest(http.MethodGet, "/v1/models?limit=0", nil))
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 }
+
+func TestModelInfoJSONOMPAliases(t *testing.T) {
+	m := kiroModelInfo{ModelID: "m1", ModelName: "M1"}
+	m.TokenLimits.MaxInputTokens = 200000
+	m.TokenLimits.MaxOutputTokens = 64000
+	info := modelInfoJSON(m, "2026-09-01T00:00:00Z")
+	assert.Equal(t, 200000, info["context_length"], "oh-my-pi reads context_length")
+	assert.Equal(t, 64000, info["max_completion_tokens"], "oh-my-pi reads max_completion_tokens")
+	assert.Equal(t, "M1", info["display_name"])
+	assert.Equal(t, "model", info["type"])
+}

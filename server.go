@@ -398,9 +398,12 @@ func modelInfoJSON(m kiroModelInfo, now string) map[string]any {
 	}
 	if m.TokenLimits.MaxInputTokens > 0 {
 		info["max_input_tokens"] = m.TokenLimits.MaxInputTokens
+		// Aliases read by oh-my-pi's anthropic-messages model mapper.
+		info["context_length"] = m.TokenLimits.MaxInputTokens
 	}
 	if m.TokenLimits.MaxOutputTokens > 0 {
 		info["max_tokens"] = m.TokenLimits.MaxOutputTokens
+		info["max_completion_tokens"] = m.TokenLimits.MaxOutputTokens
 	}
 	if m.RateMultiplier > 0 {
 		info["rate_multiplier"] = m.RateMultiplier

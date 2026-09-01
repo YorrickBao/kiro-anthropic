@@ -3,7 +3,6 @@ package main
 import (
 	"net/http"
 	"regexp"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -11,23 +10,14 @@ import (
 func TestKiroUserAgent(t *testing.T) {
 	t.Run("with machine id", func(t *testing.T) {
 		ua := kiroUserAgent("deadbeef")
-		if !strings.Contains(ua, "aws-sdk-js/"+awsSDKVersion) {
-			t.Errorf("ua missing aws-sdk-js version: %q", ua)
-		}
-		if !strings.Contains(ua, "KiroIDE-"+kiroIDEVersion+"-deadbeef") {
-			t.Errorf("ua missing KiroIDE suffix with fingerprint: %q", ua)
-		}
-		if !strings.Contains(ua, "api/codewhispererstreaming#") {
-			t.Errorf("ua missing streaming api marker: %q", ua)
-		}
-		if !strings.Contains(ua, "lang/js") {
-			t.Errorf("ua missing lang/js marker: %q", ua)
+		if !strings.HasPrefix(ua, "kiro-cli/"+kiroCLIVersion+"-deadbeef") {
+			t.Errorf("ua should be kiro-cli/<version>-<fingerprint>, got: %q", ua)
 		}
 	})
 	t.Run("without machine id", func(t *testing.T) {
 		ua := kiroUserAgent("")
-		if !strings.HasSuffix(ua, "KiroIDE-"+kiroIDEVersion) {
-			t.Errorf("ua should end with bare KiroIDE version when no fingerprint: %q", ua)
+		if ua != "kiro-cli/"+kiroCLIVersion {
+			t.Errorf("ua should be the bare kiro-cli version, got: %q", ua)
 		}
 	})
 	t.Run("never leaks kiro-anthropic", func(t *testing.T) {
@@ -40,11 +30,8 @@ func TestKiroUserAgent(t *testing.T) {
 
 func TestKiroAmzUserAgent(t *testing.T) {
 	got := kiroAmzUserAgent("abc")
-	if !strings.HasPrefix(got, "aws-sdk-js/"+awsSDKVersion+" KiroIDE-") {
+	if got != "kiro-cli/"+kiroCLIVersion {
 		t.Errorf("unexpected x-amz-user-agent: %q", got)
-	}
-	if !strings.Contains(got, "abc") {
-		t.Errorf("x-amz-user-agent missing fingerprint: %q", got)
 	}
 }
 
@@ -79,8 +66,8 @@ func TestApplyKiroHeaders(t *testing.T) {
 	applyKiroHeaders(req, "tok-123", "fp-abc")
 
 	checks := map[string]string{
-		"User-Agent":             "aws-sdk-js/",
-		"X-Amz-User-Agent":       "KiroIDE-",
+		"User-Agent":             "kiro-cli/",
+		"X-Amz-User-Agent":       "kiro-cli/",
 		"X-Amzn-Kiro-Agent-Mode": "vibe",
 		"Amz-Sdk-Invocation-Id":  "",
 		"Amz-Sdk-Request":        "attempt=1; max=3",
@@ -111,22 +98,7 @@ func TestApplyKiroHeadersEmptyTokenOmitsAuth(t *testing.T) {
 	if auth := req.Header.Get("Authorization"); auth != "" {
 		t.Errorf("empty token must not set Authorization, got %q", auth)
 	}
-	if ua := req.Header.Get("User-Agent"); !strings.Contains(ua, "KiroIDE-") {
+	if ua := req.Header.Get("User-Agent"); !strings.Contains(ua, "kiro-cli/") {
 		t.Errorf("UA still impersonates without token: %q", ua)
-	}
-}
-
-func TestKiroOSPlatform(t *testing.T) {
-	// kiroOSPlatform must mirror Node's process.platform exactly, since the
-	// AWS SDK for JS embeds that value in the UA and a mismatch makes the
-	// request *more* distinguishable, not less.
-	want := map[string]string{
-		"windows": "win32",
-		"darwin":  "darwin", // NOT "macos" — process.platform returns "darwin"
-		"linux":   "linux",
-	}
-	got := kiroOSPlatform()
-	if got != want[runtime.GOOS] {
-		t.Errorf("kiroOSPlatform() = %q for GOOS=%q, want %q", got, runtime.GOOS, want[runtime.GOOS])
 	}
 }

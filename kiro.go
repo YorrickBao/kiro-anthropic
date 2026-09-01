@@ -45,6 +45,8 @@ type kiroUserInputMessage struct {
 	Origin                  string                       `json:"origin,omitempty"`
 	UserInputMessageContext *kiroUserInputMessageContext `json:"userInputMessageContext,omitempty"`
 	Images                  []kiroImage                  `json:"images,omitempty"`
+	Documents               []kiroDocument               `json:"documents,omitempty"`
+	CachePoint              *kiroCachePoint              `json:"cachePoint,omitempty"`
 }
 
 // kiroImage is a CodeWhisperer ImageBlock. Over AWS JSON 1.0 the source bytes
@@ -92,6 +94,7 @@ type kiroAssistantMessage struct {
 	Content          string                `json:"content"`
 	ToolUses         []kiroToolUse         `json:"toolUses,omitempty"`
 	ReasoningContent *kiroReasoningContent `json:"reasoningContent,omitempty"`
+	CachePoint       *kiroCachePoint       `json:"cachePoint,omitempty"`
 }
 
 // kiroReasoningContent is the CodeWhisperer ReasoningContent union carried on an
@@ -112,6 +115,27 @@ type kiroToolUse struct {
 	ToolUseID string          `json:"toolUseId"`
 	Name      string          `json:"name"`
 	Input     json.RawMessage `json:"input,omitempty"`
+}
+
+// kiroDocument is a CodeWhisperer DocumentBlock carried on a user turn.
+// The shape mirrors the kiro-cli client model: a display name, a format
+// enum (csv | doc | md | pdf | txt | xls), and a base64 bytes source.
+type kiroDocument struct {
+	Name   string             `json:"name"`
+	Format string             `json:"format"`
+	Source kiroDocumentSource `json:"source"`
+}
+
+type kiroDocumentSource struct {
+	Bytes string `json:"bytes"` // base64-encoded document bytes
+}
+
+// kiroCachePoint is a CodeWhisperer prompt-caching breakpoint. Placing one on
+// a message marks the prefix up to it as a cache checkpoint, mirroring
+// Anthropic's cache_control. Live-verified against runtime.us-east-1.kiro.dev
+// (2026-09): {"type":"default"} is accepted and the stream completes.
+type kiroCachePoint struct {
+	Type string `json:"type"` // "default"
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -1147,4 +1148,83 @@ func TestToolLeakStreamingNoMarkerInDeltas(t *testing.T) {
 	assert.NotContains(t, joined, "function_c")
 	assert.Equal(t, "Weather:\n\n", joined)
 	assert.True(t, sawToolStart, "structured tool block still emitted")
+}
+
+func TestConvertDocumentForwarded(t *testing.T) {
+	areq := &anthropicRequest{
+		Model: "claude-opus-4.8",
+		Messages: []anthropicMessage{{Role: "user", Content: json.RawMessage(
+			`[{"type":"document","title":"notes","source":{"type":"base64","media_type":"application/pdf","data":"QUJD"}}]`)}},
+	}
+	k, err := buildKiroRequest(&Config{}, areq)
+	require.NoError(t, err)
+	um := k.ConversationState.CurrentMessage.UserInputMessage
+	require.Len(t, um.Documents, 1)
+	assert.Equal(t, "notes", um.Documents[0].Name)
+	assert.Equal(t, "pdf", um.Documents[0].Format)
+	assert.Equal(t, "QUJD", um.Documents[0].Source.Bytes)
+}
+
+func TestConvertDocumentTextSource(t *testing.T) {
+	b := anthropicContentBlock{Type: "document", Title: "readme",
+		Source: &anthropicImageSource{Type: "text", MediaType: "text/plain", Data: "hello"}}
+	doc, ok := convertDocument(b)
+	require.True(t, ok)
+	assert.Equal(t, "txt", doc.Format)
+	enc := base64.StdEncoding.EncodeToString([]byte("hello"))
+	assert.Equal(t, enc, doc.Source.Bytes)
+}
+
+func TestConvertDocumentUnsupportedMediaType(t *testing.T) {
+	b := anthropicContentBlock{Type: "document",
+		Source: &anthropicImageSource{Type: "base64", MediaType: "application/zip", Data: "UEs="}}
+	_, ok := convertDocument(b)
+	assert.False(t, ok)
+}
+
+func TestCachePointAttached(t *testing.T) {
+	areq := &anthropicRequest{
+		Model: "claude-opus-4.8",
+		Messages: []anthropicMessage{{Role: "user", Content: json.RawMessage(
+			`[{"type":"text","text":"big context"},{"type":"text","text":"question","cache_control":{"type":"ephemeral"}}]`)}},
+	}
+	k, err := buildKiroRequest(&Config{}, areq)
+	require.NoError(t, err)
+	require.NotNil(t, k.ConversationState.CurrentMessage.UserInputMessage.CachePoint)
+	assert.Equal(t, "default", k.ConversationState.CurrentMessage.UserInputMessage.CachePoint.Type)
+
+	// Serialized wire names must match the kiro-cli model.
+	out, err := json.Marshal(k)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), `"cachePoint":{"type":"default"}`)
+}
+
+func TestCachePointOmittedWithoutBreakpoint(t *testing.T) {
+	areq := &anthropicRequest{
+		Model: "claude-opus-4.8",
+		Messages: []anthropicMessage{{Role: "user", Content: json.RawMessage(
+			`[{"type":"text","text":"no breakpoints here"}]`)}},
+	}
+	k, err := buildKiroRequest(&Config{}, areq)
+	require.NoError(t, err)
+	assert.Nil(t, k.ConversationState.CurrentMessage.UserInputMessage.CachePoint)
+}
+
+func TestAssistantCachePointAttached(t *testing.T) {
+	areq := &anthropicRequest{
+		Model: "claude-opus-4.8",
+		Messages: []anthropicMessage{
+			{Role: "user", Content: json.RawMessage(`"hi"`)},
+			{Role: "assistant", Content: json.RawMessage(
+				`[{"type":"text","text":"prefill","cache_control":{"type":"ephemeral"}}]`)},
+		},
+	}
+	k, err := buildKiroRequest(&Config{}, areq)
+	require.NoError(t, err)
+	// Prefill assistant turn is pushed into history.
+	require.NotEmpty(t, k.ConversationState.History)
+	am := k.ConversationState.History[len(k.ConversationState.History)-1].AssistantResponseMessage
+	require.NotNil(t, am)
+	require.NotNil(t, am.CachePoint)
+	assert.Equal(t, "default", am.CachePoint.Type)
 }

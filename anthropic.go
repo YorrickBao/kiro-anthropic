@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -106,8 +107,10 @@ type anthropicContentBlock struct {
 	// redacted_thinking
 	Data string `json:"data,omitempty"`
 
-	// image
 	Source *anthropicImageSource `json:"source,omitempty"`
+
+	// document
+	Title string `json:"title,omitempty"` // display name for document blocks
 
 	// tool_use
 	ID    string          `json:"id,omitempty"`
@@ -157,6 +160,53 @@ func convertImage(b anthropicContentBlock) (kiroImage, bool) {
 		return kiroImage{}, false
 	}
 	return kiroImage{Format: format, Source: kiroImageSource{Bytes: b.Source.Data}}, true
+}
+
+// documentMediaTypeToKiroFormat maps an Anthropic document media_type to a
+// kiro-cli DocumentBlock format enum (csv | doc | md | pdf | txt | xls).
+// Live-verified against runtime.us-east-1.kiro.dev: the documents member and
+// its {name, format, source:{bytes}} shape are accepted (2026-09).
+func documentMediaTypeToKiroFormat(mt string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(mt)) {
+	case "application/pdf":
+		return "pdf", true
+	case "text/plain":
+		return "txt", true
+	case "text/csv":
+		return "csv", true
+	case "text/markdown":
+		return "md", true
+	case "application/msword":
+		return "doc", true
+	case "application/vnd.ms-excel":
+		return "xls", true
+	}
+	return "", false
+}
+
+// convertDocument maps an Anthropic document block to a kiro-cli-style
+// DocumentBlock. Only base64 sources with a supported media type are handled
+// (Anthropic "text" sources are inlined by re-encoding; url sources are
+// skipped).
+func convertDocument(b anthropicContentBlock) (kiroDocument, bool) {
+	if b.Source == nil || b.Source.Data == "" {
+		return kiroDocument{}, false
+	}
+	format, ok := documentMediaTypeToKiroFormat(b.Source.MediaType)
+	if !ok {
+		return kiroDocument{}, false
+	}
+	name := b.Title
+	if name == "" {
+		name = "document"
+	}
+	data := b.Source.Data
+	if strings.EqualFold(b.Source.Type, "text") {
+		// Anthropic text documents carry raw text; the Kiro DocumentBlock
+		// source is always base64 bytes, so re-encode.
+		data = base64.StdEncoding.EncodeToString([]byte(b.Source.Data))
+	}
+	return kiroDocument{Name: name, Format: format, Source: kiroDocumentSource{Bytes: data}}, true
 }
 
 // ---------------------------------------------------------------------------
@@ -551,7 +601,11 @@ func convertMessage(m anthropicMessage, modelID string) (kiroMessage, error) {
 	if m.Role == "assistant" {
 		am := &kiroAssistantMessage{}
 		var text strings.Builder
+		var hasCacheBreakpoint bool
 		for _, b := range blocks {
+			if b.CacheControl != nil {
+				hasCacheBreakpoint = true
+			}
 			switch b.Type {
 			case "text":
 				text.WriteString(b.Text)
@@ -579,6 +633,9 @@ func convertMessage(m anthropicMessage, modelID string) (kiroMessage, error) {
 				})
 			}
 		}
+		if hasCacheBreakpoint {
+			am.CachePoint = &kiroCachePoint{Type: "default"}
+		}
 		am.Content = text.String()
 		// An assistant turn carrying tool uses is well-formed with empty
 		// content; only a degenerate turn with neither text nor tool uses
@@ -594,7 +651,12 @@ func convertMessage(m anthropicMessage, modelID string) (kiroMessage, error) {
 	var text strings.Builder
 	var toolResults []kiroToolResult
 	var images []kiroImage
+	var documents []kiroDocument
+	var hasCacheBreakpoint bool
 	for _, b := range blocks {
+		if b.CacheControl != nil {
+			hasCacheBreakpoint = true
+		}
 		switch b.Type {
 		case "text":
 			text.WriteString(b.Text)
@@ -607,18 +669,31 @@ func convertMessage(m anthropicMessage, modelID string) (kiroMessage, error) {
 				// Unsupported source (e.g. url) — note it so the model knows.
 				text.WriteString("\n[unsupported image omitted]\n")
 			}
+		case "document":
+			if doc, ok := convertDocument(b); ok {
+				documents = append(documents, doc)
+			} else {
+				// Unsupported source or media type — note it so the model knows.
+				text.WriteString("\n[unsupported document omitted]\n")
+			}
 		}
 	}
 	um.Content = text.String()
 	if len(images) > 0 {
 		um.Images = images
 	}
+	if len(documents) > 0 {
+		um.Documents = documents
+	}
+	if hasCacheBreakpoint {
+		um.CachePoint = &kiroCachePoint{Type: "default"}
+	}
 	if len(toolResults) > 0 {
 		um.UserInputMessageContext = &kiroUserInputMessageContext{ToolResults: toolResults}
 		// A tool-result turn often has no text; CodeWhisperer tolerates empty
 		// content here as long as toolResults are present.
 	}
-	if um.Content == "" && len(toolResults) == 0 && len(images) == 0 {
+	if um.Content == "" && len(toolResults) == 0 && len(images) == 0 && len(documents) == 0 {
 		um.Content = " "
 	}
 	return kiroMessage{UserInputMessage: um}, nil

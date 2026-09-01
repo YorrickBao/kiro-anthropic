@@ -50,7 +50,9 @@
 - **Anthropic Messages API** `POST /v1/messages`，支持**流式（SSE）**与**非流式**。
 - **工具调用 / 函数调用**：完整的 `tools` → `tool_use` → `tool_result` 多轮闭环。
 - **图片输入**：`png` / `jpeg` / `gif` / `webp`（已实测可正常识图）。支持 base64，也支持远程 `url`（下载后内联为 base64，带 SSRF 防护、15s 超时与 10MB 上限）。
-- **系统提示词**：`system` 原生透传到 Kiro 的 `systemPrompt`。
+- **文档输入**：user 消息中的 `document` 块（base64，`application/pdf` / `text/plain` / `text/markdown` / `text/csv` 等）映射为 Kiro 的 `documents` 字段转发（已实测，模型可正确读取文档内容）；`text` source 自动重编码为 base64；不支持的 media type 留 `[unsupported document omitted]` 提示。
+- **提示缓存**：携带 `cache_control` 断点的消息会在对应 Kiro 消息上附加 `cachePoint`（`{"type":"default"}`）标记，让后端缓存消息前缀（已实测接受）。
+- **系统提示词**：`system` 注入为历史首组 user/assistant 消息下发（实测 Kiro runtime 至今仍拒绝顶层 `systemPrompt` 字段，400 "Improperly formed request"）。
 - **推理 effort**：读取请求里的 `output_config.effort` / `reasoning_effort`，**未指定时默认顶格**，并按每个模型的档位自动 clamp。
 - **扩展思考（extended thinking）**：模型的思考过程通过 Anthropic 原生的 `thinking` / `redacted_thinking` 内容块透传（流式下发 `thinking_delta` + `signature_delta`）。多轮对话时思考块连同 `signature` 原样回传给后端；若后端判定签名失效（`THINKING_SIGNATURE_INVALID`），自动剥离推理内容并重试一次。请求侧 `thinking: {type:"disabled"}` 会关闭思考块并把 effort 降到最低档。
 - **最大输出 tokens**：按模型 schema 把调用方的 `max_tokens` 下发给 Kiro。**注意：实测 Kiro 后端不强制执行该上限**，实际输出长度由模型/effort 决定，`stop_reason` 基本不会是 `max_tokens`。该字段仅为协议兼容而发送。

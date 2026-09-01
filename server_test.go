@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1040,4 +1041,77 @@ func TestIsPromptTooLongError(t *testing.T) {
 		ReasonCode: "PROMPT_TOO_LONG",
 	}), "only request-level 400 errors should match")
 	assert.False(t, isPromptTooLongError(context.Canceled))
+}
+
+func TestHandleModelsPagination(t *testing.T) {
+	// Pagination works purely on the handler output; use a server whose
+	// upstream returns a fixed multi-model list.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if r := recover(); r != nil {
+			panic(r)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+	target, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+	client := &http.Client{Transport: &rewriteTransport{host: target.Host, scheme: target.Scheme}}
+	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
+	require.NoError(t, err)
+	require.NoError(t, store.Add(&StoredAccount{
+		ID: "acc", ClientID: "client", ClientSecret: "secret", RefreshToken: "refresh",
+		AccessToken: "access", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+		Region: "us-east-1", ProfileArn: "arn:test", CreatedAt: "1",
+	}))
+	s := NewServer(&Config{}, client)
+	s.setAccounts(store, client)
+
+	// Bypass live fetching: seed the models cache with a known ordering.
+	models := []kiroModelInfo{
+		{ModelID: "m1", ModelName: "M1"},
+		{ModelID: "m2", ModelName: "M2"},
+		{ModelID: "m3", ModelName: "M3"},
+		{ModelID: "m4", ModelName: "M4"},
+	}
+	s.modelsMu.Lock()
+	s.modelsCache["acc"] = modelsCacheEntry{models: models, fetched: time.Now(), revision: 1}
+	s.modelsMu.Unlock()
+
+	do := func(q string) map[string]any {
+		rr := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/v1/models"+q, nil)
+		s.handleModels(rr, r)
+		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+		var out map[string]any
+		require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &out))
+		return out
+	}
+	ids := func(m map[string]any) []string {
+		out := []string{}
+		for _, d := range m["data"].([]any) {
+			out = append(out, d.(map[string]any)["id"].(string))
+		}
+		return out
+	}
+
+	full := do("")
+	assert.False(t, full["has_more"].(bool))
+	assert.Equal(t, []string{"m1", "m2", "m3", "m4"}, ids(full))
+
+	p1 := do("?limit=2")
+	assert.Equal(t, []string{"m1", "m2"}, ids(p1))
+	assert.True(t, p1["has_more"].(bool))
+	assert.Equal(t, "m1", p1["first_id"])
+	assert.Equal(t, "m2", p1["last_id"])
+
+	p2 := do("?limit=2&after_id=m2")
+	assert.Equal(t, []string{"m3", "m4"}, ids(p2))
+	assert.False(t, p2["has_more"].(bool))
+
+	afterLast := do("?after_id=m4")
+	assert.Empty(t, ids(afterLast))
+	assert.False(t, afterLast["has_more"].(bool))
+
+	rr := httptest.NewRecorder()
+	s.handleModels(rr, httptest.NewRequest(http.MethodGet, "/v1/models?limit=0", nil))
+	assert.Equal(t, http.StatusBadRequest, rr.Code)
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -345,7 +346,35 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resp := map[string]any{"data": data, "has_more": false}
+	// Anthropic Models API pagination: ?limit (1-1000, default 20) and
+	// ?after_id (return only models after this id in list order).
+	limit := 20
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			writeAnthropicError(w, r, http.StatusBadRequest, "invalid_request_error", "limit: must be an integer between 1 and 1000")
+			return
+		}
+		if n > 1000 {
+			n = 1000
+		}
+		limit = n
+	}
+	if after := r.URL.Query().Get("after_id"); after != "" {
+		for i, m := range data {
+			if m["id"] == after {
+				data = data[i+1:]
+				break
+			}
+		}
+	}
+	hasMore := false
+	if len(data) > limit {
+		data = data[:limit]
+		hasMore = true
+	}
+
+	resp := map[string]any{"data": data, "has_more": hasMore}
 	if len(data) > 0 {
 		resp["first_id"] = data[0]["id"]
 		resp["last_id"] = data[len(data)-1]["id"]

@@ -526,7 +526,10 @@ func TestAdminImportEndpointAndDedup(t *testing.T) {
 
 	store, err := NewAccountStore(filepath.Join(t.TempDir(), "accounts.json"))
 	require.NoError(t, err)
-	s := &Server{cfg: &Config{TokenFile: tokenFile}, accounts: store, login: newLoginManager(&http.Client{})}
+	old := localTokenFile
+	localTokenFile = tokenFile
+	defer func() { localTokenFile = old }()
+	s := &Server{cfg: &Config{}, accounts: store, login: newLoginManager(&http.Client{})}
 	h := s.AdminHandler()
 
 	// First import creates the account.
@@ -578,7 +581,10 @@ func TestAdminImportDoesNotOverwriteExisting(t *testing.T) {
 		AccessToken: "signin-acc", RefreshToken: "signin-ref", CreatedAt: "1",
 	}))
 
-	s := &Server{cfg: &Config{TokenFile: tokenFile}, accounts: store, login: newLoginManager(&http.Client{})}
+	old := localTokenFile
+	localTokenFile = tokenFile
+	defer func() { localTokenFile = old }()
+	s := &Server{cfg: &Config{}, accounts: store, login: newLoginManager(&http.Client{})}
 	rr := doAdmin(s.AdminHandler(), http.MethodPost, "/api/accounts/import", "")
 	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
 

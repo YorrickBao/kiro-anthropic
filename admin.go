@@ -293,7 +293,7 @@ func (s *Server) handleLoginCallback(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAccountImport imports the credentials from the local Kiro auth cache
-// (the --token-file and its client registration) into the multi-account store.
+// (the local Kiro token cache and its client registration) into the multi-account store.
 // An account already present is left untouched (reported via already_present),
 // never overwritten — see the dedup branch below for why.
 func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
@@ -301,7 +301,7 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		adminError(w, http.StatusServiceUnavailable, "account store is not configured")
 		return
 	}
-	acct, err := importLocalCredentials(r.Context(), s.login.client, s.cfg.TokenFile)
+	acct, err := importLocalCredentials(r.Context(), s.login.client, localTokenFile)
 	if err != nil {
 		noteError(r.Context(), err.Error())
 		adminError(w, http.StatusBadRequest, err.Error())

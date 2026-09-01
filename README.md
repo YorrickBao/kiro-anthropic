@@ -137,7 +137,6 @@ Claude Code 会自动发送 `x-claude-code-session-id`。服务会先去除首�
 | `--port` | `17890` | 监听端口（被占用时自动 +1 重试） |
 | `--admin-port` | `27890` | 管理页端口，**仅限本机访问**（被占用时自动 +1 重试） |
 | `--proxy` | `http://127.0.0.1:7890` | 出站代理；优先级：本参数 > `http(s)_proxy` 环境变量 > 内置默认；`none` 表示直连 |
-| `--token-file` | `~/.aws/sso/cache/kiro-auth-token.json` | Kiro 桌面端令牌文件路径：管理页「导入本机凭据」按钮读取的来源 |
 | `--accounts-file` | `~/.kiro-anthropic/accounts.json` | 账号池凭据的持久化存储路径 |
 | `--api-key` | 空（开放） | 设置后客户端须用 `x-api-key` 或 `Authorization: Bearer` 携带。绑非回环 `--host` 时为**必填** |
 | `--agent-mode` | `vibe` | Kiro agent 模式 |
@@ -180,7 +179,7 @@ http://127.0.0.1:27890/health      # 健康检查
 账号池由两种来源填充，都进**同一个池**，不区分主次：
 
 1. **管理页 IdC 登录**：填入 IdC 的 Start URL（形如 `https://your-org.awsapps.com/start`）与 Region，点「开始登录」；服务向 `oidc.<region>.amazonaws.com` 注册公共客户端，浏览器新窗口打开 AWS 授权页（**authorization_code + PKCE** 流程），批准后 AWS 回跳到 `/oauth/callback`，服务用授权码换取 `accessToken` / `refreshToken`，自动解析 `profileArn`，写入池。
-2. **管理页「导入本机凭据」按钮**：读取 `--token-file` 及其客户端注册文件（`<clientIdHash>.json`，找不到时扫描同目录），把当前 Kiro 桌面端账号一键纳入池。
+2. **管理页「导入本机凭据」按钮**：读取本地 Kiro 桌面端令牌缓存（`~/.aws/sso/cache/kiro-auth-token.json`）及其客户端注册文件（`<clientIdHash>.json`，找不到时扫描同目录），把当前 Kiro 桌面端账号一键纳入池。
 
 - **去重**：新账号按身份去重（优先级 `profileArn` > `email` > `clientId + refreshToken`）；命中已有账号时**原地刷新**其凭据，不新增记录。
 - **每账号自带 region / profileArn**：登录/导入时确定并存进该账号自身记录，没有全局 region 覆盖。

@@ -38,17 +38,21 @@ const defaultProxyURL = "http://127.0.0.1:7890"
 
 // Config holds everything the server needs to run.
 type Config struct {
-	Host          string
-	Port          int
-	AdminPort     int    // loopback-only management port (default 27890)
-	ProxyURL      string // outbound proxy for calls to AWS / kiro.dev (e.g. http://127.0.0.1:7890)
-	TokenFile     string // path to kiro-auth-token.json (source for the admin import button)
-	AccountsFile  string // path to the multi-account credential store
-	APIKey        string // optional key clients must send (x-api-key / Authorization)
-	AgentMode     string // Kiro agent mode, e.g. "vibe"
-	Log           bool   // enable request logging (off by default); logs to stdout unless LogFile is set
-	LogFile       string // if set, write the request log here instead of stdout ("none"/"off" disables)
+	Host         string
+	Port         int
+	AdminPort    int    // loopback-only management port (default 27890)
+	ProxyURL     string // outbound proxy for calls to AWS / kiro.dev (e.g. http://127.0.0.1:7890)
+	AccountsFile string // path to the multi-account credential store
+	APIKey       string // optional key clients must send (x-api-key / Authorization)
+	AgentMode    string // Kiro agent mode, e.g. "vibe"
+	Log          bool   // enable request logging (off by default); logs to stdout unless LogFile is set
+	LogFile      string // if set, write the request log here instead of stdout ("none"/"off" disables)
 }
+
+// localTokenFile is the Kiro desktop token cache read by the admin
+// "import local credentials" button. A var so tests can point it at fixture
+// files; there is deliberately no CLI flag for it.
+var localTokenFile = defaultTokenFile()
 
 func defaultTokenFile() string {
 	home, err := os.UserHomeDir()
@@ -109,7 +113,6 @@ func addServerFlags(cmd *cobra.Command, cfg *Config) {
 	f.IntVar(&cfg.AdminPort, "admin-port", 27890, "loopback-only management port (auto-increments if in use)")
 	f.StringVar(&cfg.ProxyURL, "proxy", "", "outbound HTTP proxy for AWS/Kiro calls; precedence: this flag > http(s)_proxy env > default "+defaultProxyURL+"; use 'none' to connect directly")
 	f.StringVar(&cfg.AccountsFile, "accounts-file", defaultAccountsFile(), "path to the multi-account credential store")
-	f.StringVar(&cfg.TokenFile, "token-file", defaultTokenFile(), "path to Kiro auth token JSON (read by the admin import button)")
 	f.StringVar(&cfg.APIKey, "api-key", "", "if set, clients must present this key via x-api-key or Authorization: Bearer")
 	f.StringVar(&cfg.AgentMode, "agent-mode", "vibe", "Kiro agent mode")
 	f.BoolVar(&cfg.Log, "log", false, "enable request logging to stdout (the window); off by default")

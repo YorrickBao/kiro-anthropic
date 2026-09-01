@@ -28,21 +28,30 @@ import (
 
 const kiroCLIVersion = "2.20.1"
 
-// kiroUserAgent returns the User-Agent the official kiro-cli sends. machineID,
-// when non-empty, is appended as a per-installation fingerprint so an account
-// pool does not look like N sessions on a single anonymous host.
-func kiroUserAgent(machineID string) string {
-	ua := "kiro-cli/" + kiroCLIVersion
+// kiroUABase renders the official kiro-cli User-Agent template:
+//
+//	KiroCLI/<version> KAS/ md/appVersion-<version> app/AmazonQ-For-CLI
+//
+// (extracted from the kiro-cli 2.20.1 binary; the KAS segment ships empty).
+// machineID, when non-empty, is appended as a per-installation fingerprint so
+// an account pool does not look like N sessions on a single anonymous host.
+func kiroUABase(machineID string) string {
+	ua := "KiroCLI/" + kiroCLIVersion
 	if machineID != "" {
 		ua += "-" + machineID
 	}
-	return ua
+	return ua + " KAS/ md/appVersion-" + kiroCLIVersion + " app/AmazonQ-For-CLI"
+}
+
+// kiroUserAgent returns the User-Agent the official kiro-cli sends.
+func kiroUserAgent(machineID string) string {
+	return kiroUABase(machineID)
 }
 
 // kiroAmzUserAgent returns the x-amz-user-agent value the official kiro-cli
-// sends: the plain CLI marker without the per-installation fingerprint.
+// sends: the bare CLI marker without the per-installation fingerprint.
 func kiroAmzUserAgent(string) string {
-	return "kiro-cli/" + kiroCLIVersion
+	return "KiroCLI/" + kiroCLIVersion
 }
 
 // applyKiroHeaders stamps a request with the full set of headers the official

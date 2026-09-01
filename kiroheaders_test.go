@@ -10,14 +10,16 @@ import (
 func TestKiroUserAgent(t *testing.T) {
 	t.Run("with machine id", func(t *testing.T) {
 		ua := kiroUserAgent("deadbeef")
-		if !strings.HasPrefix(ua, "kiro-cli/"+kiroCLIVersion+"-deadbeef") {
-			t.Errorf("ua should be kiro-cli/<version>-<fingerprint>, got: %q", ua)
+		want := "KiroCLI/" + kiroCLIVersion + "-deadbeef KAS/ md/appVersion-" + kiroCLIVersion + " app/AmazonQ-For-CLI"
+		if ua != want {
+			t.Errorf("ua = %q, want %q", ua, want)
 		}
 	})
 	t.Run("without machine id", func(t *testing.T) {
 		ua := kiroUserAgent("")
-		if ua != "kiro-cli/"+kiroCLIVersion {
-			t.Errorf("ua should be the bare kiro-cli version, got: %q", ua)
+		want := "KiroCLI/" + kiroCLIVersion + " KAS/ md/appVersion-" + kiroCLIVersion + " app/AmazonQ-For-CLI"
+		if ua != want {
+			t.Errorf("ua = %q, want %q", ua, want)
 		}
 	})
 	t.Run("never leaks kiro-anthropic", func(t *testing.T) {
@@ -30,7 +32,7 @@ func TestKiroUserAgent(t *testing.T) {
 
 func TestKiroAmzUserAgent(t *testing.T) {
 	got := kiroAmzUserAgent("abc")
-	if got != "kiro-cli/"+kiroCLIVersion {
+	if got != "KiroCLI/"+kiroCLIVersion {
 		t.Errorf("unexpected x-amz-user-agent: %q", got)
 	}
 }
@@ -66,8 +68,8 @@ func TestApplyKiroHeaders(t *testing.T) {
 	applyKiroHeaders(req, "tok-123", "fp-abc")
 
 	checks := map[string]string{
-		"User-Agent":             "kiro-cli/",
-		"X-Amz-User-Agent":       "kiro-cli/",
+		"User-Agent":             "KiroCLI/",
+		"X-Amz-User-Agent":       "KiroCLI/",
 		"X-Amzn-Kiro-Agent-Mode": "vibe",
 		"Amz-Sdk-Invocation-Id":  "",
 		"Amz-Sdk-Request":        "attempt=1; max=3",
@@ -98,7 +100,7 @@ func TestApplyKiroHeadersEmptyTokenOmitsAuth(t *testing.T) {
 	if auth := req.Header.Get("Authorization"); auth != "" {
 		t.Errorf("empty token must not set Authorization, got %q", auth)
 	}
-	if ua := req.Header.Get("User-Agent"); !strings.Contains(ua, "kiro-cli/") {
+	if ua := req.Header.Get("User-Agent"); !strings.Contains(ua, "KiroCLI/") {
 		t.Errorf("UA still impersonates without token: %q", ua)
 	}
 }

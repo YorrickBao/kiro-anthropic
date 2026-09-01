@@ -362,7 +362,7 @@ Anthropic 客户端 ──/v1/messages──►  kiro-anthropic  ──GenerateA
 
 对齐方式：从 kiro-cli 二进制提取 smithy 客户端模型（`strings` 即可，Rust 编译保留了 wire 字段名），核对以下要点；版本升级后建议重跑一遍：
 
-- **常量**：`kiroheaders.go` 的 `kiroCLIVersion`（User-Agent / `X-Amz-User-Agent` 发 `kiro-cli/<版本>`），随 kiro-cli 发布列车手动 bump。
+- **常量**：`kiroheaders.go` 的 `kiroCLIVersion`（User-Agent / `X-Amz-User-Agent` 发 `KiroCLI/<版本> KAS/ md/appVersion-<版本> app/AmazonQ-For-CLI`，x-amz 侧仅发 bare 标记），随 kiro-cli 发布列车手动 bump。
 - **运行时**：`runtime.<region>.kiro.dev` + `X-Amz-Target: AmazonCodeWhispererStreamingService.GenerateAssistantResponse`；请求成员 `conversationState` / `profileArn` / `agentMode` / `additionalModelRequestFields`（顶层 `systemPrompt` 至 2.20.1 仍被后端 400 拒绝，实测于 2026-09-01）。
 - **userInputMessage 成员**：`content` / `modelId` / `origin` / `userInputMessageContext` / `images` / `documents` / `cachePoint`（2026-09-01 实测 `documents` 与 `cachePoint:{"type":"default"}` 均被接受）。
 - **控制面**：`management.<region>.kiro.dev` 的 `ListAvailableModels`（target 名 `KiroControlPlaneBearerService.*` 与 `AmazonCodeWhispererService.*` 均被接受，2026-09-01 实测）、`ListAvailableProfiles`、`GET /getUsageLimits`。

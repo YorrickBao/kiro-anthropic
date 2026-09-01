@@ -40,6 +40,7 @@
 - [区域说明](#区域说明)
 - [限制](#限制)
 - [工作原理](#工作原理)
+- [与 kiro-cli 版本对齐](#与-kiro-cli-版本对齐)
 - [构建](#构建)
 - [目录结构](#目录结构)
 
@@ -351,6 +352,26 @@ Anthropic 客户端 ──/v1/messages──►  kiro-anthropic  ──GenerateA
 - 会话：有效 `x-claude-code-session-id` 同时驱动账号 rendezvous affinity 和进程内 Kiro `conversationId` UUID 映射；一次入站请求的所有物理发送复用同一个 ID。
 - 推理：向 `https://runtime.<region>.kiro.dev` 发送 `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`，解析其 `vnd.amazon.eventstream` 响应，再翻译回 Anthropic 的 SSE / JSON；`<region>` 取自被选中账号自身的记录。
 - 模型与 profile：通过 `https://management.<region>.kiro.dev` 的 `ListAvailableModels` / `ListAvailableProfiles` 获取。
+
+---
+
+## 与 kiro-cli 版本对齐
+
+本项目的线协议（请求结构、事件流、模型/额度控制面）以官方 **kiro-cli** 为参照客户端。对齐记录：
+
+| 日期 | kiro-cli 版本 | 说明 |
+|---|---|---|
+| 2026-09-01 | **2.20.1**（Homebrew cask `kiro-cli`） | 首次系统性对齐 |
+
+对齐方式：从 kiro-cli 二进制提取 smithy 客户端模型（`strings` 即可，Rust 编译保留了 wire 字段名），核对以下要点；版本升级后建议重跑一遍：
+
+- **常量**：`kiroheaders.go` 的 `kiroCLIVersion`（User-Agent / `X-Amz-User-Agent` 发 `kiro-cli/<版本>`），随 kiro-cli 发布列车手动 bump。
+- **运行时**：`runtime.<region>.kiro.dev` + `X-Amz-Target: AmazonCodeWhispererStreamingService.GenerateAssistantResponse`；请求成员 `conversationState` / `profileArn` / `agentMode` / `additionalModelRequestFields`（顶层 `systemPrompt` 至 2.20.1 仍被后端 400 拒绝，实测于 2026-09-01）。
+- **userInputMessage 成员**：`content` / `modelId` / `origin` / `userInputMessageContext` / `images` / `documents` / `cachePoint`（2026-09-01 实测 `documents` 与 `cachePoint:{"type":"default"}` 均被接受）。
+- **控制面**：`management.<region>.kiro.dev` 的 `ListAvailableModels`（target 名 `KiroControlPlaneBearerService.*` 与 `AmazonCodeWhispererService.*` 均被接受，2026-09-01 实测）、`ListAvailableProfiles`、`GET /getUsageLimits`。
+- **已知差异**：模型目录按**出口**个性化——同一账号经代理与直连拿到的列表可能不同（无 Claude → 有 Claude），排查"模型缺失"问题时先确认出口路径。
+
+注意：模型列表按账号/出口实时变化，代码中不注入任何静态模型；`fallbackModels` 仅在账号池完全无法获取列表时兜底 `/v1/models`。
 
 ---
 

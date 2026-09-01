@@ -362,7 +362,26 @@ Anthropic 客户端 ──/v1/messages──►  kiro-anthropic  ──GenerateA
 
 对齐方式：从 kiro-cli 二进制提取 smithy 客户端模型（`strings` 即可，Rust 编译保留了 wire 字段名），核对以下要点；版本升级后建议重跑一遍：
 
-- **常量**：`kiroheaders.go` 的 `kiroCLIVersion`（User-Agent / `X-Amz-User-Agent` 发 `KiroCLI/<版本> KAS/ md/appVersion-<版本> app/AmazonQ-For-CLI`，x-amz 侧仅发 bare 标记），随 kiro-cli 发布列车手动 bump。
+### 客户端身份面清单（改动必须逐一核对，缺一不可）
+
+客户端身份不是一个字符串，而是**一组必须互相自洽的表面**。本项目曾因只改了其中一个面、且用了未经发点验证的字符串而错了一版（详见下方教训）：
+
+| 身份面 | 当前值（2.20.1） | 代码位置 |
+|---|---|---|
+| `User-Agent` | `KiroCLI/<版本>[-<账号指纹>] KAS/ md/appVersion-<版本> app/AmazonQ-For-CLI` | `kiroheaders.go` `kiroUserAgent` |
+| `X-Amz-User-Agent` | `KiroCLI/<版本>`（bare，无指纹） | `kiroheaders.go` `kiroAmzUserAgent` |
+| IdC `RegisterClient.clientName` | `KiroCLI` | `login.go` |
+| `X-Amzn-Kiro-Agent-Mode` | `vibe` | `kiroheaders.go` `applyKiroHeaders` |
+
+### 教训（2026-09-01，v0.24.0 曾写错）
+
+1. **二进制里提取到字符串 ≠ 确认了它的用途**。`kiro-cli/2.20.1` 这个字符串属于 MCP oauth 工具模块，不是后端请求的 UA 构造点；真正的模板是 `KiroCLI/… KAS/ md/appVersion-… app/AmazonQ-For-CLI`。**必须沿着调用点（邻近的模块路径字符串、header 构造函数）确认发点**，而不是取"第一个长得像的"。
+2. **身份各面必须同一批改、一起验**。UA 改成 kiro-cli 而 SSO `clientName` 仍报 "Kiro IDE"，两个表面互相矛盾，比任何一个单独错误都更显眼。
+3. **"实测能用"只证明没被拒，不证明伪装成立**。后端对身份面通常宽松；对齐的目标是日志里不可分辨，这只能靠逐字比对发点，不能靠 200 响应。
+4. 版本升级时的最小动作：重新 `strings` 提取，逐条 diff 上表四个面的值 + UA 模板整体，再跑一次 README 记录的实测清单。
+
+### 协议面核对清单
+
 - **运行时**：`runtime.<region>.kiro.dev` + `X-Amz-Target: AmazonCodeWhispererStreamingService.GenerateAssistantResponse`；请求成员 `conversationState` / `profileArn` / `agentMode` / `additionalModelRequestFields`（顶层 `systemPrompt` 至 2.20.1 仍被后端 400 拒绝，实测于 2026-09-01）。
 - **userInputMessage 成员**：`content` / `modelId` / `origin` / `userInputMessageContext` / `images` / `documents` / `cachePoint`（2026-09-01 实测 `documents` 与 `cachePoint:{"type":"default"}` 均被接受）。
 - **控制面**：`management.<region>.kiro.dev` 的 `ListAvailableModels`（target 名 `KiroControlPlaneBearerService.*` 与 `AmazonCodeWhispererService.*` 均被接受，2026-09-01 实测）、`ListAvailableProfiles`、`GET /getUsageLimits`。

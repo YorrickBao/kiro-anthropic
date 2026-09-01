@@ -8,7 +8,7 @@ description: Drive the Anthropic API against an isolated fake Kiro upstream
 Use the public HTTP surface; do not call selector methods directly.
 
 1. Build the server to a temp path: `go build -o /tmp/kiro-anthropic-verify .`.
-2. Create a temp `accounts.json` with placeholder credentials, distinct `profileArn` values, future token expiries, and `--no-import-local`.
+2. Create a temp `accounts.json` with placeholder credentials, distinct `profileArn` values, future token expiries.
 3. Route `--proxy` to an isolated HTTP CONNECT proxy that performs TLS interception with its own test CA, then serves the fake Kiro responses inside each tunnel:
    - `GET /getUsageLimits` with per-`profileArn` Base or Overage usage.
    - `ListAvailableModels` with `gpt-5.6-sol`.

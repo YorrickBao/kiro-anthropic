@@ -58,7 +58,7 @@
 - **扩展思考（extended thinking）**：模型的思考过程通过 Anthropic 原生的 `thinking` / `redacted_thinking` 内容块透传（流式下发 `thinking_delta` + `signature_delta`）。多轮对话时思考块连同 `signature` 原样回传给后端；若后端判定签名失效（`THINKING_SIGNATURE_INVALID`），自动剥离推理内容并重试一次。请求侧 `thinking: {type:"disabled"}` 会关闭思考块并把 effort 降到最低档。
 - **最大输出 tokens**：按模型 schema 把调用方的 `max_tokens` 下发给 Kiro。**注意：实测 Kiro 后端不强制执行该上限**，实际输出长度由模型/effort 决定，`stop_reason` 基本不会是 `max_tokens`。该字段仅为协议兼容而发送。
 - **模型能力发现** `GET /v1/models`：返回 `max_input_tokens`、`max_tokens`、`capabilities.effort`（上下文窗口、effort 档位）。
-- **账号池**：无主账号，所有请求按额度状态分层选号；同一 Claude Code session 在可用层内保持账号亲和，无 session 时 round-robin。账号来自启动自动导入本地凭据、管理页 IdC 登录、管理页「导入本机凭据」，三者进同一个池；后台自动刷新令牌保活。池为空时 `/v1/messages` 返回 503。
+- **账号池**：无主账号，所有请求按额度状态分层选号；同一 Claude Code session 在可用层内保持账号亲和，无 session 时 round-robin。账号来自管理页 IdC 登录、管理页「导入本机凭据」，两者进同一个池；后台自动刷新令牌保活。池为空时 `/v1/messages` 返回 503。
 - **Claude Code 会话连续性**：有效的 `x-claude-code-session-id` 在当前服务进程内映射为稳定的 Kiro `conversationId`（UUID），模型重建、重试和账号故障转移都复用该 ID；24 小时无活动后自动过期。未传/无效 session 时每个入站请求生成独立 UUID，服务重启不会保留映射。
 - **令牌自动刷新**：池里每个账号快过期时都用 SSO-OIDC 自动续期并写回；刷新经 singleflight 去重，请求路径与后台保活不会对同一账号重复发起 `CreateToken`。
 - **profileArn 自动解析**：企业/IdC 账号走 `ListAvailableProfiles`，免费/社交登录用内置固定 ARN；结果随账号存储。
@@ -70,7 +70,7 @@
 ## 前置条件
 
 1. 至少一个可用账号。两种方式任选其一（可并存）：
-   - **可选**：本机已安装 **Kiro** 桌面端并完成登录——启动时会自动导入其令牌缓存（`~/.aws/sso/cache/kiro-auth-token.json`），开箱即用；
+   - **可选**：本机已安装 **Kiro** 桌面端并完成登录——可在管理页用「导入本机凭据」把其令牌缓存（`~/.aws/sso/cache/kiro-auth-token.json`）一键纳入池；
    - 或在**管理页**登录企业 IdC 账号 / 点「导入本机凭据」把账号纳入池。
 2. 能访问 AWS / `*.kiro.dev`（国内一般需要代理，见下文）。
 3. 仅自行构建时需要 **Go 1.26+**。
@@ -81,7 +81,7 @@
 
 ```bash
 # 启动（默认 :17890，出站默认走 http://127.0.0.1:7890）
-# 启动时会自动导入本地 Kiro 凭据到账号池（如存在）；账号 / 额度 / 模型都在管理页查看
+# 账号 / 额度 / 模型都在管理页查看与导入
 ./kiro-anthropic serve
 
 # 检查并升级到 GitHub 最新 release（见下文“升级”一节）
@@ -137,9 +137,8 @@ Claude Code 会自动发送 `x-claude-code-session-id`。服务会先去除首�
 | `--port` | `17890` | 监听端口（被占用时自动 +1 重试） |
 | `--admin-port` | `27890` | 管理页端口，**仅限本机访问**（被占用时自动 +1 重试） |
 | `--proxy` | `http://127.0.0.1:7890` | 出站代理；优先级：本参数 > `http(s)_proxy` 环境变量 > 内置默认；`none` 表示直连 |
-| `--token-file` | `~/.aws/sso/cache/kiro-auth-token.json` | 启动自动导入的来源：Kiro 桌面端令牌文件路径（也是管理页「导入本机凭据」按钮读取的路径） |
+| `--token-file` | `~/.aws/sso/cache/kiro-auth-token.json` | Kiro 桌面端令牌文件路径：管理页「导入本机凭据」按钮读取的来源 |
 | `--accounts-file` | `~/.kiro-anthropic/accounts.json` | 账号池凭据的持久化存储路径 |
-| `--no-import-local` | `false` | 加此参数则启动时**不**自动导入本地 `--token-file` 凭据；默认（不加）会自动导入到账号池 |
 | `--api-key` | 空（开放） | 设置后客户端须用 `x-api-key` 或 `Authorization: Bearer` 携带。绑非回环 `--host` 时为**必填** |
 | `--agent-mode` | `vibe` | Kiro agent 模式 |
 | `--log` | `false` | 开启请求访问日志（输出到 stdout/当前窗口）；默认关闭 |
@@ -178,11 +177,10 @@ http://127.0.0.1:27890/health      # 健康检查
 
 #### 账号来源与凭据存储
 
-账号池由三种来源填充，都进**同一个池**，不区分主次：
+账号池由两种来源填充，都进**同一个池**，不区分主次：
 
-1. **启动自动导入**：`serve` 启动时读取本地 `--token-file`（默认 `~/.aws/sso/cache/kiro-auth-token.json`）把 Kiro 桌面端账号导入池（加 `--no-import-local` 可关闭）。
-2. **管理页 IdC 登录**：填入 IdC 的 Start URL（形如 `https://your-org.awsapps.com/start`）与 Region，点「开始登录」；服务向 `oidc.<region>.amazonaws.com` 注册公共客户端，浏览器新窗口打开 AWS 授权页（**authorization_code + PKCE** 流程），批准后 AWS 回跳到 `/oauth/callback`，服务用授权码换取 `accessToken` / `refreshToken`，自动解析 `profileArn`，写入池。
-3. **管理页「导入本机凭据」按钮**：读取 `--token-file` 及其客户端注册文件（`<clientIdHash>.json`，找不到时扫描同目录），把当前 Kiro 桌面端账号一键纳入池。
+1. **管理页 IdC 登录**：填入 IdC 的 Start URL（形如 `https://your-org.awsapps.com/start`）与 Region，点「开始登录」；服务向 `oidc.<region>.amazonaws.com` 注册公共客户端，浏览器新窗口打开 AWS 授权页（**authorization_code + PKCE** 流程），批准后 AWS 回跳到 `/oauth/callback`，服务用授权码换取 `accessToken` / `refreshToken`，自动解析 `profileArn`，写入池。
+2. **管理页「导入本机凭据」按钮**：读取 `--token-file` 及其客户端注册文件（`<clientIdHash>.json`，找不到时扫描同目录），把当前 Kiro 桌面端账号一键纳入池。
 
 - **去重**：新账号按身份去重（优先级 `profileArn` > `email` > `clientId + refreshToken`）；命中已有账号时**原地刷新**其凭据，不新增记录。
 - **每账号自带 region / profileArn**：登录/导入时确定并存进该账号自身记录，没有全局 region 覆盖。
@@ -323,7 +321,7 @@ Anthropic Messages API。支持 `stream: true`（SSE：`message_start` / `conten
 
 没有全局区域参数。**每个账号的 region 在登录 / 导入时确定，随账号一起存储**，请求该账号时用它拼出 `oidc.<region>.amazonaws.com`（OIDC 令牌刷新）以及 `runtime.<region>.kiro.dev`（推理）/ `management.<region>.kiro.dev`（模型/profile/额度）。
 
-- 启动自动导入与「导入本机凭据」：region 取自本地令牌里的 `region`。
+- 「导入本机凭据」：region 取自本地令牌里的 `region`。
 - 管理页 IdC 登录：region 就是你在「添加账号」时填入的 Region。
 
 因此不同账号可以位于不同区域，互不影响。
@@ -348,7 +346,7 @@ Anthropic 客户端 ──/v1/messages──►  kiro-anthropic  ──GenerateA
    (Claude Code)                    (本地 :17890)      (AWS 事件流, 走出站代理)
 ```
 
-- 鉴权：所有请求都从**账号池**取账号；池由三种来源填充——启动时自动导入本地凭据、管理页 IdC 登录、管理页「导入本机凭据」按钮。每个账号自带 `region` / `profileArn`，后台自动用 SSO-OIDC `CreateToken` 刷新保活。池为空时 `/v1/messages` 返回 **503**（提示去管理页登录/导入）。
+- 鉴权：所有请求都从**账号池**取账号；池由两种来源填充——管理页 IdC 登录、管理页「导入本机凭据」按钮。每个账号自带 `region` / `profileArn`，后台自动用 SSO-OIDC `CreateToken` 刷新保活。池为空时 `/v1/messages` 返回 **503**（提示去管理页登录/导入）。
 - 会话：有效 `x-claude-code-session-id` 同时驱动账号 rendezvous affinity 和进程内 Kiro `conversationId` UUID 映射；一次入站请求的所有物理发送复用同一个 ID。
 - 推理：向 `https://runtime.<region>.kiro.dev` 发送 `AmazonCodeWhispererStreamingService.GenerateAssistantResponse`，解析其 `vnd.amazon.eventstream` 响应，再翻译回 Anthropic 的 SSE / JSON；`<region>` 取自被选中账号自身的记录。
 - 模型与 profile：通过 `https://management.<region>.kiro.dev` 的 `ListAvailableModels` / `ListAvailableProfiles` 获取。

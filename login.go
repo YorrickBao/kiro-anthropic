@@ -392,28 +392,6 @@ func tokenNeedsRefresh(t Token) bool {
 	return time.Now().Add(tokenRefreshBuffer).After(exp)
 }
 
-// importLocalIntoStore imports the local Kiro credentials into the account
-// store, deduping against existing accounts. On a match the stored account is
-// left untouched (NOT overwritten): a local import carries the Kiro desktop
-// client's rotating refresh-token chain, and overwriting a stored account —
-// especially one added via independent sign-in, which owns a chain that does not
-// disturb the client — would make the two contend for the same chain. Returns 1
-// if a new account was added, 0 if it was already present (left as-is) or there
-// was nothing to import. An error means the local cache was unreadable.
-func importLocalIntoStore(ctx context.Context, store *AccountStore, client *http.Client, tokenFile string) (int, error) {
-	acct, err := importLocalCredentials(ctx, client, tokenFile)
-	if err != nil {
-		return 0, err
-	}
-	if _, ok := store.FindDuplicate(*acct); ok {
-		return 0, nil
-	}
-	if err := store.Add(acct); err != nil {
-		return 0, err
-	}
-	return 1, nil
-}
-
 // findClientRegistration locates the clientId/clientSecret for an imported
 // token. It first tries the <clientIdHash>.json companion next to the token
 // file, then falls back to scanning the directory for any registration file.

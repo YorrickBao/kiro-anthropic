@@ -42,9 +42,8 @@ type Config struct {
 	Port          int
 	AdminPort     int    // loopback-only management port (default 27890)
 	ProxyURL      string // outbound proxy for calls to AWS / kiro.dev (e.g. http://127.0.0.1:7890)
-	TokenFile     string // path to kiro-auth-token.json (source for startup import)
+	TokenFile     string // path to kiro-auth-token.json (source for the admin import button)
 	AccountsFile  string // path to the multi-account credential store
-	NoImportLocal bool   // if set, do not auto-import local Kiro credentials on startup
 	APIKey        string // optional key clients must send (x-api-key / Authorization)
 	AgentMode     string // Kiro agent mode, e.g. "vibe"
 	Log           bool   // enable request logging (off by default); logs to stdout unless LogFile is set
@@ -109,9 +108,8 @@ func addServerFlags(cmd *cobra.Command, cfg *Config) {
 	f.IntVar(&cfg.Port, "port", 17890, "port to listen on")
 	f.IntVar(&cfg.AdminPort, "admin-port", 27890, "loopback-only management port (auto-increments if in use)")
 	f.StringVar(&cfg.ProxyURL, "proxy", "", "outbound HTTP proxy for AWS/Kiro calls; precedence: this flag > http(s)_proxy env > default "+defaultProxyURL+"; use 'none' to connect directly")
-	f.StringVar(&cfg.TokenFile, "token-file", defaultTokenFile(), "path to Kiro auth token JSON")
 	f.StringVar(&cfg.AccountsFile, "accounts-file", defaultAccountsFile(), "path to the multi-account credential store")
-	f.BoolVar(&cfg.NoImportLocal, "no-import-local", false, "do not auto-import the local Kiro credentials (--token-file) into the account pool on startup")
+	f.StringVar(&cfg.TokenFile, "token-file", defaultTokenFile(), "path to Kiro auth token JSON (read by the admin import button)")
 	f.StringVar(&cfg.APIKey, "api-key", "", "if set, clients must present this key via x-api-key or Authorization: Bearer")
 	f.StringVar(&cfg.AgentMode, "agent-mode", "vibe", "Kiro agent mode")
 	f.BoolVar(&cfg.Log, "log", false, "enable request logging to stdout (the window); off by default")
@@ -234,18 +232,6 @@ func runServe(cfg *Config) error {
 		return fmt.Errorf("account store init failed: %w", err)
 	}
 	srv.setAccounts(accounts, client)
-
-	// Unless disabled, adopt the local Kiro desktop credentials into the pool on
-	// startup so an existing sign-in works out of the box. Best-effort: a missing
-	// or unreadable cache is not fatal (the pool can still be filled via the
-	// admin page), keeping zero-account startup possible.
-	if !cfg.NoImportLocal {
-		if n, err := importLocalIntoStore(context.Background(), accounts, client, cfg.TokenFile); err != nil {
-			fmt.Fprintf(os.Stderr, "note: could not import local credentials (%v); pool starts with %d account(s)\n", err, len(accounts.List()))
-		} else if n > 0 {
-			fmt.Printf("  imported local Kiro credentials into the account pool\n")
-		}
-	}
 
 	// One service-lifetime context stops refreshers, probes, and detached cache
 	// warmups when SIGINT/SIGTERM begins graceful shutdown.

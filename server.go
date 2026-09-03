@@ -203,6 +203,10 @@ func (s *Server) Handler() http.Handler {
 	r.Handle("/health", http.HandlerFunc(s.handleHealth))
 	r.Handle("/v1/models", http.HandlerFunc(s.handleModels))
 	r.Handle("/v1/messages", http.HandlerFunc(s.handleMessages))
+	// OpenAI Responses endpoint shares the /v1 namespace: the wire paths
+	// (/v1/messages vs /v1/responses) are disjoint, and OpenAI clients expect
+	// base_url = http://host:port/v1, so no extra prefix is needed.
+	r.Handle("/v1/responses", http.HandlerFunc(s.handleResponses))
 	r.Post("/api/models/aggregate", s.handleAPIModelAggregate)
 	return r
 }

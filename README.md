@@ -32,6 +32,7 @@
   - [图片](#图片)
 - [API 端点](#api-端点)
   - [`POST /v1/messages`](#post-v1messages)
+  - [`POST /v1/responses`](#post-v1responses)
   - [`GET /v1/models`](#get-v1models)
   - [`GET /health`](#get-health)
 - [服务器部署（EC2 等）](#服务器部署ec2-等)
@@ -49,6 +50,7 @@
 ## 功能特性
 
 - **Anthropic Messages API** `POST /v1/messages`，支持**流式（SSE）**与**非流式**。
+- **OpenAI Responses API** `POST /v1/responses`（无状态子集）：Codex CLI 等 Responses 客户端直接接入，支持流式 / 非流式、`function` 工具闭环、图片输入与 effort，详见 [API 端点](#post-v1responses)。
 - **工具调用 / 函数调用**：完整的 `tools` → `tool_use` → `tool_result` 多轮闭环。
 - **图片输入**：`png` / `jpeg` / `gif` / `webp`（已实测可正常识图）。支持 base64，也支持远程 `url`（下载后内联为 base64，带 SSRF 防护、15s 超时与 10MB 上限）。
 - **文档输入**：user 消息中的 `document` 块（base64，`application/pdf` / `text/plain` / `text/markdown` / `text/csv` 等）映射为 Kiro 的 `documents` 字段转发（已实测，模型可正确读取文档内容）；`text` source 自动重编码为 base64；不支持的 media type 留 `[unsupported document omitted]` 提示。
@@ -264,6 +266,39 @@ http://127.0.0.1:27890/health      # 健康检查
 ### `POST /v1/messages`
 Anthropic Messages API。支持 `stream: true`（SSE：`message_start` / `content_block_start` / `content_block_delta` / `content_block_stop` / `message_delta` / `message_stop`；`content_block_delta` 涵盖 `text_delta` / `thinking_delta` / `signature_delta` / `input_json_delta`）与非流式聚合响应。支持 `system`、`messages`、`tools`、`tool_result`、`image`、`thinking`、`output_config.effort` / `reasoning_effort`，以及历史消息中的 `thinking` / `redacted_thinking` 块回传。
 
+### `POST /v1/responses`
+OpenAI Responses API 的**无状态子集**，面向 Codex CLI 等 Responses 客户端，与 Anthropic 的 `/v1/messages` 共享 `/v1` 命名空间（wire 路径互不相交），且共用账号池、failover 与 Kiro 翻译层。支持 `instructions`、`input`（字符串或 item 数组；item 的 `type` 可省略，即 OpenAI EasyInputMessage 形式）、`function` 工具与 `function_call` / `function_call_output` 历史回放、`input_image`、`reasoning.effort`、`max_output_tokens`；流式事件为 `response.created` → `output_item.added` / `*.delta` → `response.completed`。服务端工具（`web_search`、`file_search`、`code_interpreter`、`computer_use`、托管 `mcp` 等）在流开始前返回 400；接到 `/v1/responses` 的误配流量会提示改为 `…/v1`。`store:false` 与全量回放的做法即适配；`previous_response_id` 不支持。
+
+Codex CLI（`~/.codex/config.toml`）：
+
+```toml
+[model_providers.kiro]
+name = "kiro"
+base_url = "http://127.0.0.1:17890/v1"
+wire_api = "responses"
+env_key = "KIRO_API_KEY"   # 服务端设了 --api-key 时必配，否则可省略
+
+# 建议：Codex 只对 ChatGPT 官方后端拉取模型元数据，第三方 provider 用内置启发式
+# 猜上下文窗口；显式声明可获得准确的压缩阈值估算（不声明也能用）
+model_context_window = 200000
+```
+
+omp（`~/.omp/agent/models.yml`）：
+
+```yaml
+providers:
+  kiro:
+    baseUrl: http://127.0.0.1:17890/v1
+    api: openai-responses
+    auth: none            # 服务端设了 --api-key 时改为 apiKey: <key 或环境变量名>
+    models:
+      - id: claude-opus-4.8
+        name: Claude Opus via Kiro
+        contextWindow: 200000
+```
+
+其他 OpenAI SDK / 脚本：`OPENAI_BASE_URL=http://127.0.0.1:17890/v1` 即可（注意 `/v1/models` 返回的是 Anthropic 形状，OpenAI 形状的模型发现不可用，请手写模型列表）。
+
 ### `GET /v1/models`
 返回账号可用模型，每项包含：`id`、`type`、`display_name`、`created_at`、`max_input_tokens`、`max_tokens`、`capabilities.effort`（`supported` 及 `low/medium/high/xhigh/max`）。用池里任一账号查询；**账号池为空时不报错，返回内置的 fallback 静态模型列表**。
 
@@ -329,7 +364,7 @@ Anthropic Messages API。支持 `stream: true`（SSE：`message_start` / `conten
 
 ## 限制
 
-- **网络搜索不支持**：Anthropic 的 `web_search` 是服务端工具，而 Kiro 的 web 搜索是客户端工具、runtime 无对应服务端接口，无法直接映射（客户端会报 “web search not supported”）。
+- **网络搜索不支持**：Anthropic 的 `web_search` 是服务端工具，而 Kiro 的 web 搜索是客户端工具、runtime 无对应服务端接口，无法直接映射（客户端会报 “web search not supported”）。`/v1/responses` 对这类服务端工具（`web_search` / `file_search` / `code_interpreter` / `computer_use` / 托管 `mcp` 等）在流开始前返回 400 并提示移除；omp 的 web_search 为客户端本地工具，不受影响。
 - **图片**：支持 base64 与远程 `url`（URL 会下载后内联，受 SSRF/超时/大小/类型护栏约束，不通过则跳过并留 `[unsupported image omitted]` 提示）；`tool_result` 里的图片不转发。
 - **采样参数**：`temperature` / `top_p` / `top_k` 不透传（Opus 4.7+ 本身也不支持）。
 - **usage 为估算**：返回的 `input_tokens` / `output_tokens` 是基于字符数的粗略估算（非精确计费值）。Kiro 后端只提供上下文占用百分比与 credit 计费，不提供真实 token 计数，故无法返回精确值。
@@ -341,8 +376,9 @@ Anthropic Messages API。支持 `stream: true`（SSE：`message_start` / `conten
 ## 工作原理
 
 ```
-Anthropic 客户端 ──/v1/messages──►  kiro-anthropic  ──GenerateAssistantResponse──►  runtime.<region>.kiro.dev
-   (Claude Code)                    (本地 :17890)      (AWS 事件流, 走出站代理)
+Anthropic 客户端 ──/v1/messages──────────────►  kiro-anthropic  ──GenerateAssistantResponse──►  runtime.<region>.kiro.dev
+OpenAI 客户端   ──/v1/responses─────────►  (本地 :17890)      (AWS 事件流, 走出站代理)
+   (Claude Code / Codex / omp)
 ```
 
 - 鉴权：所有请求都从**账号池**取账号；池由两种来源填充——管理页 IdC 登录、管理页「导入本机凭据」按钮。每个账号自带 `region` / `profileArn`，后台自动用 SSO-OIDC `CreateToken` 刷新保活。池为空时 `/v1/messages` 返回 **503**（提示去管理页登录/导入）。
